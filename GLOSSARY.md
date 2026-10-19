@@ -20,6 +20,18 @@
 - **Avoid**: 回覆 (when it means replying to the sender only), reply, reply-to-sender, 回信
 - **Why**: The everyday word 「回復」 maps to two Outlook buttons. This platform defaults to "reply all"; a caller holding a human-approved list may adjust the envelope explicitly, and thread continuity is still decided by the anchor message. Owner: Sean (2026-08-11, confirmed the #84 / #85 and PR #102 review boundary); SoT: `bes draft-reply` recipient assembly; source: `openspec/changes/archive/2026-08-12-control-draft-reply-recipients-and-archive-anchors/ddd-note.md` §2–§4.
 
+### archive-backed (存檔路線)
+
+- **Definition**: A way of answering mail questions in which messages are first copied into a store the platform owns, and every query reads only that store, never the mail server. How the copy arrives (PST import, IMAP sync, maildir) does not change the category. mailattic is archive-backed.
+- **Avoid**: IMAP 型 (names the transport, not the category; mailattic itself syncs over IMAP), 離線版, 備份
+- **Why**: The platform's one differentiating claim (mail the server no longer holds stays answerable, plus whole-history aggregation) belongs to this category, not to any transport. Naming the category by transport made "IMAP" sound like the opposite of mailattic. Owner: Sean (2026-10-19, grill session on future direction); source: [#3](https://github.com/sean3808/mailattic/issues/3), D-20260813-2 Context.
+
+### live proxy (即時代理路線)
+
+- **Definition**: A way of answering mail questions in which each query is forwarded to the mail server (IMAP, Gmail API, Microsoft Graph) at the moment it is asked, with no platform-owned copy. It is complementary to [[archive-backed]]: it owns freshness and server-side actions; the archive owns history and aggregation.
+- **Avoid**: IMAP 型, 線上版, 即時版
+- **Why**: Same as [[archive-backed]]; the pair keeps "freshness" and "acting on the server" recognisable as the other category's job rather than a gap in this one. Owner: Sean (2026-10-19); source: [#3](https://github.com/sean3808/mailattic/issues/3).
+
 ---
 
 ## Mechanisms this platform invented (scope: mechanism)
