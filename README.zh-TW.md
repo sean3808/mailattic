@@ -99,6 +99,10 @@ PST 匯入要經由執行中的 Outlook，測試啟動器是 PowerShell。maildi
 | 某個設計當初為什麼這樣選 | [`docs/decisions.md`](docs/decisions.md)（紀錄以繁體中文撰寫） |
 | 全部文件 | [`docs/INDEX.md`](docs/INDEX.md) |
 
+## 致謝
+
+開發流程使用 Matt Pocock 的 [skills](https://github.com/mattpocock/skills)。
+
 ## 授權
 
 [MIT](LICENSE)。維護者：[@sean3808](https://github.com/sean3808)。

@@ -286,19 +286,24 @@ def test_reply_docs_publish_safe_anchor_and_paced_restart_contract() -> None:
     )
 
     assert "archive-scrape" in skill_text
-    assert "進站" in skill_text or "inbound" in skill_text
+    anchor_rule = next(
+        line
+        for line in skill_text.splitlines()
+        if "archive-scrape" in line and "--allow-archive-anchor" in line
+    )
+    assert "inbound" in anchor_rule
     assert "To/Cc" in skill_text or "To / Cc" in skill_text
     assert "--allow-archive-anchor" in skill_text
 
     assert "archive-scrape" in reply_text
-    assert "同一 thread" in reply_text
+    assert "same thread" in reply_text
     assert "To/Cc" in reply_text or "To / Cc" in reply_text
     assert "--allow-archive-anchor" in reply_text
     assert "--replace-recipients" in reply_text
-    assert "90 秒" in reply_text
+    assert "90 seconds" in reply_text
     assert "list-drafts" in reply_text
     assert "sending" in reply_text
-    assert "不要盲目重送" in reply_text
+    assert "never resend blindly" in reply_text
 
 
 def test_reply_docs_require_rfc822_anchor_and_publish_parser_boundary() -> None:
@@ -324,7 +329,7 @@ def test_reply_docs_require_rfc822_anchor_and_publish_parser_boundary() -> None:
         assert "malformed raw syntax" in text
         assert "ASCII addr-spec" in text
         assert "Unicode display name" in text
-        assert "env / DB I/O 前 exit 2" in text
+        assert "exit 2 before env / DB I/O" in text
 
 
 # ── 5. Self-check（red case）：確認 detector 能抓到已知壞範例 ─────────────────

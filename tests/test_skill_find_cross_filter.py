@@ -88,9 +88,9 @@ def run(
 
 def subjects(stdout: str) -> set[str]:
     return {
-        line.split("主旨:", 1)[1].strip()
+        line.split("Subject:", 1)[1].strip()
         for line in stdout.splitlines()
-        if "主旨:" in line
+        if "Subject:" in line
     }
 
 

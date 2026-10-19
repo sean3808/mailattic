@@ -14,7 +14,7 @@ NOT_ON_THE_MAP = {"__init__.py"}
 
 def _map_section() -> str:
     text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-    start = text.index("## 架構地圖")
+    start = text.index("## Architecture map")
     return text[start : text.index("\n## ", start + 1)]
 
 

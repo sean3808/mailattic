@@ -92,6 +92,14 @@ def test_agents_md_outside_cwd_still_reminds(tmp_path):
     _assert_reminder(_run(payload, tmp_path))
 
 
+def test_agents_md_english_contract_heading_reminds(tmp_path):
+    """AGENTS.md 改寫成英文後，只寫英文契約段名的編輯也要響。"""
+    payload = _post_edit(
+        str(tmp_path / "AGENTS.md"), new_string="edited Behaviour contracts"
+    )
+    _assert_reminder(_run(payload, tmp_path))
+
+
 def test_agents_md_without_contract_keyword_is_quiet(tmp_path):
     """AGENTS.md 被改但內容與契約無關 → 不響（關鍵詞條件仍在）。"""
     payload = _post_edit(str(tmp_path / "AGENTS.md"), new_string="改了常用指令那段")
@@ -129,7 +137,7 @@ def test_anchor_tests_match_agents_md_contract_section():
     改名或新增 anchor test 只動一邊，gate 就靜默瞎掉（= 本 hook 存在要修的失效類型）。
     """
     lines = (_REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8").splitlines()
-    start = lines.index("## 行為契約")
+    start = lines.index("## Behaviour contracts (行為契約)")
     end = next(
         i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln.startswith("## ")
     )

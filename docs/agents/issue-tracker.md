@@ -17,7 +17,7 @@ Infer the repo from `git remote -v` — `gh` does this automatically when run in
 
 The issue is where intent lives, from first report through to done: what to do, why, and what counts as finished. Its full text, comments included, is the baseline that the later semantic review and `/spec-reconcile` judge the diff against — so read the comments, not just the body.
 
-An issue is not the behavioral canon. What the system must do lives in `AGENTS.md > ## 行為契約` plus the code. The Spectra change directories used before 2026-08-20 are retired ([D-20260820-3](../decisions/D-20260820-3-migrate-to-contract-anchored-flowback.md)) and not carried in this repo; new work does not open one.
+An issue is not the behavioral canon. What the system must do lives in `AGENTS.md > ## Behaviour contracts` plus the code. The Spectra change directories used before 2026-08-20 are retired ([D-20260820-3](../decisions/D-20260820-3-migrate-to-contract-anchored-flowback.md)) and not carried in this repo; new work does not open one.
 
 ## Pull requests as a triage surface
 

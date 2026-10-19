@@ -1,67 +1,67 @@
-# Capability A — Sync（拉新鮮信件）
+# Capability A - Sync (pull fresh mail)
 
-> 此檔由 `SKILL.md` 的 Capability 路由表 MANDATORY load 進來。
-> 若任務只跑 Sync，**不要載入** `capability-b-find.md` / `capability-c-reply.md`。
+> `SKILL.md`'s capability routing table loads this file (MANDATORY).
+> When the task is Sync only, **do not load** `capability-b-find.md` / `capability-c-reply.md`.
 
-## 一條軌道：sync-imap 同時帶收件與寄件（2026-07-14 起）
+## One track: sync-imap carries both inbound and outbound (since 2026-07-14)
 
-| 方向 | 來源 | 涵蓋期間 |
+| Direction | Source | Coverage |
 |---|---|---|
-| **inbound** | `bes sync-imap`（INBOX） | 連續，無缺口 |
-| **outbound** | `bes sync-imap`（IMAP `寄件備份` folder） | **2026-07-14 起**；2026-05-27 以前靠 PST 匯入 |
+| **inbound** | `bes sync-imap` (INBOX) | continuous, no gap |
+| **outbound** | `bes sync-imap` (IMAP `寄件備份` folder) | **since 2026-07-14**; up to 2026-05-27 it came from PST import |
 
-Outlook 2026-07-14 改走 IMAP 後，寄出的信落在 server 的 `寄件備份` folder，`sync-imap` 直接同步、帶完整原始 header（`docs/decisions/D-20260714-1-imap-sent-is-sole-outbound-source.md`）。`bes scrape-archive` 的排程已停用、降為手動備援（只在 WSL 內人工跑），**不是** caller agent 的常規 outbound 路徑，不要自動呼叫。
+Since Outlook moved to IMAP on 2026-07-14, sent mail lands in the server's `寄件備份` folder, and `sync-imap` syncs it directly with the full original headers (`docs/decisions/D-20260714-1-imap-sent-is-sole-outbound-source.md`). The `bes scrape-archive` schedule is disabled and demoted to a manual fallback (run by hand inside WSL only); it is **not** a caller agent's regular outbound path - do not call it automatically.
 
-殘留：沒經過 Outlook 寄出的信不會進 `寄件備份`。
+Residual: mail that was not sent through Outlook never reaches `寄件備份`.
 
-## 何時用
+## When to use
 
-- User query 涉及 **24 小時內** 的信件（「今天有沒有收到」「剛剛某某有寄信給我嗎」「最新」「最近一兩天」）→ 先跑 `--pre-task` 再進 Capability B
-- User 找的是自己**寄出**的信（「我剛寄給 X 的信」「我今天寄出那封」）→ 一樣跑 `--pre-task`（`寄件備份` 由它同步）
-- User 明確說「同步」「拉信」「更新 DB」「sync mailbox」
-- Capability B 找信時發現 `SELECT MAX(sent_at) FROM messages` 跟今天差超過 1 天，且 query 對時效性敏感
-- **不要無條件每次都跑**：歷史檢索（「以前那封」「2024 年某月」）DB 已涵蓋，sync 純浪費
+- The user's query involves mail from the **last 24 hours** ("did anything arrive today", "did X just email me", "latest", "the last day or two") -> run `--pre-task` first, then go to Capability B
+- The user wants mail they **sent** ("the mail I just sent X", "the one I sent today") -> run `--pre-task` as well (it syncs `寄件備份`)
+- The user says "同步", "拉信", "更新 DB", or "sync mailbox"
+- During Capability B, `SELECT MAX(sent_at) FROM messages` is more than 1 day behind today and the query is time-sensitive
+- **Skip it for history lookups** ("that old mail", "some month in 2024"): the DB already covers them and a sync is pure waste
 
-## 怎麼用
+## How to use
 
-正常 caller agent 入口用 `--pre-task`，內建 15 分鐘 throttle 安全可重複呼叫：
+The caller agent's entry point is `--pre-task`, which has a built-in 15-minute throttle and is safe to call repeatedly:
 
 ```bash
 bes sync-imap --pre-task
-# 或以 JSON 輸出：
+# or with JSON output:
 bes sync-imap --pre-task --json
 ```
 
-`--pre-task` 行為：若上次 sync **嘗試**距現在 < 15 分鐘，直接 skip 印 throttle 訊息；否則跑正常 sync。設計目的是讓 caller 不用自己判斷「該不該 sync」，呼叫即可。加 `--json` 旗標（只能搭配 `--pre-task`，單獨用會 exit 2）則以 JSON 輸出結果。`status` 為 `skipped` / `synced` / `failed`（設定錯誤）；`skipped` 時固定帶 `last_sync_failed`（bool）、`last_sync_exit_code`、`last_sync_failure_stage`、`last_sync_failure_message`（不適用時為 `null`），只看 `last_sync_failed` 即可。`synced` / `failed` 帶 `exit_code`。
+`--pre-task` behaviour: if the last sync **attempt** was less than 15 minutes ago, it skips and prints a throttle message; otherwise it runs a normal sync. The caller never has to decide "should I sync" - just call it. The `--json` flag (valid only with `--pre-task`; alone it exits 2) prints the result as JSON. `status` is `skipped` / `synced` / `failed` (configuration error). When `skipped`, the output always carries `last_sync_failed` (bool), `last_sync_exit_code`, `last_sync_failure_stage`, and `last_sync_failure_message` (`null` when not applicable); reading `last_sync_failed` alone is enough. `synced` / `failed` carry `exit_code`.
 
-**「嘗試」不是「成功」** —— throttle 讀的是上次 run 的結束時間，不篩 exit status，所以**失敗的 run 一樣會讓接下來 15 分鐘的呼叫被 skip**。上一次同步失敗時，skip 輸出會帶上 `last sync failed`；後來又有一次同步開始卻沒有完成記錄（寫紀錄前就中斷，或仍在跑）時帶 `last sync did not complete`；同步狀態讀不到時帶 `last sync status unknown`（JSON 三者都是 `last_sync_failed: true`，stage 分別為記錄值 / `unfinished` / `state_unreadable`）。caller 只有在「略過且三者皆無」時才能把查無當成真的沒有，否則代表信庫可能不完整。下面「IMAP timeout 後重試」那條要照它寫的等 5-10 分鐘以上，馬上重打只會拿到 throttle 訊息而不是一次真正的重試。
+**"Attempt" is not "success"**: the throttle reads the previous run's end time without filtering on exit status, so **a failed run also makes the next 15 minutes of calls skip**. When the previous sync failed, the skip output carries `last sync failed`; when a later sync started but left no completion record (interrupted before writing its record, or still running) it carries `last sync did not complete`; when the sync state is unreadable it carries `last sync status unknown` (in JSON all three give `last_sync_failed: true`, with stage = the recorded value / `unfinished` / `state_unreadable`). Only on "skipped with none of the three" may the caller treat a miss as a true miss; otherwise the mail store may be incomplete. For the "IMAP timeout retry" item below, wait the 5-10+ minutes it says: retrying at once only returns the throttle message instead of a real retry.
 
-需要先估量會抓幾封：
+To estimate how many mails a sync would fetch:
 
 ```bash
 bes sync-imap --dry-run
 ```
 
-只算數，不寫 DB；用在 sync 量看起來很大時先看再決定。
+It only counts and writes nothing to the DB; use it to look before deciding when the sync looks large.
 
-bulk_guard 卡住時（例：某 folder UIDs 超過 500 threshold，正常 sync 會 exit=1 + 印 `bulk_guard` 訊息）才用 `--full-resync`：
+Use `--full-resync` only when bulk_guard blocks (e.g. a folder's UIDs exceed the 500 threshold, so a normal sync exits 1 and prints a `bulk_guard` message):
 
 ```bash
 bes sync-imap --full-resync
 ```
 
-會有 confirmation prompt（要 typed 確認）+ 清掉 JSON 水位鏡像（DB 內 `imap_sync_progress` 不先砍，隨重抓推進被覆寫）+ 全量重抓。**這是 escape hatch，不是常規路徑**。
+It asks for a typed confirmation, clears the JSON watermark mirror (`imap_sync_progress` inside the DB is not wiped first; it is overwritten as the re-fetch advances), and re-fetches everything. **This is an escape hatch, not a regular path.**
 
-## 失敗模式
+## Failure modes
 
-- **`bulk_guard 'INBOX': N UIDs exceeds bulk threshold 500`** → 不是 sync 壞掉，是 guardrail 主動擋。先看 N 是多少：< 1000 可考慮 `--full-resync` 確認過後跑；>= 1000 先回報 user 評估是不是 mailbox 出事
-- **`exit=1` 且訊息含 IMAP timeout / connection reset** → 網路或 server 抖動；過 5-10 分鐘重試 `--pre-task`，throttle 會避免 burst
-- **`exit=1` 且某 UID 訊息無法入庫（message-level ingest 失敗）** → sync 現在會**故意停在該 UID**（fail-loud）：watermark 不越過、失敗記進 `ingest_failures`、下次 sync 從同一 UID 重試。這是刻意設計（擋靜默漏信），不是 sync「壞掉」；若同一 UID 每次都卡 → 該信可能永久無法解析，回報 user 由人工介入（修根因或人工推進 watermark），不要自動繞過。附件解碼失敗**不會**觸發此停止（信件本體仍入庫）
-- **`exit=1` 且訊息為 `list: skipped folder: LIST returned a folder name that is not ASCII ...`**（`--dry-run` 也會印 `ERROR: skipped folder` 並 exit 1）→ 伺服器用 literal 寫法送出了一個解不開的資料夾名稱；只有那個資料夾被跳過，其餘資料夾照常同步、信照常進庫。這次 run 記為失敗（sync 紀錄 `failed`），水位線沒動；回報 user 該資料夾名稱由人處理，不要自動重試
-- **DB 剛從備份還原 / 換了另一顆 `--database`** → 同步進度存在 DB 內（`imap_sync_progress`），不是只看 maildir 旁的 `.imap_watermarks.json`；JSON 比 DB 新時不被信任，下次 sync 會自動補回缺信，不需手動動 watermark；舊版遺留、未綁定 DB 的 JSON 只採用到該 DB 自己實際持有的最大 UID 為止，該資料夾在 DB 內一封都沒有就從 UID 1 重掃。刪掉或弄丟 JSON 鏡像也會從 UID 1 重掃。DB 內有進度、JSON 鏡像也在時，缺口再大也直接補抓；只有從 UID 1 重掃（該資料夾在 DB 內沒有進度，或 JSON 鏡像遺失）且超過 500 封時才會 `bulk_guard` 非零退出，那時才走 `--full-resync`
-- **`exit=0` 但 `new=0 deduped=0`** → 正常無新信，不是失敗
-- **完全沒 log**（例：`.mailattic-work/logs/mbsync-<today>.log` 不存在）→ Windows Task Scheduler 沒觸發；不是 sync 本身問題，是排程層；提醒 user 檢查 Task Scheduler 狀態，不要在 skill 內想辦法繞過
+- **`bulk_guard 'INBOX': N UIDs exceeds bulk threshold 500`** -> sync is not broken; the guardrail blocked on purpose. Check N first: below 1000, consider running `--full-resync` after confirming; at 1000 or more, report to the user to judge whether the mailbox has a problem
+- **`exit=1` with an IMAP timeout / connection reset message** -> network or server flutter; retry `--pre-task` after 5-10 minutes, and the throttle prevents bursts
+- **`exit=1` with a UID whose message cannot be ingested (message-level ingest failure)** -> sync now **stops at that UID on purpose** (fail-loud): the watermark does not pass it, the failure is recorded in `ingest_failures`, and the next sync retries from the same UID. This is deliberate design (it blocks silent mail loss), not a broken sync. If the same UID blocks every time, that mail may be permanently unparseable: report to the user for human intervention (fix the root cause or advance the watermark by hand) and do not bypass automatically. An attachment decode failure does **not** trigger this stop (the mail body is still ingested)
+- **`exit=1` with `list: skipped folder: LIST returned a folder name that is not ASCII ...`** (`--dry-run` also prints `ERROR: skipped folder` and exits 1) -> the server sent a folder name in literal form that cannot be decoded; only that folder is skipped, the other folders sync normally and their mail is ingested. The run is recorded as failed (the sync record says `failed`) and the watermark did not move; report the folder name to the user for a human to handle, and do not retry automatically
+- **DB just restored from a backup / a different `--database`** -> sync progress lives inside the DB (`imap_sync_progress`), not only in the `.imap_watermarks.json` next to the maildir. A JSON newer than the DB is not trusted, and the next sync back-fills the missing mail automatically, so the watermark needs no manual change. A legacy JSON not bound to a DB is honoured only up to the highest UID this DB actually holds; a folder with no mail at all in the DB rescans from UID 1. Deleting or losing the JSON mirror also rescans from UID 1. When the DB has progress and the JSON mirror is present, any size of gap is back-filled directly; `bulk_guard` exits non-zero only on a rescan from UID 1 (the folder has no progress in the DB, or the JSON mirror is lost) of more than 500 mails, and only then go to `--full-resync`
+- **`exit=0` with `new=0 deduped=0`** -> normal, no new mail; not a failure
+- **No log at all** (e.g. `.mailattic-work/logs/mbsync-<today>.log` does not exist) -> Windows Task Scheduler did not fire; this is the scheduler layer, not sync itself. Remind the user to check Task Scheduler and do not try to work around it inside the skill
 
-- **附件寫入失敗的信**（`attachment-retry:` 行的 `still failing` > 0，或 `bes db doctor` 的 `unresolved_attachment_failures` > 0）→ 每次 sync 開頭會自動用本機原始信重試；原始信超過七天會被搬進隔離區（預設在資料庫旁的 `.mailattic-work/quarantine/<資料庫檔名>/`，跟著資料庫走；doctor 的 `quarantined_mail` 數的是該目錄下所有 `.eml`）而不是刪掉，直到補回或被放棄。修不回來的那筆：`bes db doctor` 列出 `id=`，**由人**決定後下 `bes db abandon-attachment-failure --id <id> --reason "..."`（破壞性，需 user 確認；agent 非互動環境不可自行加 `--yes`，系統也從不自動放棄）
+- **Mail whose attachment write failed** (`still failing` > 0 on the `attachment-retry:` line, or `unresolved_attachment_failures` > 0 in `bes db doctor`) -> every sync starts by retrying automatically from the local original mail; an original older than seven days is moved into quarantine (by default `.mailattic-work/quarantine/<database file name>/` next to the database, travelling with it; doctor's `quarantined_mail` counts every `.eml` in that directory) instead of being deleted, until recovered or abandoned. For one that cannot be recovered: `bes db doctor` lists its `id=`, and **a human** decides, then runs `bes db abandon-attachment-failure --id <id> --reason "..."` (destructive, needs user confirmation; an agent in a non-interactive environment must not add `--yes` itself, and the system never abandons automatically)
 
-不要試圖在 sync 失敗時自動 retry 多次或自動升 `--full-resync` — 那是不可逆 + 大量 IO 操作，必須 user 授權。
+When a sync fails, never retry automatically many times or escalate to `--full-resync` on your own: it is irreversible and I/O-heavy, and needs user authorisation.
