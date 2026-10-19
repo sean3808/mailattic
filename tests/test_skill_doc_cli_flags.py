@@ -286,7 +286,12 @@ def test_reply_docs_publish_safe_anchor_and_paced_restart_contract() -> None:
     )
 
     assert "archive-scrape" in skill_text
-    assert "inbound" in skill_text
+    anchor_rule = next(
+        line
+        for line in skill_text.splitlines()
+        if "archive-scrape" in line and "--allow-archive-anchor" in line
+    )
+    assert "inbound" in anchor_rule
     assert "To/Cc" in skill_text or "To / Cc" in skill_text
     assert "--allow-archive-anchor" in skill_text
 

@@ -92,6 +92,14 @@ def test_agents_md_outside_cwd_still_reminds(tmp_path):
     _assert_reminder(_run(payload, tmp_path))
 
 
+def test_agents_md_english_contract_heading_reminds(tmp_path):
+    """AGENTS.md 改寫成英文後，只寫英文契約段名的編輯也要響。"""
+    payload = _post_edit(
+        str(tmp_path / "AGENTS.md"), new_string="edited Behaviour contracts"
+    )
+    _assert_reminder(_run(payload, tmp_path))
+
+
 def test_agents_md_without_contract_keyword_is_quiet(tmp_path):
     """AGENTS.md 被改但內容與契約無關 → 不響（關鍵詞條件仍在）。"""
     payload = _post_edit(str(tmp_path / "AGENTS.md"), new_string="改了常用指令那段")
