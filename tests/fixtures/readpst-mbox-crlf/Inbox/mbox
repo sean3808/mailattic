@@ -1,0 +1,12 @@
+From alice@example.com Mon Jan 01 12:00:00 2024
+Received: from relay2.example.com (relay2 [10.0.0.2])
+	by mx.example.com with ESMTP id abc123; Mon, 01 Jan 2024 12:00:00 +0000
+Received: from client.example.com (unknown [192.168.0.1])
+	by relay2.example.com with ESMTP id def456; Mon, 01 Jan 2024 11:59:00 +0000
+Message-ID: <mbox-crlf-test@example.com>
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: CRLF mbox test
+Date: Mon, 01 Jan 2024 12:00:00 +0000
+
+CRLF mbox body text.

@@ -1,0 +1,22 @@
+services:
+  mbsync:
+    build:
+      context: .
+      dockerfile: Dockerfile.mbsync
+    env_file:
+      - ../.env.sean3808
+    working_dir: /workspace
+    environment:
+      MAILDIR_ROOT: /workspace/.mailattic-work/maildir
+      DATABASE_PATH: /workspace/mailattic.db
+      LOG_DIR: /workspace/.mailattic-work/logs
+      MBSYNC_CONFIG_PATH: /workspace/.mailattic-work/mbsync/mbsyncrc
+      MBSYNC_TEMPLATE_PATH: /opt/mailattic/mbsyncrc.template
+      SYNC_CRON_SCHEDULE: 45 8 * * *
+      PYTHONPATH: /workspace/src
+    volumes:
+      - ..:/workspace
+      - ../.mailattic-work:/workspace/.mailattic-work
+    # 不再走 long-running container — WSL2 distro idle shutdown 會 SIGTERM 所有 container
+    # 改由 Windows Task Scheduler 觸發 `docker compose run --rm mbsync ...` 走 one-shot
+    restart: "no"

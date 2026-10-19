@@ -1,0 +1,9 @@
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Date: Wed, 03 Jan 2024 05:06:07 +0000
+Subject: maplecrest contract discussion
+Message-ID: <msg-001@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Duplicate copy that should be deduplicated by Message-ID.

@@ -1,0 +1,10 @@
+From test@example.com Fri Jan 01 00:00:00 2024
+Subject: imported from mbox
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Date: Tue, 02 Jan 2024 03:04:05 +0000
+Message-ID: <mbox@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Evidence body from mbox

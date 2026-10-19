@@ -1,0 +1,1 @@
+docs/decisions/D-20260908-1-guards-defend-confused-deputy-not-deliberate-collision.md	../../CLAUDE.md#行為契約

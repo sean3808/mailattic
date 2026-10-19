@@ -1,0 +1,19 @@
+line-length = 88
+target-version = "py313"
+extend-exclude = [".tmp", ".review-tmp", "skills/", "scripts/gen_doc_index.py"]
+cache-dir = ".project-runtime/ruff-cache"
+
+[lint]
+# Rules 選擇理由：
+# - E/F/W: 基礎錯誤檢查，必開
+# - I: import sorting，消除團隊風格爭議
+# - UP: Python 版本升級建議，保持程式碼現代化
+# - B: bugbear，抓常見 bug patterns（如 mutable default args）
+# - C4: comprehension，鼓勵 Pythonic 寫法
+# - SIM: simplify，減少冗餘程式碼
+#
+# 故意不選：
+# - D (docstring): 過於嚴格，阻礙快速開發
+# - ANN (annotations): 漸進式採用更好，強制會拖慢開發
+# - ARG (unused args): 與某些框架（如 hooks）衝突
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]

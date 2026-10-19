@@ -1,0 +1,3 @@
+[doc_index]
+docs_dir = "docs"
+hook_mode = "pre-commit"

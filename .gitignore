@@ -1,0 +1,117 @@
+# .claude/ 整體不進版控。用 `.claude/*` 而非 `.claude/` 才能讓下面的負向規則生效
+# （git 不會下探被忽略的「目錄」）。
+.claude/*
+# 內部工作筆記只留本機、不隨公開版帶出（D-20261018-1）：教訓 backlog、穩態快照、
+# 歷史快照與設計筆記。檔案仍在原位，session-park 照常讀寫。
+.claude/promote-candidates.md
+docs/current-status.md
+docs/status-context-*.md
+docs/ddd-notes/
+# 開發過程的敘事性紀錄（D-20261018-1 後續）
+docs/recipient-rebuild-plan.md
+docs/rebuild-source-baseline-228-discussion.md
+docs/mail-platform-audit-20261003.md
+docs/cowork-v2-bridge-smoke.md
+docs/cowork-mcp-bridge-validation.md
+docs/mail-archive-search-performance-diagnosis.md
+docs/FUTURE_LEVERAGE_IDEAS.md
+docs/ssot-eol-governance.md
+# 專案起步期的 Copilot 說明，內容已過時（說「還沒有程式碼」），不帶出去（#331）
+.github/copilot-instructions.md
+# 已執行完的一次性救援工具：常數綁本機語料，留本機（#331）
+scripts/reingest_retained_maildir.py
+scripts/prune_first_run_validate.py
+scripts/recipient_rebuild_audit.py
+scripts/recipient_rebuild_apply.py
+tests/test_recipient_rebuild_audit.py
+tests/test_recipient_rebuild_apply.py
+# 本 repo 自己寫的 governance hook 要進版控（treaty gate 的一部分，換機不能掉）。
+# `__pycache__/` 在下面另有規則，仍然被排除。
+!.claude/hooks/
+openspec/.vector-search.db*
+
+# bes db backup staging snapshots (consistency snapshots, copy to external storage)
+backups/
+
+# Python
+.venv/
+.project-runtime/
+__pycache__/
+*.pyc
+.tools/
+.review-tmp/
+/.code-review-*
+*.db
+*.db-shm
+*.db-wal
+*.db.bak*
+*.db.pre-*
+# Generated MCP probe fixture secret (database is covered by *.db above)
+probe-fixture.canary
+probe-fixture.manifest.json
+.dev/probe-trials/
+.mailattic-work/
+.subagent-input/
+.subagent-output/
+attachments/
+session-continuity.md
+
+# Runtime logs (regenerable; archive-scraper 等 runtime 產物)
+.archive-scrape-logs/
+
+# 工具設定錯誤時在 repo 根產生的 0-byte path-like 殘留檔
+AppDataRoamingnpm
+scooppersistnodejs-ltsbin
+
+# 本機 agent / IDE 殘留
+.codex/
+
+# 本機暫存（不該入版控）
+Issue/
+
+# Outbound runtime artifacts（add-outbound-send-capability change）
+outbound/drafts/
+outbound/mcp-drafts/
+outbound/markers/
+
+# IMAP / 帳號別 credentials（add-mbsync-imap-sync change）
+# 通配 .env* 避免未來加帳號需手動加 ignore；example 範本仍允許進版控
+.env*
+!.env.example
+!*.env.example
+!*.example
+
+# Copilot CLI ephemeral dispatch artifacts
+.copilot-tasks/
+
+# Regenerable verify / copy artifacts
+cas-bad-files.txt
+cas-verify-summary.txt
+robocopy-attachments.log
+.backfill-archive-stage1.log
+*.db.from-wsl
+
+# Local-only WSL sync / smoke 腳本（reference 自 docs/wsl-environment.md）
+work-tmp/
+
+# Forensics 草稿（merge stage SQL probes 等）— 跨 session 保留供 reference
+_merge-stage-*.sql
+.codex-*.tmp
+codex-*.db-journal
+
+# Codex CLI ephemeral test/pytest temp artifacts（uv interpreter cache + pytest temp dir）
+.codex-test-run/
+.codex-tmp/
+codex-pytest-temp-*/
+codex_tmp_pytest_*/
+python_mkdir_probe/
+uv-*.lock
+
+# Local git worktrees (PR review checkouts)
+.worktrees/
+
+# Codex 讀取的外部 skill 安裝面（`npx skills` 管理，跟隨 upstream）。
+# 目錄本身等同 node_modules —— 不進版控；`skills-lock.json` 才是可重現的來源
+# （`npx skills experimental_install` 由它還原）。這裡刻意不 fork 任何 skill，
+# 偏離集中宣告在 docs/agents/external-skill-routing.md。
+.agents/skills/

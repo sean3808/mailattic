@@ -1,0 +1,11 @@
+# 跨 OS line ending 規範：Linux 內執行的腳本強制 LF，避免 Windows 簽出帶 CRLF 導致
+# Docker 容器內 shebang 解析失敗（exec: no such file or directory）
+*.sh        text eol=lf
+Dockerfile* text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# 郵件測試 fixture 是 byte-exact 原始郵件資料（mbox / .eml），含刻意的 CRLF /
+# 混合 EOL 供 byte-for-byte 斷言（raw_headers round-trip）。autocrlf 正規化會 mangle
+# 這些 bytes 導致 fresh clone 測試失敗 → 標 -text 讓 git 原樣保存、永不做 EOL 轉換。
+tests/fixtures/**            -text

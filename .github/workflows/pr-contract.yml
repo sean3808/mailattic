@@ -1,0 +1,23 @@
+name: PR Contract
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  structure:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      - name: Validate pull request body structure
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: uv run --python 3.13 --no-project python scripts/check_pr_contract.py

@@ -1,0 +1,29 @@
+IMAPAccount mailattic-remote
+Host ${IMAP_HOST}
+Port ${IMAP_PORT}
+User ${IMAP_USER}
+Pass ${IMAP_PASSWORD}
+SSLType IMAPS
+AuthMechs LOGIN
+PipelineDepth 1
+CertificateFile /etc/ssl/certs/ca-certificates.crt
+
+IMAPStore mailattic-remote-store
+Account mailattic-remote
+
+MaildirStore mailattic-local-store
+SubFolders Verbatim
+Path ${MAILDIR_ROOT}/${IMAP_ACCOUNT_NAME}/
+Inbox ${MAILDIR_ROOT}/${IMAP_ACCOUNT_NAME}/INBOX
+
+Channel mailattic-channel
+Far :mailattic-remote-store:
+Near :mailattic-local-store:
+${MBSYNC_PATTERNS_LINE}
+Create Near
+Expunge None
+Sync Pull
+SyncState *
+
+Group mailattic-sync
+Channel mailattic-channel

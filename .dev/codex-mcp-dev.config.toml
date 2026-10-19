@@ -1,0 +1,38 @@
+# Client B (codex-cli) probe profile TEMPLATE — currently DELIVERED UNUSED.
+#
+# Client B is excluded at codex-cli 0.146.0 because `codex exec` takes its prompt
+# at launch and runs the turn to completion. The current supervisor therefore
+# cannot read a canary result before deciding whether to send the target. Missing
+# pre-tool inventory is not an exclusion reason under Supervisor-enforced launch
+# isolation. This template remains unused until Codex has an equivalent staged
+# supervisor boundary; no profile-layering experiment is run in this round.
+#
+# INSTALL LOCATION (outside this repository, which is why only the template is
+# committed): copy to the Codex home directory as
+#
+#   $CODEX_HOME/codex-mcp-dev.config.toml        (default: ~/.codex/)
+#
+# and select it with `-p codex-mcp-dev`. Fill the two placeholders first:
+#
+#   __UV_EXECUTABLE__ -> absolute path of an existing uv.exe
+#   __WORKTREE_ROOT__  -> absolute path of the working tree under test
+#   __FIXTURE_DIR__    -> absolute directory the fixture generator wrote to
+#
+# The database override below is the same binding client A uses. It is stated
+# explicitly rather than left to default resolution, because an unset or blank
+# MAILATTIC_DB resolves to the production database.
+
+[mcp_servers.mailattic-mail-probe]
+command = "__UV_EXECUTABLE__"
+args = [
+    "run",
+    "--project",
+    "__WORKTREE_ROOT__",
+    "python",
+    "-m",
+    "mailattic.mcp_server",
+]
+
+[mcp_servers.mailattic-mail-probe.env]
+MAILATTIC_DB = "__FIXTURE_DIR__/probe-fixture.db"
+PYTHONIOENCODING = "utf-8"

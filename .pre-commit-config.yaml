@@ -1,0 +1,67 @@
+# 職責分離：
+#   - ruff（這裡）：lint + auto-fix lint issues
+#   - ruff-format（這裡）：commit-time format，變更時失敗以便重新 stage
+#
+# --fix：自動修復 lint 問題（如 unused imports、sorting imports）
+# --exit-non-zero-on-fix：修復後仍回傳非零，讓 git 重新 stage
+#
+# default_install_hook_types：確保 reclone 後跑 `pre-commit install` 時，
+# post-commit + post-merge + pre-push wrapper 一併安裝（不依賴本機既存 hook）。
+# post-merge 必要：skill 改動走 feature branch、之後才 merge 到 main 時，
+# merge 觸發的是 post-merge（非 post-commit），少了它則 skill 不會自動部署。
+# pre-push wrapper 的 raw-stdin companion 由 scripts/install-release-pre-push.ps1
+# 安裝為 pre-push.legacy；不能註冊成一般 pre-commit hook，否則拿不到完整 refs。
+minimum_pre_commit_version: "4.5.1"
+default_install_hook_types: [pre-commit, post-commit, post-merge, pre-push]
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff lint
+        entry: uv run --locked --exact ruff check --force-exclude --fix --exit-non-zero-on-fix
+        language: system
+        stages: [pre-commit]
+        types_or: [python, pyi, jupyter]
+        require_serial: true
+        # 兩處排除,理由各不相同(只有第二處是 vendored):
+        #   skills/                   — 本 repo 才是 dev-canonical(見 D-20260602-2),
+        #                               SSOT(另一個 repo)是下游 release
+        #                               copy,由 main commit 的 post-commit/post-merge
+        #                               hook 從這裡部署過去(D-20260820-4)。方向是
+        #                               repo → SSOT。
+        #                               排除是刻意的,不是上游 invariant:skill 內容
+        #                               的正典是可讀性與 subagent 可用性,不是本 repo
+        #                               的 Python lint 風格(issue #34 拍板,2026-08-11)
+        #   scripts/gen_doc_index.py  — placement-drift skill 的 bundled generator,
+        #                               契約是跨專案 byte-identical(見該檔 docstring),
+        #                               改它會破壞上游 invariant
+        exclude: ^(skills/|scripts/gen_doc_index\.py$)
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --locked --exact ruff format --force-exclude
+        language: system
+        stages: [pre-commit]
+        types_or: [python, pyi, jupyter]
+        require_serial: true
+        exclude: ^(skills/|scripts/gen_doc_index\.py$)
+      - id: check-commit-blocklist
+        name: check commit blocklist
+        entry: uv run python scripts/check_commit_blocklist.py
+        language: system
+        stages: [pre-commit]
+        always_run: true
+        pass_filenames: false
+
+  - repo: local
+    hooks:
+      # doc-index 鮮度已改由 harness 層 hook 維護（SessionStart + PostToolUse，
+      # 見 ~/.claude/hooks/docindex-refresh.py 與 .claude/settings.local.json）。
+      # 原本的 doc-index-freshness gate 在此移除：它會擋下不可能讓索引過期的
+      # commit，收工產出未 commit 時任何 commit 都被擋。
+      - id: deploy-skill-to-ssot
+        name: Deploy mailattic skill to SSOT (on main commits)
+        entry: uv run python scripts/deploy-skill-to-ssot.py
+        language: system
+        stages: [post-commit, post-merge]
+        always_run: true
+        pass_filenames: false

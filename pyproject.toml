@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mailattic"
+version = "0.1.0"
+description = "Local PST email evidence ingestion and query tool"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "tzdata>=2024.1; sys_platform == 'win32'",
+    "requests>=2.32",
+    # Imported directly by archive_scrape (PoolManager subclass carrying the legacy
+    # SSL context, plus InsecureRequestWarning). Declared rather than left to
+    # resolve as a requests transitive; the ceiling is here for the same reason the
+    # floor is, so neither bound is inherited from requests.
+    "urllib3>=2.0,<3",
+    "beautifulsoup4>=4.12",
+    "toons>=0.7.0",
+    "charset-normalizer>=3.4.7",
+    # Generation constraint, not a version pin: keeps resolution inside the 2.x generation
+    # whose result-conversion shape and validation-error format this repo has measured.
+    # Excludes 1.x (different lowlevel handler-registration surface and a different
+    # result-conversion contract) and any future 3.x, neither of which has been measured here.
+    "mcp>=2,<3",
+    "pydantic>=2.11",
+    "pywin32>=312 ; sys_platform == 'win32'",
+]
+
+[project.scripts]
+mailattic = "mailattic.cli:main"
+bes = "mailattic.cli:main"
+bes-mcp = "mailattic.mcp_server:main"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.3",
+    "pytest-xdist==3.8.0",
+    "ruff>=0.15.11",
+    "pyright>=1.1.411",
+    # Agent quality gates. Declared here rather than run through an ephemeral tool
+    # runner so uv.lock pins the checker version: a gate whose checker can change
+    # between two runs of the same commit is not a gate.
+    "deptry>=0.25.1",
+    "pip-audit>=2.9.0",
+    # Report-only diff coverage (#75). Locked here rather than supplied by
+    # `uv run --with` for the same reason as the gates above, plus one measured
+    # this change: an ephemeral overlay environment sets VIRTUAL_ENV to a temp
+    # path, and uv's resulting mismatch warning is emitted where callers parse
+    # its output -- which broke two release-installer tests that pass under the
+    # locked route. The overlay is not the path that ships, so it must not be
+    # the path that is qualified.
+    "pytest-cov>=7.0.0",
+    "coverage>=7.11.3",
+    "diff-cover>=9.7.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --basetemp=.project-runtime/pytest"
+cache_dir = ".project-runtime/pytest-cache"
+markers = [
+    "slow: pathological MCP response-budget tests",
+    "release: release, installation, or Git-hook end-to-end tests",
+]
+
+[tool.pyright]
+include = [
+    "src/mailattic/mcp_server.py",
+    "src/mailattic/mcp_delivery.py",
+]
+pythonVersion = "3.13"
+pythonPlatform = "Windows"
+typeCheckingMode = "basic"
+
+# Dependency-contract gate. Canonical invocation: uv run --locked --exact deptry src
+# Scope stays at src/ deliberately: scripts/, docker/ and skills/ import the first-party
+# package, and without configured first-party roots that produces a wall of false
+# DEP001 findings. Widening the scope requires configuring those roots first.
+[tool.deptry]
+# beautifulsoup4 installs the module bs4; without this the declared dependency reads
+# as unused. A packaging naming fact, not a project exception.
+[tool.deptry.package_module_name_map]
+beautifulsoup4 = "bs4"
+# tzdata is a data-only distribution consumed by the stdlib zoneinfo on Windows. No
+# source file imports it and none ever will, so it is permanently invisible to an
+# import scanner. Named specifically so every other unused-dependency finding still fails.
+[tool.deptry.per_rule_ignores]
+DEP002 = ["tzdata"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mailattic"]

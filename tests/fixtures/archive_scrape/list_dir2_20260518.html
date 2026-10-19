@@ -1,0 +1,205 @@
+<html>
+<head>
+<link rel="stylesheet" href="../my_style.css" type="text/css">
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<script language="JavaScript" src="../global.js"></script>
+<script language="JavaScript">
+    var PrevPage = 1, NextPage = 2;
+    function setVar(OBJ, RECIPIENT) {
+	OBJ.cd.value = 0;
+	OBJ.fsed.value = OBJ.frcpt.value = RECIPIENT;
+	return;
+    }
+    function ViewDetail(DT, SN, NO, CHARSET, RRD, MAIL, RDD, E) {
+       var URI = '/cgi-bin/mail_log.cgi?q=1&dir=2&entry='+SN+'&dt='+DT+'&MULTI_LANG=ch&cc='+CHARSET+'&rrd='+RRD+'&menulv=59_62&fsed='+MAIL+'&frcpt='+MAIL+'&rdd='+RDD;
+       DetailViewer = OpenViewer(URI, 1000, 550);
+       return false;
+    }
+    function ChangeDate(OBJ) {
+	OBJ.submit();
+    }
+</script>
+</head>
+<body class="MainBody">
+<form name="mail_log" method="post" action="mail_log.cgi">
+<input type="hidden" name="q" value="0">
+<input type="hidden" name="cd" value="0">
+<input type="hidden" name="dir" value="2">
+<input type="hidden" name="fsed" value="">
+<input type="hidden" name="frcpt" value="">
+<table width="900" cellPadding="0" cellSpacing="0">
+<tr class="TextAttr">
+<td align="center">
+<select name="dt" onChange="return ChangeDate(document.mail_log);"><option value="20260519">2026-05-19</option>
+<option value="20260518" selected>2026-05-18 (12&nbsp;筆記錄)</option>
+<option value="20260515">2026-05-15</option>
+<option value="20260514">2026-05-14</option>
+<option value="20260513">2026-05-13</option>
+<option value="20260512">2026-05-12</option>
+<option value="20260511">2026-05-11</option>
+<option value="20260508">2026-05-08</option>
+<option value="20260507">2026-05-07</option>
+<option value="20260506">2026-05-06</option>
+<option value="20260505">2026-05-05</option>
+<option value="20260504">2026-05-04</option>
+</select></td>
+</tr>
+</table>
+<table width="900" cellPadding="0" cellSpacing="0">
+<tr class="TextAttr">
+<td align="right"><input type="hidden" name="page" value="1">
+<input type="hidden" name="pageReset">
+<input type="hidden" name="move">
+<input type="hidden" name="uiPageNum">
+<input type="hidden" name="pageStr" value="1,1,1,1,">
+<script language="JavaScript">
+function ChangePage(objf, page, uipagenum) {
+	objf.page.value = page;
+	objf.uiPageNum.value = uipagenum;
+	objf.submit();
+}
+function InputPage(objf, num, e, act, uipagenum, pagemax) {
+	return false;
+}
+</script>
+<td><input type="text" name="gopage0" maxlength="1" class="list_tool_input_attr" style="width:17px;" value="1" onKeyDown="return InputPage(this.form, 0, event, 'INPUT', 0, 2);"></td>
+<td><button type="submit" class="list_tool_bt_go" onClick="return InputPage(this.form, 0, event, 'GO', 0, 2);">移至</button></td>
+<td><button type="submit" class="list_tool_bt_up" onClick="return ChangePage(this.form, 2, 0)">next</button></td>
+</tr>
+</table>
+<table width="900" cellPadding="0" cellSpacing="1" class="FixedTable">
+<tr class="FstCol">
+<td width="22"><input type="checkbox" id="sa" name="select_all"></td>
+<td width="50">時間</td>
+<td width="100">寄件者 </td>
+<td width="100">收件者 </td>
+<td width="70">郵件 ID</td>
+<td width="22"></td>
+<td width="250">主旨 </td>
+<td width="65">處理方式 </td>
+</tr>
+<input type="hidden" name="fst_mail" value="dan.wu@buyer-a.example">
+<tr id="ML_0" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="54" onClick="setVar(document.mail_log, 'dan.wu@buyer-a.example');"></td>
+<td>17:29:21</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'staff01@mailattic.test');">staff01@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'dan.wu@buyer-a.example&erin.fox@buyer-a.example');">dan.wu@buyer-a.example,&nbsp;erin.fox@buyer-a.example</a></td>
+<td class="textOverFlow"><input id="MID0" type="hidden" value="01aa01dd0054$2b3c4d5e$6f7a8b9c$@mailattic.test">&nbsp;01aa01dd0054$2b3c4d5e$6f7a8b9c$@mailattic.test</td>
+<td><img src="../icons_ch/graph_clip.gif" border="0" align="absmiddle" onMouseOver="showTip('<b>附加檔案</b> : inline-01.jpg,&nbsp;quote-PAPER-A4-80.pdf');" onMouseout="hideTip();"></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '54', '0', '^o^', '1', 'dan.wu@buyer-a.example', '4', event);">RE:&nbsp;Delivery&nbsp;note&nbsp;for&nbsp;PAPER-A4-80&nbsp;pallet</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_1" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="53" onClick="setVar(document.mail_log, 'carol.ng@buyer-a.example');"></td>
+<td>15:12:37</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'sean3808@mailattic.test');">sean3808@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'carol.ng@buyer-a.example&bob.lee@buyer-a.example&dan.wu@buyer-a.example');">carol.ng@buyer-a.example,&nbsp;bob.lee@buyer-a.example,&nbsp;dan.wu@buyer-a.example</a></td>
+<td class="textOverFlow"><input id="MID1" type="hidden" value="01aa01dd0053$1a2b3c4d$5e6f7a8b$@mailattic.test">&nbsp;01aa01dd0053$1a2b3c4d$5e6f7a8b$@mailattic.test</td>
+<td><img src="../icons_ch/graph_clip.gif" border="0" align="absmiddle" onMouseOver="showTip('<b>附加檔案</b> : inline-01.png,&nbsp;inline-02.gif,&nbsp;quote-PEN-100.pdf');" onMouseout="hideTip();"></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '53', '1', '^o^', '1', 'carol.ng@buyer-a.example', '4', event);">RE:&nbsp;Quote&nbsp;for&nbsp;PEN-100&nbsp;sample&nbsp;kit</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_2" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="52" onClick="setVar(document.mail_log, 'frank.gu@buyer-b.example');"></td>
+<td>17:04:22</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'staff02@mailattic.test');">staff02@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'frank.gu@buyer-b.example&gina.hu@buyer-b.example');">frank.gu@buyer-b.example,&nbsp;gina.hu@buyer-b.example</a></td>
+<td class="textOverFlow"><input id="MID2" type="hidden" value="01aa01dd0052$3c4d5e6f$7a8b9c0d$@mailattic.test">&nbsp;01aa01dd0052$3c4d5e6f$7a8b9c0d$@mailattic.test</td>
+<td><img src="../icons_ch/graph_clip.gif" border="0" align="absmiddle" onMouseOver="showTip('<b>附加檔案</b> : inline-01.png');" onMouseout="hideTip();"></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '52', '2', '^o^', '1', 'frank.gu@buyer-b.example', '4', event);">RE:&nbsp;Order&nbsp;confirmation&nbsp;TONER-55&nbsp;x&nbsp;20</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_3" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="51" onClick="setVar(document.mail_log, 'hank.ito@buyer-c.example');"></td>
+<td>17:04:14</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'sean3808@mailattic.test');">sean3808@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'hank.ito@buyer-c.example');">hank.ito@buyer-c.example</a></td>
+<td class="textOverFlow"><input id="MID3" type="hidden" value="01aa01dd0051$4d5e6f7a$8b9c0d1e$@mailattic.test">&nbsp;01aa01dd0051$4d5e6f7a$8b9c0d1e$@mailattic.test</td>
+<td><img src="../icons_ch/graph_clip.gif" border="0" align="absmiddle" onMouseOver="showTip('<b>附加檔案</b> : inline-01.png');" onMouseout="hideTip();"></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '51', '3', '^o^', '1', 'hank.ito@buyer-c.example', '4', event);">RE:&nbsp;Invoice&nbsp;INV-2051&nbsp;for&nbsp;DESK-30</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_4" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="50" onClick="setVar(document.mail_log, 'ivy.qin@buyer-c.example');"></td>
+<td>16:59:08</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'staff03@mailattic.test');">staff03@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'ivy.qin@buyer-c.example');">ivy.qin@buyer-c.example</a></td>
+<td class="textOverFlow"><input id="MID4" type="hidden" value="01aa01dd0050$5e6f7a8b$9c0d1e2f$@mailattic.test">&nbsp;01aa01dd0050$5e6f7a8b$9c0d1e2f$@mailattic.test</td>
+<td></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '50', '4', '^o^', '1', 'ivy.qin@buyer-c.example', '4', event);">Quote&nbsp;for&nbsp;STAPLER-7&nbsp;(office&nbsp;pack)</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_5" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="49" onClick="setVar(document.mail_log, 'jack.ma@buyer-d.example');"></td>
+<td>16:41:55</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'staff01@mailattic.test');">staff01@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'jack.ma@buyer-d.example&kate.su@buyer-d.example');">jack.ma@buyer-d.example,&nbsp;kate.su@buyer-d.example</a></td>
+<td class="textOverFlow"><input id="MID5" type="hidden" value="01aa01dd0049$6f7a8b9c$0d1e2f3a$@mailattic.test">&nbsp;01aa01dd0049$6f7a8b9c$0d1e2f3a$@mailattic.test</td>
+<td><img src="../icons_ch/graph_clip.gif" border="0" align="absmiddle" onMouseOver="showTip('<b>附加檔案</b> : inline-01.png,&nbsp;inline-02.png');" onMouseout="hideTip();"></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '49', '5', '^o^', '1', 'jack.ma@buyer-d.example', '4', event);">RE:&nbsp;Delivery&nbsp;note&nbsp;for&nbsp;FOLDER-20</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_6" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="48" onClick="setVar(document.mail_log, 'leo.tan@buyer-d.example');"></td>
+<td>15:30:02</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'sean3808@mailattic.test');">sean3808@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'leo.tan@buyer-d.example');">leo.tan@buyer-d.example</a></td>
+<td class="textOverFlow"><input id="MID6" type="hidden" value="01aa01dd0048$7a8b9c0d$1e2f3a4b$@mailattic.test">&nbsp;01aa01dd0048$7a8b9c0d$1e2f3a4b$@mailattic.test</td>
+<td></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '48', '6', '^o^', '1', 'leo.tan@buyer-d.example', '4', event);">RE:&nbsp;Order&nbsp;confirmation&nbsp;PEN-100&nbsp;x&nbsp;500</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_7" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="47" onClick="setVar(document.mail_log, 'mia.yeh@buyer-e.example');"></td>
+<td>14:18:40</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'staff02@mailattic.test');">staff02@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'mia.yeh@buyer-e.example');">mia.yeh@buyer-e.example</a></td>
+<td class="textOverFlow"><input id="MID7" type="hidden" value="01aa01dd0047$8b9c0d1e$2f3a4b5c$@mailattic.test">&nbsp;01aa01dd0047$8b9c0d1e$2f3a4b5c$@mailattic.test</td>
+<td><img src="../icons_ch/graph_clip.gif" border="0" align="absmiddle" onMouseOver="showTip('<b>附加檔案</b> : quote-NOTE-A5.pdf');" onMouseout="hideTip();"></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '47', '7', '^o^', '1', 'mia.yeh@buyer-e.example', '4', event);">Quote&nbsp;for&nbsp;NOTE-A5&nbsp;(notebooks)</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_8" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="46" onClick="setVar(document.mail_log, 'ned.kuo@buyer-e.example');"></td>
+<td>11:52:13</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'staff04@mailattic.test');">staff04@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'ned.kuo@buyer-e.example&ola.pan@buyer-e.example');">ned.kuo@buyer-e.example,&nbsp;ola.pan@buyer-e.example</a></td>
+<td class="textOverFlow"><input id="MID8" type="hidden" value="01aa01dd0046$9c0d1e2f$3a4b5c6d$@mailattic.test">&nbsp;01aa01dd0046$9c0d1e2f$3a4b5c6d$@mailattic.test</td>
+<td></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '46', '8', '^o^', '1', 'ned.kuo@buyer-e.example', '4', event);">RE:&nbsp;Invoice&nbsp;INV-2046&nbsp;for&nbsp;CHAIR-12</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_9" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="45" onClick="setVar(document.mail_log, 'pam.lo@buyer-f.example');"></td>
+<td>10:07:29</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'staff01@mailattic.test');">staff01@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'pam.lo@buyer-f.example');">pam.lo@buyer-f.example</a></td>
+<td class="textOverFlow"><input id="MID9" type="hidden" value="01aa01dd0045$0d1e2f3a$4b5c6d7e$@mailattic.test">&nbsp;01aa01dd0045$0d1e2f3a$4b5c6d7e$@mailattic.test</td>
+<td><img src="../icons_ch/graph_clip.gif" border="0" align="absmiddle" onMouseOver="showTip('<b>附加檔案</b> : inline-01.png');" onMouseout="hideTip();"></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '45', '9', '^o^', '1', 'pam.lo@buyer-f.example', '4', event);">RE:&nbsp;Delivery&nbsp;note&nbsp;for&nbsp;TONER-55</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_10" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="44" onClick="setVar(document.mail_log, 'quin.ho@buyer-f.example');"></td>
+<td>09:45:51</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'sean3808@mailattic.test');">sean3808@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'quin.ho@buyer-f.example');">quin.ho@buyer-f.example</a></td>
+<td class="textOverFlow"><input id="MID10" type="hidden" value="01aa01dd0044$1e2f3a4b$5c6d7e8f$@mailattic.test">&nbsp;01aa01dd0044$1e2f3a4b$5c6d7e8f$@mailattic.test</td>
+<td></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '44', '10', '^o^', '1', 'quin.ho@buyer-f.example', '4', event);">RE:&nbsp;Quote&nbsp;for&nbsp;MARKER-8&nbsp;(whiteboard&nbsp;set)</a></td>
+<td>歸檔</td>
+</tr>
+<tr id="ML_11" class="Col" onMouseOver="LightBarIn(this);" onMouseOut="LightBarOut(this);">
+<td><input type="checkbox" name="entry" value="43" onClick="setVar(document.mail_log, 'ray.wen@buyer-f.example');"></td>
+<td>09:12:06</td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '1', 'staff05@mailattic.test');">staff05@mailattic.test</a></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return enableFilter(document.mail_log, '2', 'ray.wen@buyer-f.example&sue.lai@buyer-f.example');">ray.wen@buyer-f.example,&nbsp;sue.lai@buyer-f.example</a></td>
+<td class="textOverFlow"><input id="MID11" type="hidden" value="01aa01dd0043$2f3a4b5c$6d7e8f9a$@mailattic.test">&nbsp;01aa01dd0043$2f3a4b5c$6d7e8f9a$@mailattic.test</td>
+<td><img src="../icons_ch/graph_clip.gif" border="0" align="absmiddle" onMouseOver="showTip('<b>附加檔案</b> : inline-01.png,&nbsp;inline-02.jpg');" onMouseout="hideTip();"></td>
+<td class="textOverFlow" align="left">&nbsp;<a href="#" class="ColLink"  onClick="return ViewDetail(document.mail_log.dt.options[document.mail_log.dt.options.selectedIndex].value, '43', '11', '^o^', '1', 'ray.wen@buyer-f.example', '4', event);">RE:&nbsp;Order&nbsp;confirmation&nbsp;PAPER-A4-80&nbsp;x&nbsp;40</a></td>
+<td>歸檔</td>
+</tr>
+</table>
+</form>
+</body>
+</html>

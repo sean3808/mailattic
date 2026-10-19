@@ -1,0 +1,19 @@
+# Gitignored files/dirs to copy into new worktrees created by `claude -w`.
+# Syntax: .gitignore-style patterns. Only files that are gitignored AND match
+# a pattern get copied; tracked files are never duplicated.
+#
+# Why each entry exists:
+# - `.claude/skills/<name>/` and `.codex/skills/<name>/` are junctions pointing
+#   to the SSOT repo. They are gitignored and
+#   would not be inherited by fresh git worktree checkouts. Worktree session
+#   needs them to invoke /<skill> without manual /sync-skill-from-SSOT
+#   (which is itself a junction — chicken-and-egg).
+# - `.agents/skills/` is where Codex looks for repo-scope skills. Unlike the
+#   entries above it holds real files, not junctions: the Matt skill set is
+#   installed there and gitignored, and there is no USER-scope copy for Codex
+#   to fall back on (Claude Code is unaffected — it loads that set from a
+#   user-level plugin cache). Without this entry a fresh worktree's Codex
+#   agent has no Matt skills at all. The pattern covers the whole directory
+#   on purpose: naming skills one by one would silently miss whatever
+#   upstream adds next.
+.agents/skills/

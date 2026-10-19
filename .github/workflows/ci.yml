@@ -1,0 +1,132 @@
+name: CI
+
+# What this workflow is for: the things a local gate cannot establish. The
+# `static` and `package` jobs run on every non-draft pull request and every
+# push to main; a clean checkout with no local cache, no .venv, and none of the
+# gitignored vendored files proves that this commit is complete and installable.
+# Neither of them runs pytest.
+#
+# `hosted-full` does run the canonical launcher's Full route, but only from the
+# weekly schedule or a manual dispatch (#62). It is a supplemental
+# environment-compatibility probe, not merge or release evidence -- those still
+# come from a local Full run. See docs/agents/quality-gates.md for what each
+# green signal does and does not mean.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 18 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    # Draft pull requests do not run: agents push often and Windows minutes bill
+    # at 2x. Marking a pull request ready for review triggers the run.
+    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    # windows-latest only, and no matrix. Pyright is configured with
+    # pythonPlatform = "Windows" and a .venv/Scripts/python.exe interpreter path,
+    # and the operational environment is Windows 11. An Ubuntu run would prove
+    # nothing this repository cares about while producing false signals from the
+    # .gitattributes EOL rules and the `tests/fixtures/** -text` entry.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned to the exact release measured in the #60 spike. setup-uv
+      # publishes no `v9` moving major tag -- `@v9` fails to resolve, verified
+      # on run 30686339783 -- so a major-tag pin is not available here.
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      # No uv cache is restored on purpose: an empty environment is the point of
+      # this job, and a restored cache would weaken the claim it makes. setup-uv
+      # reads the tracked uv.toml and leaves UV_CACHE_DIR alone, so the cache
+      # lands under the gitignored .project-runtime/ root (measured in the #60
+      # spike) and cannot dirty the working tree.
+      - name: Sync the locked environment
+        run: uv sync --locked
+
+      # Every command below is the canonical form from
+      # docs/agents/quality-gates.md, check variant only. No hand-assembled
+      # variants, and nothing that mutates tracked files.
+      - name: Ruff lint
+        run: uv run --locked --exact ruff check .
+
+      - name: Ruff format
+        run: uv run --locked --exact ruff format --check .
+
+      - name: Dependency contract
+        run: uv run --locked --exact deptry src
+
+      - name: MCP boundary types
+        run: uv run --locked --exact pyright --pythonpath .venv/Scripts/python.exe --warnings
+
+      # The gate a local run cannot provide: after every check above, the
+      # working tree must still match the commit. This catches a gate that
+      # repaired a file locally without the repair being committed.
+      - name: Working tree is clean
+        shell: pwsh
+        run: |
+          $changes = git status --porcelain
+          if ($changes) {
+            Write-Host "::error::The working tree is not clean after the checks above."
+            $changes | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          Write-Host "Working tree clean."
+
+  package:
+    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      - name: Build the wheel
+        run: uv build
+
+      # Installs the wheel that was just built -- not the working tree -- so a
+      # [tool.hatch] packages list that omits a module fails here rather than at
+      # release time.
+      - name: Install the built wheel as a tool
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem dist/*.whl | Select-Object -First 1
+          if (-not $wheel) { throw "uv build produced no wheel under dist/." }
+          Write-Host "Installing $($wheel.Name)"
+          uv tool install --force $wheel.FullName
+
+      - name: Console scripts start
+        shell: pwsh
+        run: |
+          $binDir = (uv tool dir --bin).Trim()
+          $env:PATH = "$binDir;$env:PATH"
+          bes --help
+          bes-mcp --help
+
+  hosted-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      - name: Sync the locked environment
+        run: uv sync --locked
+
+      - name: Run the canonical full test gate
+        run: pwsh -NoProfile -File scripts/invoke-pytest.ps1 -Route Full

@@ -1,0 +1,24 @@
+From: Alice Example <alice@example.com>
+To: Bob Example <bob@example.com>
+Cc: Carol Example <carol@example.com>
+Date: Tue, 02 Jan 2024 03:04:05 +0000
+Subject: maplecrest contract discussion
+Message-ID: <msg-001@example.com>
+In-Reply-To: <root@example.com>
+References: <root@example.com> <msg-001@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="boundary-001"
+
+--boundary-001
+Content-Type: text/plain; charset="utf-8"
+
+This email records the first maplecrest contract discussion.
+
+--boundary-001
+Content-Type: application/pdf
+Content-Disposition: attachment; filename="evidence.pdf"
+Content-Transfer-Encoding: base64
+
+UEZG
+
+--boundary-001--
