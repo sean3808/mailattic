@@ -99,6 +99,10 @@ PST import reads through a running Outlook profile, and the test launcher is Pow
 | Why a design was chosen | [`docs/decisions.md`](docs/decisions.md) (records are written in Traditional Chinese) |
 | All documents | [`docs/INDEX.md`](docs/INDEX.md) |
 
+## Acknowledgements
+
+The development workflow uses Matt Pocock's [skills](https://github.com/mattpocock/skills).
+
 ## License
 
 [MIT](LICENSE). Maintained by [@sean3808](https://github.com/sean3808).

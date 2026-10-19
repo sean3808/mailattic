@@ -176,7 +176,7 @@ def main() -> int:
             no_anchor += 1
         snip = re.sub(r"\s+", " ", body[s:e])
         print(f"[{r['id']}] {r['sent_at'][:10]} | {r['sender_email']}")
-        print(f"   主旨: {r['subject']}")
+        print(f"   Subject: {r['subject']}")
         label = "" if m else "[anchor not found; body start] "
         print(f"   {label}...{snip}...\n")
         hits += 1

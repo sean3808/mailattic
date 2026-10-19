@@ -13,7 +13,9 @@ import re
 import sys
 from pathlib import Path
 
-KEYWORDS = re.compile(r"契約|anchor\s*test|reconcile|行為契約", re.IGNORECASE)
+KEYWORDS = re.compile(
+    r"契約|anchor\s*test|reconcile|behaviou?r\s+contract", re.IGNORECASE
+)
 ANCHOR_TESTS = {
     "test_mcp_server.py",
     "test_outbound_send.py",
@@ -28,7 +30,7 @@ MSG = (
     "本操作觸及行為契約領域（非強制提醒）。本專案規則：動到行為契約條目或其 anchor test"
     "的變更必須走 PR + /spec-reconcile；anchor test 檔案改動另須跨模型語意審查"
     "（由 /closeout 的 semantic-review 格履行，收尾定 Medium 以上）。"
-    f"正典：{CANONICAL_DOC} ## 行為契約 段（D-20260820-3）。"
+    f"正典：{CANONICAL_DOC} ## Behaviour contracts (行為契約) 段（D-20260820-3）。"
     "與契約無關的操作可忽略本提醒。"
 )
 

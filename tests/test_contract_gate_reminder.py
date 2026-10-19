@@ -129,7 +129,7 @@ def test_anchor_tests_match_agents_md_contract_section():
     改名或新增 anchor test 只動一邊，gate 就靜默瞎掉（= 本 hook 存在要修的失效類型）。
     """
     lines = (_REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8").splitlines()
-    start = lines.index("## 行為契約")
+    start = lines.index("## Behaviour contracts (行為契約)")
     end = next(
         i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln.startswith("## ")
     )
