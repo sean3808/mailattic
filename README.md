@@ -9,6 +9,8 @@ It was built for one long-running mailbox on a self-hosted mail server that only
 ## Quick start
 
 ```powershell
+git clone https://github.com/sean3808/mailattic.git
+cd mailattic
 uv sync
 uv run bes init-db --database .\mailattic.db
 uv run bes import --database .\mailattic.db --maildir C:\path\to\maildir-account --account-email you@example.com
@@ -17,6 +19,17 @@ uv run bes thread 1 --database .\mailattic.db --format json
 ```
 
 You need Windows 11, Python 3.13, and [`uv`](https://docs.astral.sh/uv/). The import above reads a maildir and does not use Outlook. For PST import, read [Requirements](#requirements) first.
+
+### Use `bes` from any directory
+
+Agents in other projects call a global `bes`. Install it from the clone, then point it at your database:
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File scripts\reinstall-global.ps1
+setx MAILATTIC_DB C:\path\to\mailattic.db
+```
+
+The global `bes` is a snapshot of the build, so run the script again after you pull new code. Removal and the database path order are in [`docs/global-install-and-release.md`](docs/global-install-and-release.md). To register the MCP server with Claude Desktop, see [`docs/cowork-mcp-bridge-validation.md`](docs/cowork-mcp-bridge-validation.md) (written in Traditional Chinese).
 
 ## Why query an archive
 

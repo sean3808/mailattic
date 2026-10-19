@@ -9,6 +9,8 @@ mailattic 把多年的 Outlook PST 存檔和 IMAP 增量同步收進一顆本機
 ## 快速開始
 
 ```powershell
+git clone https://github.com/sean3808/mailattic.git
+cd mailattic
 uv sync
 uv run bes init-db --database .\mailattic.db
 uv run bes import --database .\mailattic.db --maildir C:\path\to\maildir-account --account-email you@example.com
@@ -17,6 +19,17 @@ uv run bes thread 1 --database .\mailattic.db --format json
 ```
 
 需要 Windows 11、Python 3.13 與 [`uv`](https://docs.astral.sh/uv/)。上面匯入的是 maildir，用不到 Outlook；要匯入 PST 請先看[環境需求](#環境需求)。
+
+### 在任何目錄使用 `bes`
+
+其他專案的 agent 呼叫的是全域 `bes`。在 clone 下來的目錄安裝，再指向你的資料庫：
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File scripts\reinstall-global.ps1
+setx MAILATTIC_DB C:\path\to\mailattic.db
+```
+
+全域 `bes` 是建置當下的快照，拉了新程式碼要再跑一次腳本。移除方式與資料庫路徑的優先順序見 [`docs/global-install-and-release.md`](docs/global-install-and-release.md)；要把 MCP server 加進 Claude Desktop，見 [`docs/cowork-mcp-bridge-validation.md`](docs/cowork-mcp-bridge-validation.md)。
 
 ## 為什麼從存檔查
 
