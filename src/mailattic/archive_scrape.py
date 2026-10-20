@@ -47,9 +47,6 @@ DEFAULT_TIMEOUT_SECONDS: int = 15
 
 EXIT_OK: int = 0
 EXIT_ENV_PROBLEM: int = 1
-EXIT_MLS_UNREACHABLE: int = 2
-EXIT_MLS_AUTH_FAILED: int = 3
-EXIT_MLS_SESSION_INVALID: int = 4
 EXIT_PARTIAL_FAILURE: int = 5
 
 
@@ -74,36 +71,6 @@ class EnvMissingFieldError(RuntimeError):
 
     def __init__(self, key: str) -> None:
         super().__init__(f"MAIL_SERVER_ENV_MISSING_FIELD: {key}")
-
-
-class MlsUnreachableError(RuntimeError):
-    """mail server 管理介面連不上（exit 2）。"""
-
-    exit_code: int = EXIT_MLS_UNREACHABLE
-
-    def __init__(self, detail: str = "") -> None:
-        msg = "MLS_UNREACHABLE"
-        if detail:
-            msg = f"{msg}: {detail}"
-        super().__init__(msg)
-
-
-class MlsAuthFailedError(RuntimeError):
-    """HTTP Basic auth 被拒 401（exit 3）。"""
-
-    exit_code: int = EXIT_MLS_AUTH_FAILED
-
-    def __init__(self) -> None:
-        super().__init__("MLS_AUTH_FAILED")
-
-
-class MlsSessionInvalidError(RuntimeError):
-    """已取得 session cookie 但 archive 頁回 401（exit 4）。"""
-
-    exit_code: int = EXIT_MLS_SESSION_INVALID
-
-    def __init__(self) -> None:
-        super().__init__("MLS_SESSION_INVALID")
 
 
 # ---------------------------------------------------------------------------
@@ -250,47 +217,6 @@ def build_session(
     session.verify = verify
     session.mount("https://", _LegacySslAdapter())
     return session
-
-
-# ---------------------------------------------------------------------------
-# task 2.3 — failure classifier helper
-# ---------------------------------------------------------------------------
-
-
-def classify_request_failure(
-    exc: Exception,
-    *,
-    after_login: bool,
-) -> type[MlsUnreachableError | MlsAuthFailedError | MlsSessionInvalidError]:
-    """將 requests 例外對應到 MLS 失敗 class。
-
-    Parameters
-    ----------
-    exc:
-        捕捉到的例外（``requests.exceptions.*`` 或帶 ``status_code`` 的
-        ``requests.Response``）。
-    after_login:
-        ``True`` 表示 login 成功後存取 archive 頁時發生；
-        ``False`` 表示在 login 階段發生。
-
-    Returns
-    -------
-    type
-        對應的 exception class（未 raise，由呼叫端決定是否 raise）。
-    """
-    network_excs = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
-    if isinstance(exc, network_excs):
-        return MlsUnreachableError
-
-    # HTTP response 物件（呼叫端包成例外前傳入此 helper 判斷）
-    status_code: int | None = getattr(exc, "status_code", None)
-    if status_code == 401:
-        if after_login:
-            return MlsSessionInvalidError
-        return MlsAuthFailedError
-
-    # fallback：視為連線問題
-    return MlsUnreachableError
 
 
 # ---------------------------------------------------------------------------
@@ -1257,9 +1183,6 @@ def run_scrape(
                 conn.close()
 
     except (EnvNotFoundError, EnvMissingFieldError) as exc:
-        print(str(exc), file=sys.stderr)
-        exit_code = exc.exit_code
-    except (MlsUnreachableError, MlsAuthFailedError, MlsSessionInvalidError) as exc:
         print(str(exc), file=sys.stderr)
         exit_code = exc.exit_code
 

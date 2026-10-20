@@ -27,7 +27,6 @@ from .identity import (
     resolve_self_addresses,
 )
 from .imap_sync import (
-    DEFAULT_COMPOSE_FILE,
     DEFAULT_ENV_FILE,
     DEFAULT_LOG_DIR,
     DEFAULT_MAILDIR_ROOT,
@@ -210,12 +209,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--env-file",
         type=Path,
         default=DEFAULT_ENV_FILE,
-        help=argparse.SUPPRESS,
-    )
-    sync_parser.add_argument(
-        "--compose-file",
-        type=Path,
-        default=DEFAULT_COMPOSE_FILE,
         help=argparse.SUPPRESS,
     )
     sync_parser.add_argument(
@@ -1143,7 +1136,6 @@ def _handle_sync_imap(args: argparse.Namespace) -> int:
             )
             outcome = pre_task_sync_imap(
                 database_path=args.database,
-                compose_file=args.compose_file,
                 env_file=args.env_file,
                 maildir_root=args.maildir_root,
                 log_dir=args.log_dir,
@@ -1264,7 +1256,6 @@ def _handle_sync_imap(args: argparse.Namespace) -> int:
         )
         result = run_sync_imap(
             database_path=args.database,
-            compose_file=args.compose_file,
             env_file=args.env_file,
             maildir_root=args.maildir_root,
             log_dir=args.log_dir,

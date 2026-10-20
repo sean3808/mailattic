@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 from mailattic.imap_sync import (
-    DEFAULT_COMPOSE_FILE,
     DEFAULT_DATABASE_PATH,
     DEFAULT_ENV_FILE,
     DEFAULT_LOG_DIR,
@@ -31,7 +30,6 @@ from mailattic.storage import DEFAULT_DB_NAME
 REPO_ROOT = Path(r"C:\IT_Projects\mailattic")
 
 DEFAULT_PATHS: dict[str, Path] = {
-    "imap_sync.DEFAULT_COMPOSE_FILE": DEFAULT_COMPOSE_FILE,
     "imap_sync.DEFAULT_ENV_FILE": DEFAULT_ENV_FILE,
     "imap_sync.DEFAULT_MAILDIR_ROOT": DEFAULT_MAILDIR_ROOT,
     "imap_sync.DEFAULT_DATABASE_PATH": DEFAULT_DATABASE_PATH,

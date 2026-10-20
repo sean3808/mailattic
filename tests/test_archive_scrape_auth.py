@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import requests
 
@@ -16,13 +16,9 @@ from mailattic.archive_scrape import (
     CREDENTIALS_ENV_VAR,
     EnvMissingFieldError,
     EnvNotFoundError,
-    MlsAuthFailedError,
     MlsCredentials,
-    MlsSessionInvalidError,
-    MlsUnreachableError,
     _default_credentials_env_path,
     build_session,
-    classify_request_failure,
     load_credentials,
 )
 
@@ -108,6 +104,14 @@ class TestLoadCredentials(unittest.TestCase):
 
         self.assertEqual(creds.password, "abc=xyz==")
 
+    def test_env_exception_classes_inherit_runtime_error(self) -> None:
+        """各 exception class 應繼承 RuntimeError。"""
+        for cls in (EnvNotFoundError, EnvMissingFieldError):
+            self.assertTrue(
+                issubclass(cls, RuntimeError),
+                f"{cls.__name__} not RuntimeError",
+            )
+
 
 class TestBuildSession(unittest.TestCase):
     """task 2.2 — build_session() unit tests（不連真實郵件伺服器）。"""
@@ -143,62 +147,6 @@ class TestBuildSession(unittest.TestCase):
         creds = self._make_creds()
         session = build_session(creds)
         self.assertIsInstance(session, requests.Session)
-
-
-class TestClassifyRequestFailure(unittest.TestCase):
-    """task 2.3 — classify_request_failure() unit tests。"""
-
-    def test_connection_error_maps_to_mls_unreachable(self) -> None:
-        """requests.ConnectionError → MlsUnreachableError（exit 2）。"""
-        exc = requests.exceptions.ConnectionError("Name resolution failed")
-        result = classify_request_failure(exc, after_login=False)
-        self.assertIs(result, MlsUnreachableError)
-        self.assertEqual(result.exit_code, 2)
-
-    def test_timeout_maps_to_mls_unreachable(self) -> None:
-        """requests.Timeout → MlsUnreachableError。"""
-        exc = requests.exceptions.Timeout("timed out")
-        result = classify_request_failure(exc, after_login=False)
-        self.assertIs(result, MlsUnreachableError)
-
-    def test_401_at_login_maps_to_mls_auth_failed(self) -> None:
-        # after_login=False + 401 → MlsAuthFailedError (exit 3)
-        exc = MagicMock()
-        exc.status_code = 401
-        # Not a ConnectionError / Timeout, has status_code attribute
-        result = classify_request_failure(exc, after_login=False)
-        self.assertIs(result, MlsAuthFailedError)
-        self.assertEqual(result.exit_code, 3)
-
-    def test_401_after_login_maps_to_mls_session_invalid(self) -> None:
-        # after_login=True + 401 → MlsSessionInvalidError (exit 4)
-        exc = MagicMock()
-        exc.status_code = 401
-        result = classify_request_failure(exc, after_login=True)
-        self.assertIs(result, MlsSessionInvalidError)
-        self.assertEqual(result.exit_code, 4)
-
-    def test_exception_classes_have_correct_exit_codes(self) -> None:
-        """各 exception class 的 exit_code 屬性對應常數。"""
-        self.assertEqual(EnvNotFoundError.exit_code, 1)
-        self.assertEqual(EnvMissingFieldError.exit_code, 1)
-        self.assertEqual(MlsUnreachableError.exit_code, 2)
-        self.assertEqual(MlsAuthFailedError.exit_code, 3)
-        self.assertEqual(MlsSessionInvalidError.exit_code, 4)
-
-    def test_exception_classes_inherit_runtime_error(self) -> None:
-        """各 exception class 應繼承 RuntimeError。"""
-        for cls in (
-            EnvNotFoundError,
-            EnvMissingFieldError,
-            MlsUnreachableError,
-            MlsAuthFailedError,
-            MlsSessionInvalidError,
-        ):
-            self.assertTrue(
-                issubclass(cls, RuntimeError),
-                f"{cls.__name__} not RuntimeError",
-            )
 
 
 class TestDefaultCredentialsEnvPath(unittest.TestCase):

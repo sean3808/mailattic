@@ -987,12 +987,6 @@ def _walk_own_parts_with_context(message: Any) -> Iterator[tuple[Any, bool]]:
                 stack.append((child, is_alt))
 
 
-def _walk_own_parts(message: Any) -> Iterator[Any]:
-    """walk() that does not descend into an attached message/rfc822 subtree."""
-    for part, _ in _walk_own_parts_with_context(message):
-        yield part
-
-
 # Pinned host-independent extensions for standard attachment MIME types.
 # Mirrors CODING_STANDARDS.md rule D2 spirit: standard formats must not depend
 # on machine-local Windows registry overrides.

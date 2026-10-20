@@ -35,7 +35,6 @@ def _build_legacy_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-DEFAULT_COMPOSE_FILE = Path(r"C:\IT_Projects\mailattic\docker\docker-compose.yml")
 DEFAULT_ENV_FILE = Path(r"C:\IT_Projects\mailattic\.env.sean3808")
 DEFAULT_MAILDIR_ROOT = Path(r"C:\IT_Projects\mailattic\.mailattic-work\maildir")
 DEFAULT_DATABASE_PATH = Path(r"C:\IT_Projects\mailattic\mailattic.db")
@@ -129,15 +128,12 @@ def estimate_sync_run(
 def run_sync_imap(
     *,
     database_path: str | Path = DEFAULT_DATABASE_PATH,
-    compose_file: str | Path = DEFAULT_COMPOSE_FILE,  # kept for backward compat
     env_file: str | Path = DEFAULT_ENV_FILE,
     maildir_root: str | Path = DEFAULT_MAILDIR_ROOT,
     log_dir: str | Path = DEFAULT_LOG_DIR,
     attachment_root: Path | None = None,
     folder: str | None = None,
     full_resync: bool = False,
-    project_root: str | Path | None = None,  # kept for backward compat
-    subprocess_runner=None,  # kept for backward compat
 ) -> SyncExecutionResult:
     env = load_env_file(env_file)
     validate_sync_environment(env)
@@ -215,30 +211,6 @@ def read_last_sync_record(
     return latest_record
 
 
-def read_last_sync_time(
-    log_dir: str | Path = DEFAULT_LOG_DIR,
-) -> datetime | None:
-    """Return the end timestamp of the most recently completed sync run.
-
-    Scans all ``mbsync-*.log`` files under *log_dir* and returns the latest
-    ``end=<ISO-8601>`` timestamp found across all log lines (regardless of
-    exit code — the end timestamp is written unconditionally by
-    ``_append_sync_log`` in imap_runtime.py).
-
-    Returns ``None`` when no log files exist or no valid timestamp is found.
-
-    Timestamp source rationale: ``_append_sync_log`` (imap_runtime.py) writes
-    ``end=<UTC ISO-8601>`` for every sync run, including failures.  The field
-    is written atomically after ``run_logged_sync_job`` completes, making it
-    the most durable and accurate record of "last attempted/completed sync
-    end time" available without adding a new state file.  If a stricter
-    "last *successful* sync" definition is needed in future, add
-    ``exit=0`` filtering here.
-    """
-    record = read_last_sync_record(log_dir)
-    return record.end_at if record is not None else None
-
-
 def _unfinished_run_after(
     database_path: str | Path, logged_end: datetime
 ) -> tuple[str, str] | None:
@@ -281,14 +253,11 @@ def _unfinished_run_after(
 def pre_task_sync_imap(
     *,
     database_path: str | Path = DEFAULT_DATABASE_PATH,
-    compose_file: str | Path = DEFAULT_COMPOSE_FILE,
     env_file: str | Path = DEFAULT_ENV_FILE,
     maildir_root: str | Path = DEFAULT_MAILDIR_ROOT,
     log_dir: str | Path = DEFAULT_LOG_DIR,
     attachment_root: Path | None = None,
     folder: str | None = None,
-    project_root: str | Path | None = None,
-    subprocess_runner=None,
     min_interval_seconds: int = PRE_TASK_MIN_INTERVAL_SECONDS,
     now: datetime | None = None,
     last_sync: datetime | LastSyncRecord | None = None,
@@ -359,14 +328,11 @@ def pre_task_sync_imap(
 
     result = run_sync_imap(
         database_path=database_path,
-        compose_file=compose_file,
         env_file=env_file,
         maildir_root=maildir_root,
         log_dir=log_dir,
         attachment_root=attachment_root,
         folder=folder,
-        project_root=project_root,
-        subprocess_runner=subprocess_runner,
     )
     last_sync_at = (
         effective_last_sync.isoformat() if effective_last_sync is not None else None
