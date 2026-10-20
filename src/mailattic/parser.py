@@ -474,40 +474,53 @@ def iter_maildir_message_paths(source_path: Path) -> Iterable[Path]:
         yield from sorted(path for path in bucket_root.rglob("*") if path.is_file())
 
 
+def _parse_maildir_message(
+    *,
+    source: MaildirSource,
+    message_path: Path | str,
+    attachment_root: Path | None = None,
+) -> ExtractionResult:
+    source_root = source.path.expanduser().resolve()
+    resolved_message_path = Path(message_path).expanduser().resolve()
+    relative_path = resolved_message_path.relative_to(source_root)
+    logical_locator = f"{source.folder_name}/{relative_path.as_posix()}"
+    try:
+        if attachment_root is None:
+            raw_message = _parse_eml_file(resolved_message_path)
+        else:
+            raw_message = _parse_eml_file(
+                resolved_message_path, attachment_root=attachment_root
+            )
+        return ExtractionResult(
+            message=ExtractedMessage(
+                raw_message=raw_message,
+                folder_path=source.folder_name,
+                logical_locator=logical_locator,
+            )
+        )
+    except Exception as exc:
+        return ExtractionResult(
+            failure=IngestFailure.from_source(
+                source,
+                folder_path=source.folder_name,
+                logical_locator=logical_locator,
+                error_stage="parse-maildir",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+        )
+
+
 class MaildirParser:
     def iter_extraction_results(
         self, source: MaildirSource, *, attachment_root: Path | None = None
     ) -> Iterable[ExtractionResult]:
         for message_path in iter_maildir_message_paths(source.path):
-            relative_path = message_path.relative_to(source.path)
-            logical_locator = f"{source.folder_name}/{relative_path.as_posix()}"
-            try:
-                if attachment_root is None:
-                    raw_message = _parse_eml_file(message_path)
-                else:
-                    raw_message = _parse_eml_file(
-                        message_path, attachment_root=attachment_root
-                    )
-                yield ExtractionResult(
-                    message=ExtractedMessage(
-                        raw_message=raw_message,
-                        folder_path=source.folder_name,
-                        logical_locator=logical_locator,
-                    )
-                )
-            except Exception as exc:
-                yield ExtractionResult(
-                    failure=IngestFailure(
-                        pst_source=source.source_path,
-                        folder_path=source.folder_name,
-                        logical_locator=logical_locator,
-                        source_input_mode=source.input_mode,
-                        source_requested_from=source.requested_from_path,
-                        error_stage="parse-maildir",
-                        error_type=type(exc).__name__,
-                        error_message=str(exc),
-                    )
-                )
+            yield _parse_maildir_message(
+                source=source,
+                message_path=message_path,
+                attachment_root=attachment_root,
+            )
 
 
 def _parse_extraction_file(
@@ -536,17 +549,18 @@ def _parse_extraction_file(
         )
     except Exception as exc:
         return ExtractionResult(
-            failure=IngestFailure(
-                pst_source=source.source_path,
+            failure=IngestFailure.from_source(
+                source,
                 folder_path=folder_path or None,
                 logical_locator=logical_locator,
-                source_input_mode=source.input_mode,
-                source_requested_from=source.requested_from_path,
                 error_stage=error_stage,
                 error_type=type(exc).__name__,
                 error_message=str(exc),
             )
         )
+
+
+_HEADER_SEPARATOR_RE = re.compile(rb"\r\n\r\n|\n\n")
 
 
 def _extract_raw_headers(raw_bytes: bytes | None) -> str | None:
@@ -565,33 +579,11 @@ def _extract_raw_headers(raw_bytes: bytes | None) -> str | None:
     if not raw_bytes:
         return None
 
-    # Locate the header/body separator: the first CRLF CRLF or LF LF sequence.
-    # We search for both to handle both RFC-compliant and Unix-style line endings.
-    sep_crlf = raw_bytes.find(b"\r\n\r\n")
-    sep_lf = raw_bytes.find(b"\n\n")
-
-    if sep_crlf == -1 and sep_lf == -1:
-        # No blank line found — entire content is headers or malformed; cannot
-        # reliably identify where headers end.
+    match = _HEADER_SEPARATOR_RE.search(raw_bytes)
+    if match is None or match.start() == 0:
         return None
 
-    # Pick the earliest separator found (prefer CRLF when they tie at position 0).
-    if sep_crlf == -1:
-        header_end = sep_lf
-    elif sep_lf == -1:
-        header_end = sep_crlf
-    else:
-        # Use whichever comes first; CRLF wins on a tie (it matches two bytes
-        # earlier than LF when they overlap, but in practice they differ by pos).
-        header_end = min(sep_crlf, sep_lf)
-
-    header_bytes = raw_bytes[:header_end]
-    # Empty header section (separator at byte 0) → treat as no recoverable headers.
-    # The absence of header data must be represented by None, not an empty string.
-    if not header_bytes:
-        return None
-    # Latin-1 decode: bijective mapping, never raises, always reversible.
-    return header_bytes.decode("latin-1")
+    return raw_bytes[: match.start()].decode("latin-1")
 
 
 def _get_legacy_header_values(raw_header_bytes: bytes, header_name: str) -> list[str]:
@@ -784,80 +776,48 @@ def _parse_email_message(
     raw_bytes: bytes | None = None,
     attachment_root: Path | None = None,
 ) -> dict[str, object]:
-    normalized_message = _coerce_email_message(message)
-    sender_name, sender_email = _parse_single_address(normalized_message.get("From"))
+    sender_name, sender_email = _parse_single_address(message.get("From"))
     (sender,) = _repair_mislabelled_names(
-        [{"name": sender_name, "email": sender_email}], normalized_message, "from"
+        [{"name": sender_name, "email": sender_email}], message, "from"
     )
-    attachments = _extract_attachments(
-        normalized_message, attachment_root=attachment_root
-    )
+    attachments = _extract_attachments(message, attachment_root=attachment_root)
 
-    to_values = normalized_message.get_all("To", [])
-    cc_values = normalized_message.get_all("Cc", [])
-    bcc_values = normalized_message.get_all("Bcc", [])
+    recipients: dict[str, list[dict[str, str | None]]] = {}
+    for header_name in ("To", "Cc", "Bcc"):
+        values = message.get_all(header_name, [])
+        recipients[header_name.lower()] = _repair_mislabelled_names(
+            _drop_addresses_without_email(
+                _recover_truncated_recipients(
+                    header_name=header_name,
+                    header_values=values,
+                    default_addresses=_parse_address_list(values),
+                    raw_bytes=raw_bytes,
+                )
+            ),
+            message,
+            header_name.lower(),
+        )
 
     return {
-        "subject": _subject_from_message(normalized_message),
+        "subject": _subject_from_message(message),
         "sender": sender,
-        "to": _repair_mislabelled_names(
-            _drop_addresses_without_email(
-                _recover_truncated_recipients(
-                    header_name="To",
-                    header_values=to_values,
-                    default_addresses=_parse_address_list(to_values),
-                    raw_bytes=raw_bytes,
-                )
-            ),
-            normalized_message,
-            "to",
+        "to": recipients["to"],
+        "cc": recipients["cc"],
+        "bcc": recipients["bcc"],
+        "sent_at": _parse_datetime_candidates([message.get("Date")]),
+        "received_at": _parse_datetime_candidates(
+            message.get_all("Received", []), extract_trace_timestamp=True
         ),
-        "cc": _repair_mislabelled_names(
-            _drop_addresses_without_email(
-                _recover_truncated_recipients(
-                    header_name="Cc",
-                    header_values=cc_values,
-                    default_addresses=_parse_address_list(cc_values),
-                    raw_bytes=raw_bytes,
-                )
-            ),
-            normalized_message,
-            "cc",
-        ),
-        "bcc": _repair_mislabelled_names(
-            _drop_addresses_without_email(
-                _recover_truncated_recipients(
-                    header_name="Bcc",
-                    header_values=bcc_values,
-                    default_addresses=_parse_address_list(bcc_values),
-                    raw_bytes=raw_bytes,
-                )
-            ),
-            normalized_message,
-            "bcc",
-        ),
-        "sent_at": _parse_datetime_header(normalized_message.get("Date")),
-        "received_at": _parse_received_datetime(
-            normalized_message.get_all("Received", [])
-        ),
-        "body_text": _extract_body_text(normalized_message),
+        "body_text": _extract_body_text(message),
         "attachments": attachments,
         "attachment_names": [
             str(attachment["attachment_name"]) for attachment in attachments
         ],
-        "message_id": normalized_message.get("Message-ID"),
-        "in_reply_to": normalized_message.get("In-Reply-To"),
-        "references": normalized_message.get("References"),
+        "message_id": message.get("Message-ID"),
+        "in_reply_to": message.get("In-Reply-To"),
+        "references": message.get("References"),
         "raw_headers": _extract_raw_headers(raw_bytes),
     }
-
-
-def _coerce_email_message(message: object) -> Any:
-    if hasattr(message, "get_content"):
-        return message
-    if hasattr(message, "as_bytes"):
-        return BytesParser(policy=_MAIL_POLICY).parsebytes(message.as_bytes())
-    return message
 
 
 def resolve_readpst_path(readpst_path: str | Path | None = None) -> Path:
@@ -915,23 +875,10 @@ def _parse_single_address(raw_header: str | None) -> tuple[str | None, str | Non
 
 
 def _parse_address_list(raw_headers: list[str]) -> list[dict[str, str | None]]:
-    result: list[dict[str, str | None]] = []
-    for name, email_address in getaddresses(raw_headers):
-        result.append(
-            {
-                "name": name or None,
-                "email": email_address or None,
-            }
-        )
-    return result
-
-
-def _parse_datetime_header(raw_header: str | None) -> object:
-    return _parse_datetime_candidates([raw_header])
-
-
-def _parse_received_datetime(raw_headers: list[str]) -> object:
-    return _parse_datetime_candidates(raw_headers, extract_trace_timestamp=True)
+    return [
+        {"name": name or None, "email": email_address or None}
+        for name, email_address in getaddresses(raw_headers)
+    ]
 
 
 def _parse_datetime_candidates(
@@ -1075,12 +1022,6 @@ def _extract_part_filename(part: Any) -> str | None:
                         f"{header_name}: {header_value}\n\n"
                     )
                     raw_fn = parsed_header.get_filename()
-                    if not raw_fn:
-                        raw_fn = parsed_header.get_param(
-                            "filename", header="content-disposition"
-                        )
-                    if not raw_fn:
-                        raw_fn = parsed_header.get_param("name", header="content-type")
                     if raw_fn:
                         cleaned = _clean_attachment_filename(raw_fn)
                         if cleaned:
@@ -1215,13 +1156,10 @@ def _is_attachment_part(
         filename if filename is not None else _extract_part_filename(part)
     )
 
-    if part.get_content_type() == "message/rfc822":
-        return disposition == "attachment" or (
-            disposition == "inline" and bool(resolved_filename)
-        )
-
-    subtype = part.get_content_subtype()
-    if subtype in ("plain", "html"):
+    if part.get_content_type() == "message/rfc822" or part.get_content_subtype() in (
+        "plain",
+        "html",
+    ):
         return disposition == "attachment" or (
             disposition == "inline" and bool(resolved_filename)
         )

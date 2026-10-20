@@ -10,8 +10,6 @@ from typing import Literal
 
 from .discovery import discover_pst_sources
 from .models import (
-    ExtractedMessage,
-    ExtractionResult,
     ImportSummary,
     IngestFailure,
     MaildirSource,
@@ -26,7 +24,7 @@ from .outlook_pst import (
     PstExtractionAccount,
     write_pst_extraction_summary,
 )
-from .parser import MaildirParser, ReadpstParser, _parse_eml_file
+from .parser import MaildirParser, ReadpstParser, _parse_maildir_message
 from .quarantine import release_quarantined_mail
 from .storage import (
     connect_database,
@@ -180,12 +178,8 @@ def _record_pst_extraction_failure(
     print(f"{source.source_path}: {exc}", file=sys.stderr)
     record_ingest_failure(
         connection,
-        IngestFailure(
-            pst_source=source.source_path,
-            folder_path=None,
-            logical_locator=None,
-            source_input_mode=source.input_mode,
-            source_requested_from=source.requested_from_path,
+        IngestFailure.from_source(
+            source,
             error_stage="extract-pst",
             error_type=type(exc).__name__,
             error_message=str(exc),
@@ -251,12 +245,9 @@ def import_maildir_sources(
             except (OSError, RuntimeError, ValueError) as exc:
                 record_ingest_failure(
                     connection,
-                    IngestFailure(
-                        pst_source=source.source_path,
+                    IngestFailure.from_source(
+                        source,
                         folder_path=source.folder_name,
-                        logical_locator=None,
-                        source_input_mode=source.input_mode,
-                        source_requested_from=source.requested_from_path,
                         error_stage="read-maildir",
                         error_type=type(exc).__name__,
                         error_message=str(exc),
@@ -293,45 +284,6 @@ def import_maildir_message(
         ],
     )
     return summary
-
-
-def _parse_maildir_message(
-    *,
-    source: MaildirSource,
-    message_path: str | Path,
-    attachment_root: Path | None = None,
-) -> ExtractionResult:
-    source_root = source.path.expanduser().resolve()
-    resolved_message_path = Path(message_path).expanduser().resolve()
-    relative_path = resolved_message_path.relative_to(source_root)
-    logical_locator = f"{source.folder_name}/{relative_path.as_posix()}"
-    try:
-        if attachment_root is None:
-            raw_message = _parse_eml_file(resolved_message_path)
-        else:
-            raw_message = _parse_eml_file(
-                resolved_message_path, attachment_root=attachment_root
-            )
-        return ExtractionResult(
-            message=ExtractedMessage(
-                raw_message=raw_message,
-                folder_path=source.folder_name,
-                logical_locator=logical_locator,
-            )
-        )
-    except Exception as exc:
-        return ExtractionResult(
-            failure=IngestFailure(
-                pst_source=source.source_path,
-                folder_path=source.folder_name,
-                logical_locator=logical_locator,
-                source_input_mode=source.input_mode,
-                source_requested_from=source.requested_from_path,
-                error_stage="parse-maildir",
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-            )
-        )
 
 
 def _resolve_work_root(
@@ -371,12 +323,10 @@ def _persist_extraction_results(
         except Exception as exc:
             record_ingest_failure(
                 connection,
-                IngestFailure(
-                    pst_source=source.source_path,
+                IngestFailure.from_source(
+                    source,
                     folder_path=extraction_result.message.folder_path,
                     logical_locator=extraction_result.message.logical_locator,
-                    source_input_mode=source.input_mode,
-                    source_requested_from=source.requested_from_path,
                     error_stage="normalize-message",
                     error_type=type(exc).__name__,
                     error_message=str(exc),
@@ -401,12 +351,10 @@ def _persist_extraction_results(
             connection.execute("RELEASE SAVEPOINT persist_message")
             record_ingest_failure(
                 connection,
-                IngestFailure(
-                    pst_source=source.source_path,
+                IngestFailure.from_source(
+                    source,
                     folder_path=extraction_result.message.folder_path,
                     logical_locator=extraction_result.message.logical_locator,
-                    source_input_mode=source.input_mode,
-                    source_requested_from=source.requested_from_path,
                     error_stage="persist-message",
                     error_type=type(exc).__name__,
                     error_message=str(exc),
@@ -435,12 +383,10 @@ def _record_attachment_failures(
     if collection_error:
         record_ingest_failure(
             connection,
-            IngestFailure(
-                pst_source=source.source_path,
+            IngestFailure.from_source(
+                source,
                 folder_path=extraction_result.message.folder_path,
                 logical_locator=extraction_result.message.logical_locator,
-                source_input_mode=source.input_mode,
-                source_requested_from=source.requested_from_path,
                 error_stage="attachment-collection-read",
                 error_type="AttachmentCollectionError",
                 error_message=f"Attachment collection unreadable: {collection_error}",
@@ -460,12 +406,10 @@ def _record_attachment_failures(
             continue
         record_ingest_failure(
             connection,
-            IngestFailure(
-                pst_source=source.source_path,
+            IngestFailure.from_source(
+                source,
                 folder_path=extraction_result.message.folder_path,
                 logical_locator=extraction_result.message.logical_locator,
-                source_input_mode=source.input_mode,
-                source_requested_from=source.requested_from_path,
                 error_stage=error_stage,
                 error_type="AttachmentError",
                 error_message=(
