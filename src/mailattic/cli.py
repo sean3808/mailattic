@@ -54,6 +54,7 @@ from .quarantine import (
     unresolved_attachment_failures,
 )
 from .query_commands import (
+    add_database_argument,
     register_contact_history_command,
     register_message_commands,
 )
@@ -96,12 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Outlook nor readpst."
         ),
     )
-    import_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(import_parser)
     import_parser.add_argument(
         "--directory",
         dest="directories",
@@ -153,12 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
         "sync-imap",
         help="Run IMAP synchronization.",
     )
-    sync_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(sync_parser)
     sync_parser.add_argument(
         "--folder",
         default=None,
@@ -231,12 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
         "scrape-archive",
         help="Scrape outbound mail archive from the mail server admin UI.",
     )
-    scrape_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(scrape_parser)
     scrape_parser.add_argument(
         "--once",
         action="store_true",
@@ -320,12 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Declare an email address as self (idempotent).",
     )
     identity_add_parser.add_argument("address", help="Email address to declare.")
-    identity_add_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(identity_add_parser)
     identity_add_parser.set_defaults(handler=_handle_identity_add)
 
     identity_remove_parser = identity_subparsers.add_parser(
@@ -333,12 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Undeclare an email address.",
     )
     identity_remove_parser.add_argument("address", help="Email address to undeclare.")
-    identity_remove_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(identity_remove_parser)
     identity_remove_parser.set_defaults(handler=_handle_identity_remove)
 
     identity_list_parser = identity_subparsers.add_parser(
@@ -348,12 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
             "`database` or `unset` (nothing declared)."
         ),
     )
-    identity_list_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(identity_list_parser)
     identity_list_parser.set_defaults(handler=_handle_identity_list)
 
     identity_parser.set_defaults(
@@ -378,12 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
             "sqlite3.Connection.backup() (never copies .db directly)."
         ),
     )
-    db_backup_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(db_backup_parser)
     db_backup_parser.add_argument(
         "--output",
         type=Path,
@@ -403,12 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
             "foreign_key_check and report results."
         ),
     )
-    db_doctor_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(db_doctor_parser)
     db_doctor_parser.add_argument(
         "--quarantine-root",
         type=Path,
@@ -429,12 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
             "in a single rollback-safe transaction."
         ),
     )
-    db_reindex_fts_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(db_reindex_fts_parser)
     db_reindex_fts_parser.set_defaults(handler=_handle_db_reindex_fts)
 
     db_verify_cas_parser = db_subparsers.add_parser(
@@ -511,12 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
     db_abandon_parser.add_argument(
         "--reason", required=True, help="Why it is given up (recorded)."
     )
-    db_abandon_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(db_abandon_parser)
     db_abandon_parser.add_argument(
         "--quarantine-root",
         type=Path,

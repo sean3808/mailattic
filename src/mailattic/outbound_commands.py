@@ -34,6 +34,7 @@ from .outbound import (
     send_batch,
     send_draft,
 )
+from .query_commands import add_database_argument
 
 _SMTP_ENV_FILE_KEYS = "SMTP_HOST, SMTP_PORT, SMTP_USER, and SMTP_PASSWORD"
 _SMTP_ENV_FILE_HELP = (
@@ -127,12 +128,7 @@ def register_outbound_commands(subparsers: argparse._SubParsersAction) -> None: 
             "manually verifying its recipients."
         ),
     )
-    draft_reply_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(draft_reply_parser)
     draft_reply_parser.add_argument(
         "--env-file",
         type=Path,
@@ -161,12 +157,7 @@ def register_outbound_commands(subparsers: argparse._SubParsersAction) -> None: 
             "the draft changed since. Without it, a real terminal is required."
         ),
     )
-    send_draft_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(send_draft_parser)
     send_draft_parser.add_argument(
         "--env-file",
         type=Path,
@@ -191,12 +182,7 @@ def register_outbound_commands(subparsers: argparse._SubParsersAction) -> None: 
             "terminal. A draft whose fingerprint no longer matches is not sent."
         ),
     )
-    send_batch_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(send_batch_parser)
     send_batch_parser.add_argument(
         "--env-file",
         type=Path,

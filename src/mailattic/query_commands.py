@@ -44,22 +44,19 @@ from .query import (
 )
 
 
-def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
-    """Register search, attachments, show and thread."""
-    search_parser = subparsers.add_parser(
-        "search",
-        help="Search imported messages.",
-    )
-    search_parser.add_argument(
+def add_database_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the standard --database option to an ArgumentParser."""
+    parser.add_argument(
         "--database",
         type=Path,
         default=None,
         help="SQLite database path.",
     )
-    search_parser.add_argument("--keyword", default=None, help="FTS keyword query.")
-    search_parser.add_argument("--sender", default=None, help="Sender filter.")
-    search_parser.add_argument("--recipient", default=None, help="Recipient filter.")
-    search_parser.add_argument(
+
+
+def add_date_range_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add shared --from-date and --to-date filter options to a query parser."""
+    parser.add_argument(
         "--from-date",
         dest="sent_from",
         default=None,
@@ -70,7 +67,7 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
             "read as Asia/Taipei."
         ),
     )
-    search_parser.add_argument(
+    parser.add_argument(
         "--to-date",
         dest="sent_to",
         default=None,
@@ -81,6 +78,19 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
             "read as Asia/Taipei."
         ),
     )
+
+
+def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register search, attachments, show and thread."""
+    search_parser = subparsers.add_parser(
+        "search",
+        help="Search imported messages.",
+    )
+    add_database_argument(search_parser)
+    search_parser.add_argument("--keyword", default=None, help="FTS keyword query.")
+    search_parser.add_argument("--sender", default=None, help="Sender filter.")
+    search_parser.add_argument("--recipient", default=None, help="Recipient filter.")
+    add_date_range_arguments(search_parser)
     search_parser.add_argument(
         "--sender-domain",
         dest="sender_domain",
@@ -143,12 +153,7 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
         "attachments",
         help="Search attachments and optionally export matching payloads.",
     )
-    attachments_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(attachments_parser)
     attachments_parser.add_argument(
         "--name-contains",
         dest="name_contains",
@@ -187,28 +192,7 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
         default=None,
         help="Recipient email domain filter; repeatable, values OR together.",
     )
-    attachments_parser.add_argument(
-        "--from-date",
-        dest="sent_from",
-        default=None,
-        help=(
-            "Inclusive sent-at lower bound. A YYYY-MM-DD date means the "
-            "whole Asia/Taipei calendar day; a timestamp with a UTC "
-            "offset selects that instant; a timestamp without one is "
-            "read as Asia/Taipei."
-        ),
-    )
-    attachments_parser.add_argument(
-        "--to-date",
-        dest="sent_to",
-        default=None,
-        help=(
-            "Inclusive sent-at upper bound. A YYYY-MM-DD date means the "
-            "whole Asia/Taipei calendar day; a timestamp with a UTC "
-            "offset selects that instant; a timestamp without one is "
-            "read as Asia/Taipei."
-        ),
-    )
+    add_date_range_arguments(attachments_parser)
     attachments_parser.add_argument(
         "--dedupe",
         choices=["content-hash"],
@@ -256,12 +240,7 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
         help="Show one imported message by stored identifier.",
     )
     show_parser.add_argument("message_id", type=int, help="Stored message identifier.")
-    show_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(show_parser)
     show_parser.add_argument(
         "--format",
         dest="format",
@@ -307,12 +286,7 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
             "RFC822 Message-ID string (with or without angle brackets)."
         ),
     )
-    thread_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(thread_parser)
     thread_parser.add_argument(
         "--format",
         dest="format",
@@ -383,12 +357,7 @@ def register_contact_history_command(
         default=20,
         help="Max recent attachment filenames to include (default 20; non-negative).",
     )
-    contact_history_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(contact_history_parser)
     contact_history_parser.set_defaults(handler=_handle_contact_history)
 
 
