@@ -185,16 +185,6 @@ def is_cas_entry_shape(file_path: Path, store_root: Path | None = None) -> bool:
 
 def verify_cas(attachment_root: Path) -> CasVerifyResult:
     """Verify content-addressed attachment files against their SHA-256 filenames."""
-    if not attachment_root.exists() or not attachment_root.is_dir():
-        return CasVerifyResult(
-            total=0,
-            ok=0,
-            mismatched=0,
-            read_error=0,
-            bad_files=[],
-            non_cas_files=[],
-        )
-
     total = 0
     ok = 0
     mismatched = 0

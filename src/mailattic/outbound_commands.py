@@ -24,7 +24,6 @@ from .outbound import (
     DraftReplyError,
     SendRefused,
     SmtpConfig,
-    _draft_dir,
     _sanitize_for_terminal,
     assemble_draft_reply,
     list_drafts,
@@ -239,7 +238,6 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
         result = assemble_draft_reply(
             database_path=args.database,
             message_id=args.message_id,
-            draft_dir=_draft_dir(args.database),
             own_address=own_address,
             body_from=args.body_from,
             to=args.to,

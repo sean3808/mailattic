@@ -167,7 +167,7 @@ class TestParseListRows(unittest.TestCase):
     def test_row_count_matches_fixture(self) -> None:
         """解析出的 row 數 == fixture 實際 ML_ tr 數量。"""
         expected = self._ground_truth_row_count()
-        rows, _, _ = parse_list_rows(self.html)
+        rows = parse_list_rows(self.html)
         self.assertEqual(
             len(rows),
             expected,
@@ -176,19 +176,19 @@ class TestParseListRows(unittest.TestCase):
 
     def test_returns_list_row_meta_instances(self) -> None:
         """每個 row 都是 ListRowMeta 實例。"""
-        rows, _, _ = parse_list_rows(self.html)
+        rows = parse_list_rows(self.html)
         for row in rows:
             self.assertIsInstance(row, ListRowMeta)
 
     def test_first_row_entry_id_non_zero(self) -> None:
         """第一筆 row 的 entry_id 非零。"""
-        rows, _, _ = parse_list_rows(self.html)
+        rows = parse_list_rows(self.html)
         self.assertGreater(len(rows), 0)
         self.assertGreater(rows[0].entry_id, 0, "entry_id must be positive integer")
 
     def test_first_row_subject_non_empty(self) -> None:
         """第一筆 row 的 subject 非空。"""
-        rows, _, _ = parse_list_rows(self.html)
+        rows = parse_list_rows(self.html)
         self.assertGreater(len(rows), 0)
         self.assertGreater(len(rows[0].subject.strip()), 0)
 
@@ -198,7 +198,7 @@ class TestParseListRows(unittest.TestCase):
         NOTE: Fixture 顯示 pagemax=2 (page 1 of 2, 12 rows),
         entry 53 is row index 1 in the first page.
         """
-        rows, _, _ = parse_list_rows(self.html)
+        rows = parse_list_rows(self.html)
         # Find entry 53
         entry53 = next((r for r in rows if r.entry_id == 53), None)
         self.assertIsNotNone(entry53, "entry_id=53 must be present in fixture page 1")
@@ -208,22 +208,9 @@ class TestParseListRows(unittest.TestCase):
         )
         self.assertIn("pen-100", entry53.subject.lower())
 
-    def test_pagination_detection(self) -> None:
-        """Fixture pagemax=2, current page=1 → has_next_page=True.
-
-        NOTE: Brief states 'fixture 無下一頁 → has_next_page=False' but the actual
-        fixture HTML contains InputPage(form, 0, event, 'GO', 0, 2) indicating pagemax=2
-        and page value=1, which correctly results in has_next_page=True.
-        Divergence from brief documented per 'fixture takes precedence' rule.
-        """
-        _, has_next_page, next_page_url = parse_list_rows(self.html)
-        # Fixture has pagemax=2, current page=1 → has_next_page=True
-        self.assertTrue(has_next_page, "Fixture pagemax=2 means there IS a next page")
-        self.assertIsNotNone(next_page_url)
-
     def test_all_rows_have_non_empty_sender(self) -> None:
         """每個 row 的 sender 非空。"""
-        rows, _, _ = parse_list_rows(self.html)
+        rows = parse_list_rows(self.html)
         for row in rows:
             self.assertGreater(
                 len(row.sender.strip()), 0, f"entry_id={row.entry_id} sender empty"
@@ -240,7 +227,7 @@ class TestFilterBySender(unittest.TestCase):
 
     def setUp(self) -> None:
         self.html = _load_fixture(LIST_FIXTURE)
-        all_rows, _, _ = parse_list_rows(self.html)
+        all_rows = parse_list_rows(self.html)
         self.all_rows = all_rows
 
     def _ground_truth_sean_count(self) -> int:

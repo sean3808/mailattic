@@ -391,7 +391,7 @@ class TestRunScrapePerEntryFaultTolerance(unittest.TestCase):
         mock_validate.return_value = ([today], [])
 
         rows = self._make_three_rows()
-        mock_rows.return_value = (rows, False, None)
+        mock_rows.return_value = rows
         mock_filter.return_value = rows
 
         hdr1 = _make_detail_header(message_id="mid1@mailattic.test")
@@ -547,7 +547,7 @@ class TestRunScrapeEmitsJsonToStdout(unittest.TestCase):
         mock_list_page.return_value = "<html/>"
         mock_date_opts.return_value = [today]
         mock_validate.return_value = ([today], [])
-        mock_rows.return_value = ([], False, None)
+        mock_rows.return_value = []
         mock_filter.return_value = []
 
         buf = io.StringIO()
@@ -608,7 +608,7 @@ class TestRunScrapeEmitsJsonToStdout(unittest.TestCase):
         mock_list_page.return_value = "<html/>"
         mock_date_opts.return_value = [today]
         mock_validate.return_value = ([today], [])
-        mock_rows.return_value = ([], False, None)
+        mock_rows.return_value = []
         mock_filter.return_value = []
 
         buf = io.StringIO()
@@ -969,7 +969,7 @@ class TestScrapeFailureNonZeroExit(unittest.TestCase):
             message_id="mid1@mailattic.test",
             subject="test",
         )
-        mock_rows.return_value = ([row], False, None)
+        mock_rows.return_value = [row]
         mock_filter.return_value = [row]
         mock_q1.return_value = "<html><body>Session expired - 401</body></html>"
 

@@ -14,7 +14,7 @@ import re
 import sys
 import urllib.parse
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -226,7 +226,6 @@ def build_session(
 # list 頁
 _SEL_DATE_SELECT = 'select[name="dt"]'
 _SEL_DATA_ROW = "tr[id^='ML_']"  # pattern: ML_0, ML_1, ...
-_SEL_PAGE_INPUT_GO = "button.list_tool_bt_go"
 
 # detail header 頁 (q=1)
 _SEL_DETAIL_HEADER_ROWS = "tr.TextAttr"
@@ -240,13 +239,6 @@ _SEL_BODY_PRE = "pre"
 _RE_VIEWDETAIL_ENTRY = re.compile(
     r"ViewDetail\([^,]+,\s*'(\d+)'",
 )
-# InputPage call's last arg is pagemax: InputPage(form, num, e, act, uipagenum, pagemax)
-_RE_INPUTPAGE_PAGEMAX = re.compile(
-    r"InputPage\(this\.form,\s*0,\s*event,\s*'GO',\s*\d+,\s*(\d+)\)"
-)
-_RE_PAGE_VALUE = re.compile(r'name="page" value="(\d+)"')
-
-# Label texts in Chinese UI (used for detail header parsing)
 _LABEL_FROM = "寄件者"
 _LABEL_DATE = "日期"
 _LABEL_MSG_ID = "郵件 ID"
@@ -412,7 +404,7 @@ def validate_date_range(
 
 def parse_list_rows(
     html: str,
-) -> tuple[list[ListRowMeta], bool, str | None]:
+) -> list[ListRowMeta]:
     """從 list 頁 HTML 解析所有 row metadata。
 
     Parameters
@@ -422,10 +414,8 @@ def parse_list_rows(
 
     Returns
     -------
-    tuple[list[ListRowMeta], bool, str | None]
-        ``(rows, has_next_page, next_page_url)``。
-        ``next_page_url`` 在 ``has_next_page=False`` 時為 ``None``；
-        本函式回傳的 URL 為 placeholder（實際 URL 需呼叫端依表單 POST 構建）。
+    list[ListRowMeta]
+        所有 row 的 metadata 列表。
 
     Raises
     ------
@@ -499,18 +489,7 @@ def parse_list_rows(
             )
         )
 
-    # Pagination detection: find current page and pagemax from InputPage call
-    m_pagemax = _RE_INPUTPAGE_PAGEMAX.search(html)
-    m_page = _RE_PAGE_VALUE.search(html)
-    if m_pagemax and m_page:
-        pagemax = int(m_pagemax.group(1))
-        current_page = int(m_page.group(1))
-        has_next_page = current_page < pagemax
-    else:
-        has_next_page = False
-
-    next_page_url: str | None = "__next_page_post__" if has_next_page else None
-    return rows, has_next_page, next_page_url
+    return rows
 
 
 def filter_by_sender(rows: list[ListRowMeta], sender: str) -> list[ListRowMeta]:
@@ -989,24 +968,7 @@ def _summary_to_json(s: ScrapeSummary) -> str:
     str
         Single-line JSON string (no trailing newline) with 10 fields.
     """
-    return json.dumps(
-        {
-            "started_at": s.started_at.isoformat(),
-            "ended_at": s.ended_at.isoformat(),
-            "date_range": [
-                s.date_range[0].isoformat(),
-                s.date_range[1].isoformat(),
-            ],
-            "candidate_entries": s.candidate_entries,
-            "matched_sender": s.matched_sender,
-            "fetched_messages": s.fetched_messages,
-            "inserted_messages": s.inserted_messages,
-            "skipped_duplicates": s.skipped_duplicates,
-            "errors": s.errors,
-            "exit_code": s.exit_code,
-        },
-        ensure_ascii=False,
-    )
+    return json.dumps(asdict(s), default=lambda o: o.isoformat(), ensure_ascii=False)
 
 
 def _append_to_daily_log(
@@ -1101,7 +1063,7 @@ def run_scrape(
             for dt in in_window:
                 # Fetch list for this date (menu navigation is cached on session)
                 day_html = _fetch_list_page(session, base_url, dt)
-                all_rows, _has_next, _ = parse_list_rows(day_html)
+                all_rows = parse_list_rows(day_html)
                 candidate_entries += len(all_rows)
                 matched_rows = [
                     row
