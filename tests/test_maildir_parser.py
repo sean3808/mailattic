@@ -198,6 +198,42 @@ def test_iter_maildir_message_paths_yields_every_bucket(tmp_path: Path) -> None:
     assert "deep.eml" not in found, "only bucket subtrees are read"
 
 
+def test_batch_walk_keeps_walked_locator_through_a_junction(tmp_path: Path) -> None:
+    """A link inside the walked tree that points outside it keeps the locator
+    of the path that was walked, and does not abort the batch (#7 review)."""
+    import subprocess
+
+    folder = tmp_path / "INBOX"
+    (folder / "cur").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write_message(
+        outside / "linked.eml",
+        subject="Linked",
+        sender="alice@example.com",
+        recipient="bob@example.com",
+        message_id="<linked@example.com>",
+    )
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(folder / "cur" / "link"), str(outside)],
+        check=True,
+        capture_output=True,
+    )
+    source = MaildirSource(
+        path=folder,
+        account_email="sean3808@mailattic.test",
+        account_name="sean3808",
+        folder_name="INBOX",
+        requested_from=folder.parent,
+    )
+
+    results = list(MaildirParser().iter_extraction_results(source))
+
+    assert [r.message.logical_locator for r in results if r.message] == [
+        "INBOX/cur/link/linked.eml"
+    ]
+
+
 def test_iter_maildir_message_paths_yields_nothing_for_a_file_named_cur(
     tmp_path: Path,
 ) -> None:

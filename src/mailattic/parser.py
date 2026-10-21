@@ -479,9 +479,17 @@ def _parse_maildir_message(
     source: MaildirSource,
     message_path: Path | str,
     attachment_root: Path | None = None,
+    resolve_paths: bool = True,
 ) -> ExtractionResult:
-    source_root = source.path.expanduser().resolve()
-    resolved_message_path = Path(message_path).expanduser().resolve()
+    # The directory walk passes resolve_paths=False: it records the path it
+    # walked, so a symlink keeps its own locator and one pointing outside the
+    # root cannot abort the batch in relative_to.
+    if resolve_paths:
+        source_root = source.path.expanduser().resolve()
+        resolved_message_path = Path(message_path).expanduser().resolve()
+    else:
+        source_root = source.path
+        resolved_message_path = Path(message_path)
     relative_path = resolved_message_path.relative_to(source_root)
     logical_locator = f"{source.folder_name}/{relative_path.as_posix()}"
     try:
@@ -520,6 +528,7 @@ class MaildirParser:
                 source=source,
                 message_path=message_path,
                 attachment_root=attachment_root,
+                resolve_paths=False,
             )
 
 
