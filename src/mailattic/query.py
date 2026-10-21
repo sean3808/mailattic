@@ -416,15 +416,16 @@ _BANNER_RE = re.compile(
 
 
 def _iter_lines_with_offsets(text: str):
-    """Yield ``(char_offset, line_without_ending)`` for each line in *text*.
+    """Yield ``(char_offset, end_offset, line_without_ending)`` for each line in *text*.
 
     Uses ``splitlines(keepends=True)`` so that the char offset correctly
     tracks both ``\\n`` and ``\\r\\n`` line endings.
     """
     pos = 0
     for line in text.splitlines(keepends=True):
-        yield pos, line.rstrip("\r\n")
-        pos += len(line)
+        lend = pos + len(line)
+        yield pos, lend, line.rstrip("\r\n")
+        pos = lend
 
 
 def _is_gt_quote_line(line: str) -> bool:
@@ -452,7 +453,7 @@ def _find_hard_cut(normalized: str) -> int | None:
     cjk_has_anchor = False
     cjk_boundary: int | None = None
 
-    for lpos, line in _iter_lines_with_offsets(normalized):
+    for lpos, _, line in _iter_lines_with_offsets(normalized):
         if _EN_HEADER_LINE_RE.match(line):
             if en_run_start is None:
                 en_run_start = lpos
@@ -520,11 +521,7 @@ def _parse_body_quotes(text: str) -> _QuoteAnalysis:
 
     line_spans: list[tuple[int, int, str]] = []
     lines: list[tuple[int, str, str]] = []
-    pos = 0
-    for line in scanned_text.splitlines(keepends=True):
-        lpos = pos
-        lend = pos + len(line)
-        line_text = line.rstrip("\r\n")
+    for lpos, lend, line_text in _iter_lines_with_offsets(scanned_text):
         s = line_text.strip()
         if not s:
             kind = "blank"
@@ -538,7 +535,6 @@ def _parse_body_quotes(text: str) -> _QuoteAnalysis:
             kind = "normal"
         lines.append((lpos, line_text, kind))
         line_spans.append((lpos, lend, kind))
-        pos = lend
 
     # "…於…寫道：" is also ordinary prose ("如同我於合約第三條寫道："), and unlike
     # the English form it carries no year+address signature to tell the two
@@ -1355,27 +1351,18 @@ def search_messages(
     keyword_ranked = False
     if filters.keyword:
         match_expr = _build_fts_match_expr(filters.keyword)
-        if match_expr is None:
-            # Empty / whitespace keyword → no keyword condition (same as no keyword)
-            query_parts.append("LEFT JOIN message_fts ON message_fts.rowid = m.id")
-        else:
+        if match_expr is not None:
             # Non-empty keyword (may be impossible sentinel for pure-punctuation)
             query_parts.append("JOIN message_fts ON message_fts.rowid = m.id")
             conditions.append("message_fts MATCH ?")
             parameters.append(match_expr)
             keyword_ranked = True
-    else:
-        query_parts.append("LEFT JOIN message_fts ON message_fts.rowid = m.id")
 
     _append_search_filter_conditions(
         filters=filters,
         conditions=conditions,
         parameters=parameters,
-        sender_email_sql="m.sender_email",
-        sender_name_sql="m.sender_name",
-        recipient_sql="m.recipient_search_text",
         attachment_name_sql="m.attachment_search_text",
-        sent_at_sql="m.sent_at",
     )
 
     if conditions:
@@ -1532,11 +1519,7 @@ def search_attachments(
         filters=filters,
         conditions=conditions,
         parameters=parameters,
-        sender_email_sql="m.sender_email",
-        sender_name_sql="m.sender_name",
-        recipient_sql="m.recipient_search_text",
         attachment_name_sql="COALESCE(ma.attachment_name, '')",
-        sent_at_sql="m.sent_at",
     )
 
     attachment_ext = _normalize_attachment_ext(filters.attachment_ext)
@@ -1687,58 +1670,16 @@ def get_message(
         if row is None:
             raise KeyError(f"Stored message id {stored_message_id} was not found.")
 
-        recipients = connection.execute(
-            """
-            SELECT recipient_type, display_name, email
-            FROM message_recipients
-            WHERE message_id = ?
-            ORDER BY id
-            """,
-            [stored_message_id],
-        ).fetchall()
-        attachments = connection.execute(
-            """
-            SELECT
-                id,
-                attachment_name,
-                content_hash,
-                size_bytes,
-                mime_type,
-                storage_path
-            FROM message_attachments
-            WHERE message_id = ?
-            ORDER BY id
-            """,
-            [stored_message_id],
-        ).fetchall()
+        recipient_map = _load_recipients_for_messages(
+            connection, [stored_message_id]
+        ).get(stored_message_id, {"to": [], "cc": [], "bcc": []})
+        attachments_list = _load_attachments_for_messages(
+            connection, [stored_message_id]
+        ).get(stored_message_id, [])
         # Same connection, still open (issue #169) -- resolved once per call.
         self_addresses = resolve_self_addresses(connection)
     finally:
         connection.close()
-
-    recipient_map: dict[str, list[dict[str, str | None]]] = {
-        "to": [],
-        "cc": [],
-        "bcc": [],
-    }
-    for recipient in recipients:
-        recipient_map[recipient["recipient_type"]].append(
-            {
-                "name": recipient["display_name"],
-                "email": recipient["email"],
-            }
-        )
-    attachments_list = [
-        {
-            "id": row["id"],
-            "attachment_name": row["attachment_name"],
-            "content_hash": row["content_hash"],
-            "size_bytes": row["size_bytes"],
-            "mime_type": row["mime_type"],
-            "storage_path": row["storage_path"],
-        }
-        for row in attachments
-    ]
 
     return {
         "id": row["id"],
@@ -1927,13 +1868,12 @@ def _is_invalid_fts_query(exc: sqlite3.OperationalError) -> bool:
     )
 
 
-def _to_like_pattern(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"%{escaped}%"
-
-
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _to_like_pattern(value: str) -> str:
+    return f"%{_escape_like(value)}%"
 
 
 def _append_search_filter_conditions(
@@ -1941,12 +1881,12 @@ def _append_search_filter_conditions(
     filters: SearchFilters,
     conditions: list[str],
     parameters: list[object],
-    sender_email_sql: str,
-    sender_name_sql: str,
-    recipient_sql: str,
     attachment_name_sql: str,
-    sent_at_sql: str,
 ) -> None:
+    sender_email_sql = "m.sender_email"
+    sender_name_sql = "m.sender_name"
+    recipient_sql = "m.recipient_search_text"
+    sent_at_sql = "m.sent_at"
     if filters.sender:
         conditions.append(
             f"({sender_email_sql} LIKE ? ESCAPE '\\' "
@@ -2067,13 +2007,6 @@ def _attachment_result_sort_key(result: dict[str, object]) -> tuple[int, int, in
     )
 
 
-def _carrying_message_sort_key(message: dict[str, object]) -> tuple[int, int]:
-    return (
-        int(message["sent_at_epoch"]),
-        int(message["message_db_id"]),
-    )
-
-
 def _dedupe_attachment_results(
     rows: list[dict[str, object]],
 ) -> list[dict[str, object]]:
@@ -2100,7 +2033,7 @@ def _dedupe_attachment_results(
         winner_row = dict(winner)
         winner_row["carrying_messages"] = sorted(
             carrying_messages.values(),
-            key=_carrying_message_sort_key,
+            key=lambda m: (int(m["sent_at_epoch"]), int(m["message_db_id"])),
             reverse=True,
         )
         deduped.append(winner_row)

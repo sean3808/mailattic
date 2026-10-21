@@ -498,85 +498,64 @@ def set_imap_progress(
     )
 
 
+_SCHEMA_MIGRATIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        "messages",
+        (
+            ("dedup_basis", "TEXT NOT NULL DEFAULT ''"),
+            ("source_input_mode", "TEXT NOT NULL DEFAULT ''"),
+            ("source_requested_from", "TEXT NOT NULL DEFAULT ''"),
+            ("thread_key", "INTEGER"),
+            ("thread_bridge_target", "TEXT"),
+            (
+                "thread_bridge_source",
+                "TEXT CHECK (thread_bridge_source IS NULL "
+                "OR thread_bridge_source = 'subject_heuristic')",
+            ),
+            ("raw_headers", "TEXT"),
+        ),
+    ),
+    (
+        "ingest_failures",
+        (
+            ("source_input_mode", "TEXT NOT NULL DEFAULT ''"),
+            ("source_requested_from", "TEXT NOT NULL DEFAULT ''"),
+            # #255: attachment sub-failure ledger. resolved_at NULL = still open.
+            ("attachment_name", "TEXT"),
+            ("attachment_size", "INTEGER"),
+            ("resolved_at", "TEXT"),
+            # #256: set together with resolved_at when a human abandons the entry.
+            ("abandon_reason", "TEXT"),
+        ),
+    ),
+    (
+        "message_attachments",
+        (
+            ("content_hash", "TEXT"),
+            ("size_bytes", "INTEGER"),
+            ("mime_type", "TEXT"),
+            ("storage_path", "TEXT"),
+        ),
+    ),
+)
+
+
 def _ensure_message_schema(connection: sqlite3.Connection) -> None:
-    message_columns = {
-        row["name"] for row in connection.execute("PRAGMA table_info(messages)")
-    }
-    if "dedup_basis" not in message_columns:
-        connection.execute(
-            "ALTER TABLE messages ADD COLUMN dedup_basis TEXT NOT NULL DEFAULT ''"
-        )
-    if "source_input_mode" not in message_columns:
-        connection.execute(
-            "ALTER TABLE messages ADD COLUMN source_input_mode TEXT NOT NULL DEFAULT ''"
-        )
-    if "source_requested_from" not in message_columns:
-        connection.execute(
-            "ALTER TABLE messages ADD COLUMN "
-            "source_requested_from TEXT NOT NULL DEFAULT ''"
-        )
+    for table, columns in _SCHEMA_MIGRATIONS:
+        existing_columns = {
+            row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for column, ddl in columns:
+            if column not in existing_columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
-    failure_columns = {
-        row["name"] for row in connection.execute("PRAGMA table_info(ingest_failures)")
-    }
-    if "source_input_mode" not in failure_columns:
-        connection.execute(
-            "ALTER TABLE ingest_failures ADD COLUMN "
-            "source_input_mode TEXT NOT NULL DEFAULT ''"
-        )
-    if "source_requested_from" not in failure_columns:
-        connection.execute(
-            "ALTER TABLE ingest_failures ADD COLUMN "
-            "source_requested_from TEXT NOT NULL DEFAULT ''"
-        )
-    # #255: attachment sub-failure ledger. resolved_at NULL = still open.
-    for column, ddl in (
-        ("attachment_name", "TEXT"),
-        ("attachment_size", "INTEGER"),
-        ("resolved_at", "TEXT"),
-        # #256: set together with resolved_at when a human abandons the entry.
-        ("abandon_reason", "TEXT"),
-    ):
-        if column not in failure_columns:
-            connection.execute(f"ALTER TABLE ingest_failures ADD COLUMN {column} {ddl}")
-
-    attachment_columns = {
-        row["name"]
-        for row in connection.execute("PRAGMA table_info(message_attachments)")
-    }
-    if "content_hash" not in attachment_columns:
-        connection.execute(
-            "ALTER TABLE message_attachments ADD COLUMN content_hash TEXT"
-        )
-    if "size_bytes" not in attachment_columns:
-        connection.execute(
-            "ALTER TABLE message_attachments ADD COLUMN size_bytes INTEGER"
-        )
-    if "mime_type" not in attachment_columns:
-        connection.execute("ALTER TABLE message_attachments ADD COLUMN mime_type TEXT")
-    if "storage_path" not in attachment_columns:
-        connection.execute(
-            "ALTER TABLE message_attachments ADD COLUMN storage_path TEXT"
-        )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_attachments_hash "
         "ON message_attachments(content_hash)"
     )
-    if "thread_key" not in message_columns:
-        connection.execute("ALTER TABLE messages ADD COLUMN thread_key INTEGER")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_thread_key ON messages(thread_key)"
     )
-    if "thread_bridge_target" not in message_columns:
-        connection.execute("ALTER TABLE messages ADD COLUMN thread_bridge_target TEXT")
-    if "thread_bridge_source" not in message_columns:
-        connection.execute(
-            "ALTER TABLE messages ADD COLUMN thread_bridge_source TEXT "
-            "CHECK (thread_bridge_source IS NULL "
-            "OR thread_bridge_source = 'subject_heuristic')"
-        )
-    if "raw_headers" not in message_columns:
-        connection.execute("ALTER TABLE messages ADD COLUMN raw_headers TEXT")
 
 
 # Batch size for the per-insert scanning query in

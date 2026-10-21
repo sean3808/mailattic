@@ -58,25 +58,6 @@ class SyncExecutionResult:
             "attachments_source_missing": self.attachments_source_missing,
         }
 
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> SyncExecutionResult:
-        return cls(
-            pulled_messages=int(payload.get("pulled_messages", 0)),
-            folder_count=int(payload.get("folder_count", 0)),
-            candidate_messages=int(payload.get("candidate_messages", 0)),
-            inserted_messages=int(payload.get("inserted_messages", 0)),
-            deduplicated_messages=int(payload.get("deduplicated_messages", 0)),
-            failure_count=int(payload.get("failure_count", 0)),
-            exit_code=int(payload.get("exit_code", 1)),
-            failure_stage=_coerce_optional_text(payload.get("failure_stage")),
-            failure_message=_coerce_optional_text(payload.get("failure_message")),
-            attachments_recovered=int(payload.get("attachments_recovered", 0)),
-            attachments_still_failing=int(payload.get("attachments_still_failing", 0)),
-            attachments_source_missing=int(
-                payload.get("attachments_source_missing", 0)
-            ),
-        )
-
 
 def load_env_file(env_file: str | Path) -> dict[str, str]:
     path = Path(env_file).expanduser().resolve()
@@ -350,10 +331,3 @@ def _append_sync_log(
     if result.failure_message:
         fields.append(f"message={result.failure_message}")
     log_path.open("a", encoding="utf-8").write(" ".join(fields) + "\n")
-
-
-def _coerce_optional_text(value: object) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None

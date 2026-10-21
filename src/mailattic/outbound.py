@@ -476,6 +476,14 @@ def _decode_rfc2047_text(value: str) -> str:
     return str(make_header(decode_header(value)))
 
 
+def _format_recipient_header(entries_raw: object) -> str:
+    return ", ".join(
+        _decode_rfc2047_text(formataddr((r.get("name") or "", r.get("email") or "")))
+        for r in (entries_raw if isinstance(entries_raw, list) else [])
+        if isinstance(r, dict) and r.get("email")
+    )
+
+
 def build_quoted_reply_bodies(
     original: dict[str, object],
     reply_text: str,
@@ -507,21 +515,8 @@ def build_quoted_reply_bodies(
         except (ValueError, TypeError):
             sent_val = str(sent_at_raw)
 
-    to_raw = original.get("to")
-    to_entries = [
-        _decode_rfc2047_text(formataddr((r.get("name") or "", r.get("email") or "")))
-        for r in (to_raw if isinstance(to_raw, list) else [])
-        if isinstance(r, dict) and r.get("email")
-    ]
-    to_val = ", ".join(to_entries)
-
-    cc_raw = original.get("cc")
-    cc_entries = [
-        _decode_rfc2047_text(formataddr((r.get("name") or "", r.get("email") or "")))
-        for r in (cc_raw if isinstance(cc_raw, list) else [])
-        if isinstance(r, dict) and r.get("email")
-    ]
-    cc_val = ", ".join(cc_entries)
+    to_val = _format_recipient_header(original.get("to"))
+    cc_val = _format_recipient_header(original.get("cc"))
 
     subject_val = _original_subject(original)
     # Same cleaner as the display path, so style text already stored in an
@@ -823,8 +818,8 @@ def assemble_draft_reply(
     database_path: str | Path,
     message_id: str,
     *,
-    draft_dir: str | Path,
     own_address: str,
+    draft_dir: str | Path | None = None,
     body_text: str | None = None,
     body_from: str | Path | None = None,
     to: Sequence[str] | None = None,
@@ -960,7 +955,7 @@ def assemble_draft_reply(
             filename=path.name,
         )
 
-    out_dir = Path(draft_dir)
+    out_dir = Path(draft_dir) if draft_dir is not None else _draft_dir(database_path)
     out_dir.mkdir(parents=True, exist_ok=True)
     draft_path = out_dir / f"{draft_id}.eml"
     draft_bytes = msg.as_bytes()
@@ -988,6 +983,10 @@ def assemble_draft_reply(
 # ---------------------------------------------------------------------------
 # Send-draft gates and submission
 # ---------------------------------------------------------------------------
+
+
+def _draft_dir(database_path: Path | str) -> Path:
+    return Path(database_path).resolve().parent / "outbound" / "drafts"
 
 
 def _marker_dir(database_path: Path | str) -> Path:
@@ -1390,15 +1389,10 @@ def _prepare_draft_for_send(
         valid Message-ID is already known (e.g. a `_read_marker` I/O/decode
         error). Carries `message_id` for audit/recovery.
     """
-    if draft_dir is not None:
-        draft_path = Path(draft_dir) / f"{draft_id}.eml"
-    else:
-        draft_path = (
-            Path(database_path).resolve().parent
-            / "outbound"
-            / "drafts"
-            / (f"{draft_id}.eml")
-        )
+    draft_dir_path = (
+        Path(draft_dir) if draft_dir is not None else _draft_dir(database_path)
+    )
+    draft_path = draft_dir_path / f"{draft_id}.eml"
     raw = draft_path.read_bytes()
     msg = message_from_bytes(raw, policy=policy.default)
     if not isinstance(msg, EmailMessage):
@@ -2061,10 +2055,6 @@ def _extract_body_text(msg: EmailMessage) -> str:
 # ---------------------------------------------------------------------------
 # list-drafts: enumerate pending (unsent) drafts
 # ---------------------------------------------------------------------------
-
-
-def _draft_dir(database_path: Path | str) -> Path:
-    return Path(database_path).resolve().parent / "outbound" / "drafts"
 
 
 def list_drafts(database_path: Path | str) -> list[dict[str, str]]:

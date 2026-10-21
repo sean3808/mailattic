@@ -14,7 +14,13 @@ from uuid import uuid4
 
 from . import attachment_store
 from .datetime_bounds import TAIPEI
-from .models import ExtractedMessage, ExtractionResult, IngestFailure, PstSource
+from .models import (
+    ExtractedMessage,
+    ExtractionResult,
+    IngestFailure,
+    PstSource,
+    _coerce_optional_text,
+)
 
 # MK_E_UNAVAILABLE (0x800401E3): nothing registered in the Running Object Table,
 # which for a fixed ProgID means "that application is not running". Measured, not
@@ -263,7 +269,7 @@ class OutlookComReader:
     def _read_item(
         self, item: Any, *, folder_path: str
     ) -> RawOutlookMessage | RawOutlookFailure:
-        logical_locator = _optional_text(_safe_attr(item, "EntryID"))
+        logical_locator = _coerce_optional_text(_safe_attr(item, "EntryID"))
         try:
             item_class = item.Class
         except Exception as exc:
@@ -304,10 +310,10 @@ class OutlookComReader:
         # corrupted rows").
         try:
             subject = item.Subject
-            sender_name = _optional_text(item.SenderName)
-            sender_type = _optional_text(item.SenderEmailType)
+            sender_name = _coerce_optional_text(item.SenderName)
+            sender_type = _coerce_optional_text(item.SenderEmailType)
             sender_email_via_om = (
-                _optional_text(item.SenderEmailAddress)
+                _coerce_optional_text(item.SenderEmailAddress)
                 if sender_type and sender_type.casefold() == "smtp"
                 else None
             )
@@ -338,7 +344,9 @@ class OutlookComReader:
         sender_email = (
             sender_email_via_om
             if sender_type and sender_type.casefold() == "smtp"
-            else _optional_text(_optional_property(accessor, PR_SENDER_SMTP_ADDRESS))
+            else _coerce_optional_text(
+                _optional_property(accessor, PR_SENDER_SMTP_ADDRESS)
+            )
         )
         raw_message: dict[str, object] = {
             "subject": subject,
@@ -354,16 +362,16 @@ class OutlookComReader:
                 str(attachment["attachment_name"]) for attachment in attachments
             ],
             "attachment_collection_error": attachment_collection_error,
-            "message_id": _optional_text(
+            "message_id": _coerce_optional_text(
                 _optional_property(accessor, PR_INTERNET_MESSAGE_ID)
             ),
-            "in_reply_to": _optional_text(
+            "in_reply_to": _coerce_optional_text(
                 _optional_property(accessor, PR_IN_REPLY_TO_ID)
             ),
-            "references": _optional_text(
+            "references": _coerce_optional_text(
                 _optional_property(accessor, PR_INTERNET_REFERENCES)
             ),
-            "raw_headers": _optional_text(
+            "raw_headers": _coerce_optional_text(
                 _optional_property(accessor, PR_TRANSPORT_MESSAGE_HEADERS)
             ),
         }
@@ -386,14 +394,16 @@ class OutlookComReader:
             accessor = recipient.PropertyAccessor
             raw_recipients.append(
                 RawOutlookRecipient(
-                    display_name=_optional_text(_safe_attr(recipient, "Name")),
-                    smtp_address=_optional_text(
+                    display_name=_coerce_optional_text(_safe_attr(recipient, "Name")),
+                    smtp_address=_coerce_optional_text(
                         _optional_property(accessor, PR_SMTP_ADDRESS)
                     ),
-                    email_address=_optional_text(
+                    email_address=_coerce_optional_text(
                         _optional_property(accessor, PR_EMAIL_ADDRESS)
                     ),
-                    addrtype=_optional_text(_optional_property(accessor, PR_ADDRTYPE)),
+                    addrtype=_coerce_optional_text(
+                        _optional_property(accessor, PR_ADDRTYPE)
+                    ),
                     recipient_type=int(_safe_attr(recipient, "Type") or 0),
                 )
             )
@@ -418,7 +428,7 @@ class OutlookComReader:
                     payload = _optional_property(accessor, PR_ATTACH_DATA_BIN)
                     if not isinstance(payload, bytes | bytearray):
                         raise TypeError("Attachment binary property is unavailable")
-                    mime_type = _optional_text(
+                    mime_type = _coerce_optional_text(
                         _optional_property(accessor, PR_ATTACH_MIME_TAG)
                     )
                     record = attachment_store.write_attachment(
@@ -573,13 +583,6 @@ def _optional_property(accessor: Any, property_name: str) -> Any | None:
         return accessor.GetProperty(property_name)
     except Exception:
         return None
-
-
-def _optional_text(value: object) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
 
 
 def _load_outlook_namespace() -> Any:
@@ -746,12 +749,10 @@ class OutlookPstParser:
                 if isinstance(message, RawOutlookFailure):
                     account.parse_failures += 1
                     yield ExtractionResult(
-                        failure=IngestFailure(
-                            pst_source=source.source_path,
+                        failure=IngestFailure.from_source(
+                            source,
                             folder_path=message.folder_path,
                             logical_locator=message.logical_locator,
-                            source_input_mode=source.input_mode,
-                            source_requested_from=source.requested_from_path,
                             error_stage=message.error_stage,
                             error_type=message.error_type,
                             error_message=message.error_message,
@@ -764,12 +765,10 @@ class OutlookPstParser:
                 except ValueError as exc:
                     account.parse_failures += 1
                     yield ExtractionResult(
-                        failure=IngestFailure(
-                            pst_source=source.source_path,
+                        failure=IngestFailure.from_source(
+                            source,
                             folder_path=message.folder_path,
                             logical_locator=message.logical_locator,
-                            source_input_mode=source.input_mode,
-                            source_requested_from=source.requested_from_path,
                             error_stage="normalize-recipients",
                             error_type=type(exc).__name__,
                             error_message=str(exc),

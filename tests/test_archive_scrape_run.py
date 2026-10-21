@@ -22,6 +22,7 @@ import requests
 
 from mailattic.archive_scrape import (
     EXIT_OK,
+    EXIT_PARTIAL_FAILURE,
     AttachmentMeta,
     DetailHeader,
     ListRowMeta,
@@ -390,7 +391,7 @@ class TestRunScrapePerEntryFaultTolerance(unittest.TestCase):
         mock_validate.return_value = ([today], [])
 
         rows = self._make_three_rows()
-        mock_rows.return_value = (rows, False, None)
+        mock_rows.return_value = rows
         mock_filter.return_value = rows
 
         hdr1 = _make_detail_header(message_id="mid1@mailattic.test")
@@ -546,7 +547,7 @@ class TestRunScrapeEmitsJsonToStdout(unittest.TestCase):
         mock_list_page.return_value = "<html/>"
         mock_date_opts.return_value = [today]
         mock_validate.return_value = ([today], [])
-        mock_rows.return_value = ([], False, None)
+        mock_rows.return_value = []
         mock_filter.return_value = []
 
         buf = io.StringIO()
@@ -607,7 +608,7 @@ class TestRunScrapeEmitsJsonToStdout(unittest.TestCase):
         mock_list_page.return_value = "<html/>"
         mock_date_opts.return_value = [today]
         mock_validate.return_value = ([today], [])
-        mock_rows.return_value = ([], False, None)
+        mock_rows.return_value = []
         mock_filter.return_value = []
 
         buf = io.StringIO()
@@ -864,6 +865,117 @@ class TestExtractCfFilename(unittest.TestCase):
     def test_raises_value_error_for_empty_html(self) -> None:
         with self.assertRaises(ValueError):
             _extract_cf_filename("")
+
+
+class TestScrapeFailureNonZeroExit(unittest.TestCase):
+    """Verify archive-scrape exits non-zero on failure conditions:
+    1. Server unreachable (network error)
+    2. Credentials rejected (HTTP 401 / missing date dropdown)
+    3. Session expired mid-run (detail fetch failure resulting in partial failure)
+    """
+
+    def setUp(self) -> None:
+        # The launcher points TEMP at the managed runtime root; one dir per test
+        # so parallel workers never share or delete each other's DB.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "test.db"
+        initialize_database(self.db_path)
+        conn = connect_database(self.db_path)
+        try:
+            conn.execute(
+                "INSERT INTO self_addresses (address) VALUES ('sean@mailattic.test')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run_cli_scrape(self) -> int:
+        from mailattic.cli import main as cli_main
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            return cli_main(
+                [
+                    "scrape-archive",
+                    "--database",
+                    str(self.db_path),
+                    "--from",
+                    "2026-05-18",
+                    "--to",
+                    "2026-05-18",
+                    "--dry-run",
+                ]
+            )
+
+    @patch("mailattic.archive_scrape.load_credentials")
+    @patch("mailattic.archive_scrape.build_session")
+    @patch("mailattic.archive_scrape._fetch_list_page")
+    def test_server_unreachable_exits_non_zero(
+        self, mock_fetch_list, mock_session, mock_creds
+    ) -> None:
+        mock_creds.return_value = MagicMock(url=_BASE_URL, user="u", password="p")
+        mock_fetch_list.side_effect = requests.exceptions.ConnectionError(
+            "Connection refused"
+        )
+        exit_code = self._run_cli_scrape()
+        self.assertNotEqual(exit_code, 0)
+        self.assertEqual(exit_code, 2)
+
+    @patch("mailattic.archive_scrape.load_credentials")
+    @patch("mailattic.archive_scrape.build_session")
+    @patch("mailattic.archive_scrape._fetch_list_page")
+    def test_credentials_rejected_exits_non_zero(
+        self, mock_fetch_list, mock_session, mock_creds
+    ) -> None:
+        mock_creds.return_value = MagicMock(url=_BASE_URL, user="u", password="p")
+        mock_fetch_list.return_value = "<html><body>401 Unauthorized</body></html>"
+        exit_code = self._run_cli_scrape()
+        self.assertNotEqual(exit_code, 0)
+        self.assertEqual(exit_code, 2)
+
+    @patch("mailattic.archive_scrape.load_credentials")
+    @patch("mailattic.archive_scrape.build_session")
+    @patch("mailattic.archive_scrape._fetch_list_page")
+    @patch("mailattic.archive_scrape.parse_date_options")
+    @patch("mailattic.archive_scrape.validate_date_range")
+    @patch("mailattic.archive_scrape.parse_list_rows")
+    @patch("mailattic.archive_scrape.filter_by_sender")
+    @patch("mailattic.archive_scrape._fetch_detail_q1")
+    def test_session_expired_mid_run_exits_non_zero(
+        self,
+        mock_q1,
+        mock_filter,
+        mock_rows,
+        mock_validate,
+        mock_date_opts,
+        mock_list_page,
+        mock_session,
+        mock_creds,
+    ) -> None:
+        target_date = date(2026, 5, 18)
+        mock_creds.return_value = MagicMock(url=_BASE_URL, user="u", password="p")
+        mock_session.return_value = MagicMock(spec=requests.Session)
+        mock_list_page.return_value = "<html/>"
+        mock_date_opts.return_value = [target_date]
+        mock_validate.return_value = ([target_date], [])
+        row = ListRowMeta(
+            entry_id=1,
+            time_str="10:00:00",
+            sender="sean@mailattic.test",
+            recipient="r@mailattic.test",
+            message_id="mid1@mailattic.test",
+            subject="test",
+        )
+        mock_rows.return_value = [row]
+        mock_filter.return_value = [row]
+        mock_q1.return_value = "<html><body>Session expired - 401</body></html>"
+
+        exit_code = self._run_cli_scrape()
+        self.assertNotEqual(exit_code, 0)
+        self.assertEqual(exit_code, EXIT_PARTIAL_FAILURE)
 
 
 if __name__ == "__main__":

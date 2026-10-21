@@ -979,54 +979,42 @@ def _message_record_reduction_states(
     regardless of these bounds -- no state here ever truncates one to fit.
     """
 
-    def make_state(*, bmc: int, rl: int, al: int) -> Callable[[], dict[str, object]]:
-        def state() -> dict[str, object]:
-            return shape_message_payload(
-                message,
-                include_body=include_body,
-                recipients_limit=rl,
-                attachments_limit=al,
-                new_only=new_only,
-                body_max_chars=bmc,
-            )
-
-        return state
+    def make_payload(*, bmc: int, rl: int, al: int) -> dict[str, object]:
+        return shape_message_payload(
+            message,
+            include_body=include_body,
+            recipients_limit=rl,
+            attachments_limit=al,
+            new_only=new_only,
+            body_max_chars=bmc,
+        )
 
     states: list[Callable[[], dict[str, object]]] = []
 
     body_floor = body_max_chars
     if include_body:
-        for reduced_body_max_chars in _ladder_halving_steps(
-            body_max_chars, _BODY_MAX_CHARS_RANGE[0]
-        ):
-            states.append(
-                make_state(
-                    bmc=reduced_body_max_chars,
-                    rl=recipients_limit,
-                    al=attachments_limit,
-                )
-            )
-            body_floor = reduced_body_max_chars
-
-    recipients_floor = recipients_limit
-    for reduced_recipients_limit in _ladder_halving_steps(
-        recipients_limit, _RECIPIENTS_LIMIT_RANGE[0]
-    ):
-        states.append(
-            make_state(
-                bmc=body_floor, rl=reduced_recipients_limit, al=attachments_limit
-            )
+        b_states, body_floor = _halving_ladder_states(
+            body_max_chars,
+            _BODY_MAX_CHARS_RANGE[0],
+            lambda bmc: make_payload(
+                bmc=bmc, rl=recipients_limit, al=attachments_limit
+            ),
         )
-        recipients_floor = reduced_recipients_limit
+        states.extend(b_states)
 
-    for reduced_attachments_limit in _ladder_halving_steps(
-        attachments_limit, _ATTACHMENTS_LIMIT_RANGE[0]
-    ):
-        states.append(
-            make_state(
-                bmc=body_floor, rl=recipients_floor, al=reduced_attachments_limit
-            )
-        )
+    r_states, recipients_floor = _halving_ladder_states(
+        recipients_limit,
+        _RECIPIENTS_LIMIT_RANGE[0],
+        lambda rl: make_payload(bmc=body_floor, rl=rl, al=attachments_limit),
+    )
+    states.extend(r_states)
+
+    a_states, _ = _halving_ladder_states(
+        attachments_limit,
+        _ATTACHMENTS_LIMIT_RANGE[0],
+        lambda al: make_payload(bmc=body_floor, rl=recipients_floor, al=al),
+    )
+    states.extend(a_states)
 
     return states
 
@@ -1174,9 +1162,6 @@ def _contact_history_summary_with_reduced_recent(
 def shape_contact_history_summary(
     summary: _ContactHistorySummary, *, contacts_limit: int
 ) -> dict[str, object]:
-    _validate_int_range(
-        contacts_limit, "contacts_limit", *_MAIL_CONTACT_HISTORY_CONTACTS_LIMIT_RANGE
-    )
     truncated_fields: dict[str, int] = {}
     contacts = list(summary.get("contacts") or [])
     bounded_contacts, _, contacts_truncated = _bound_collection(
@@ -1287,11 +1272,6 @@ def _attachment_search_payload(
 def shape_attachment_search_item(
     entry: dict[str, object], *, carrying_messages_limit: int
 ) -> dict[str, object]:
-    _validate_int_range(
-        carrying_messages_limit,
-        "carrying_messages_limit",
-        *_MAIL_ATTACHMENTS_CARRYING_MESSAGES_LIMIT_RANGE,
-    )
     truncated_fields: dict[str, int] = {}
     # query.search_attachments produces carrying_messages as a list of
     # message-summary mappings for both deduplicated and passthrough results.
@@ -1387,18 +1367,11 @@ def _normalize_day_bound(value: str | None, *, end_of_day: bool) -> datetime | N
         # accepted: the alternatives are restructuring the CLI-shared
         # datetime_bounds formatter or duplicating its wording here. Upgrade
         # path: return structured fields from it, then cap the value alone.
-        if end_of_day:
-            raise build_tool_error(
-                ValueError,
-                format_invalid_date_message(
-                    "{date_value}", "to_date", expected=_ISO_DATE_ONLY_EXPECTED
-                ),
-                date_value=value,
-            ) from exc
+        param_name = "to_date" if end_of_day else "from_date"
         raise build_tool_error(
             ValueError,
             format_invalid_date_message(
-                "{date_value}", "from_date", expected=_ISO_DATE_ONLY_EXPECTED
+                "{date_value}", param_name, expected=_ISO_DATE_ONLY_EXPECTED
             ),
             date_value=value,
         ) from exc
@@ -1641,10 +1614,13 @@ def create_server(
     writer = MailWriter.for_database(resolved_database_path)
     server = MCPServer(_SERVER_NAME)
 
-    def _build_success_result(tool_name: str, payload: object) -> CallToolResult:
+    def _get_registered_tool(tool_name: str):
         tool = server._tool_manager.get_tool(tool_name)
         assert tool is not None
-        return build_call_tool_result(payload, tool=tool)
+        return tool
+
+    def _build_success_result(tool_name: str, payload: object) -> CallToolResult:
+        return build_call_tool_result(payload, tool=_get_registered_tool(tool_name))
 
     @server.tool(
         name="mail_search",
@@ -1823,8 +1799,7 @@ def create_server(
                 body_max_chars=body_max_chars,
             ),
         ]
-        tool = server._tool_manager.get_tool("mail_show")
-        assert tool is not None
+        tool = _get_registered_tool("mail_show")
         try:
             outcome = walk_ladder(_flag_ladder_states(states), tool=tool)
         except LadderExhausted as exc:
@@ -1948,9 +1923,12 @@ def create_server(
         states: list[Callable[[], dict[str, object]]] = [
             lambda: message_ids_state(selected_ids)
         ]
-        for reduced_count in _ladder_halving_steps(len(selected_ids), 1):
-            reduced_ids = selected_ids[-reduced_count:]
-            states.append(lambda ids=reduced_ids: message_ids_state(ids))
+        count_states, _ = _halving_ladder_states(
+            len(selected_ids),
+            1,
+            lambda count: message_ids_state(selected_ids[-count:]),
+        )
+        states.extend(count_states)
 
         # Once one message remains, apply mail_show's own within-record
         # order to it (body, then recipients, then attachments). Reusing
@@ -1974,8 +1952,7 @@ def create_server(
                 lambda record_state=record_state: build_thread_payload([record_state()])
             )
 
-        tool = server._tool_manager.get_tool("mail_thread")
-        assert tool is not None
+        tool = _get_registered_tool("mail_thread")
         try:
             outcome = walk_ladder(_flag_ladder_states(states), tool=tool)
         except LadderExhausted as exc:
@@ -2099,8 +2076,7 @@ def create_server(
             ),
         ]
 
-        tool = server._tool_manager.get_tool("mail_contact_history")
-        assert tool is not None
+        tool = _get_registered_tool("mail_contact_history")
         try:
             outcome = walk_ladder(_flag_ladder_states(states), tool=tool)
         except LadderExhausted as exc:
@@ -2217,8 +2193,7 @@ def create_server(
         # Same reasoning as mail_show/mail_thread/mail_contact_history: the
         # measured object already carries the flag, so the measured object
         # is what ships.
-        tool = server._tool_manager.get_tool("mail_attachments")
-        assert tool is not None
+        tool = _get_registered_tool("mail_attachments")
         try:
             outcome = walk_ladder(_flag_ladder_states(states), tool=tool)
         except LadderExhausted as exc:
@@ -2472,13 +2447,12 @@ def create_server(
         states: list[Callable[[], dict[str, object]]] = [
             lambda: _make_payload(result.body_text)
         ]
-        kept = len(result.body_text)
-        while kept > 1000:
-            kept = max(1000, kept // 2)
-            states.append(lambda kept=kept: _shrunk_payload(kept))
+        shrunk_states, _ = _halving_ladder_states(
+            len(result.body_text), 1000, _shrunk_payload
+        )
+        states.extend(shrunk_states)
 
-        tool = server._tool_manager.get_tool("mail_draft_reply")
-        assert tool is not None
+        tool = _get_registered_tool("mail_draft_reply")
         try:
             outcome = walk_ladder(_flag_ladder_states(states), tool=tool)
         except LadderExhausted as exc:
@@ -2543,8 +2517,7 @@ def create_server(
         # The mail is already out: a receipt that cannot be shrunk into the
         # budget must still be delivered as a success, never an error.
         states = _send_receipt_states(payload)
-        tool = server._tool_manager.get_tool("mail_send")
-        assert tool is not None
+        tool = _get_registered_tool("mail_send")
         try:
             return walk_ladder(states, tool=tool).delivered
         except LadderExhausted:

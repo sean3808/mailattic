@@ -201,6 +201,32 @@ class IngestFailure:
     attachment_name: str | None = None
     attachment_size: int | None = None
 
+    @classmethod
+    def from_source(
+        cls,
+        source: IngestionSource,
+        *,
+        error_stage: str,
+        error_type: str,
+        error_message: str,
+        folder_path: str | None = None,
+        logical_locator: str | None = None,
+        attachment_name: str | None = None,
+        attachment_size: int | None = None,
+    ) -> IngestFailure:
+        return cls(
+            pst_source=source.source_path,
+            folder_path=folder_path,
+            logical_locator=logical_locator,
+            source_input_mode=source.input_mode,
+            source_requested_from=source.requested_from_path,
+            error_stage=error_stage,
+            error_type=error_type,
+            error_message=error_message,
+            attachment_name=attachment_name,
+            attachment_size=attachment_size,
+        )
+
 
 @dataclass(slots=True)
 class ImportSummary:

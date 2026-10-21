@@ -27,7 +27,6 @@ from .identity import (
     resolve_self_addresses,
 )
 from .imap_sync import (
-    DEFAULT_COMPOSE_FILE,
     DEFAULT_ENV_FILE,
     DEFAULT_LOG_DIR,
     DEFAULT_MAILDIR_ROOT,
@@ -55,6 +54,8 @@ from .quarantine import (
     unresolved_attachment_failures,
 )
 from .query_commands import (
+    _format_exception_message,
+    add_database_argument,
     register_contact_history_command,
     register_message_commands,
 )
@@ -97,12 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Outlook nor readpst."
         ),
     )
-    import_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(import_parser)
     import_parser.add_argument(
         "--directory",
         dest="directories",
@@ -154,12 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "sync-imap",
         help="Run IMAP synchronization.",
     )
-    sync_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(sync_parser)
     sync_parser.add_argument(
         "--folder",
         default=None,
@@ -213,12 +204,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     sync_parser.add_argument(
-        "--compose-file",
-        type=Path,
-        default=DEFAULT_COMPOSE_FILE,
-        help=argparse.SUPPRESS,
-    )
-    sync_parser.add_argument(
         "--maildir-root",
         type=Path,
         default=DEFAULT_MAILDIR_ROOT,
@@ -238,12 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
         "scrape-archive",
         help="Scrape outbound mail archive from the mail server admin UI.",
     )
-    scrape_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(scrape_parser)
     scrape_parser.add_argument(
         "--once",
         action="store_true",
@@ -327,12 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Declare an email address as self (idempotent).",
     )
     identity_add_parser.add_argument("address", help="Email address to declare.")
-    identity_add_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(identity_add_parser)
     identity_add_parser.set_defaults(handler=_handle_identity_add)
 
     identity_remove_parser = identity_subparsers.add_parser(
@@ -340,12 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Undeclare an email address.",
     )
     identity_remove_parser.add_argument("address", help="Email address to undeclare.")
-    identity_remove_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(identity_remove_parser)
     identity_remove_parser.set_defaults(handler=_handle_identity_remove)
 
     identity_list_parser = identity_subparsers.add_parser(
@@ -355,12 +325,7 @@ def build_parser() -> argparse.ArgumentParser:
             "`database` or `unset` (nothing declared)."
         ),
     )
-    identity_list_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(identity_list_parser)
     identity_list_parser.set_defaults(handler=_handle_identity_list)
 
     identity_parser.set_defaults(
@@ -385,12 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
             "sqlite3.Connection.backup() (never copies .db directly)."
         ),
     )
-    db_backup_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(db_backup_parser)
     db_backup_parser.add_argument(
         "--output",
         type=Path,
@@ -410,12 +370,7 @@ def build_parser() -> argparse.ArgumentParser:
             "foreign_key_check and report results."
         ),
     )
-    db_doctor_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(db_doctor_parser)
     db_doctor_parser.add_argument(
         "--quarantine-root",
         type=Path,
@@ -436,12 +391,7 @@ def build_parser() -> argparse.ArgumentParser:
             "in a single rollback-safe transaction."
         ),
     )
-    db_reindex_fts_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(db_reindex_fts_parser)
     db_reindex_fts_parser.set_defaults(handler=_handle_db_reindex_fts)
 
     db_verify_cas_parser = db_subparsers.add_parser(
@@ -518,12 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
     db_abandon_parser.add_argument(
         "--reason", required=True, help="Why it is given up (recorded)."
     )
-    db_abandon_parser.add_argument(
-        "--database",
-        type=Path,
-        default=None,
-        help="SQLite database path.",
-    )
+    add_database_argument(db_abandon_parser)
     db_abandon_parser.add_argument(
         "--quarantine-root",
         type=Path,
@@ -609,6 +554,29 @@ def _handle_db_doctor(args: argparse.Namespace) -> int:
     return 0 if passed and not unresolved else 1
 
 
+def _confirm_destructive_action(
+    *,
+    confirmed_flag: bool,
+    prompt: str,
+    action_name: str,
+) -> bool:
+    if confirmed_flag:
+        return True
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            answer = input(prompt).strip()
+        except EOFError:
+            answer = ""
+        if answer == "yes":
+            return True
+    print(
+        f"{action_name}: confirmation required. "
+        "Use --yes flag or run interactively and type 'yes'.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _handle_db_abandon_attachment_failure(args: argparse.Namespace) -> int:
     db = args.database  # already resolved by main() three-layer fallback
     quarantine_root = args.quarantine_root or default_quarantine_root(db)
@@ -645,21 +613,11 @@ def _handle_db_abandon_attachment_failure(args: argparse.Namespace) -> int:
                 print(f"Quarantined raw mail that will be removed: {path}")
         connection.close()
         connection = None
-        confirmed = False
-        if args.yes:
-            confirmed = True
-        elif sys.stdin.isatty() and sys.stdout.isatty():
-            try:
-                answer = input("Type 'yes' to abandon it for good: ").strip()
-            except EOFError:
-                answer = ""
-            confirmed = answer == "yes"
-        if not confirmed:
-            print(
-                "abandon-attachment-failure: confirmation required. "
-                "Use --yes flag or run interactively and type 'yes'.",
-                file=sys.stderr,
-            )
+        if not _confirm_destructive_action(
+            confirmed_flag=args.yes,
+            prompt="Type 'yes' to abandon it for good: ",
+            action_name="abandon-attachment-failure",
+        ):
             return 1
         initialize_database(db)  # idempotent: adds the missing ledger columns
         connection = connect_database(db, create=False)
@@ -772,24 +730,11 @@ def _handle_db_prune_cas(args: argparse.Namespace) -> int:
     for path in result.bad_files:
         print(f"  {path}")
 
-    confirmed = False
-    if getattr(args, "yes", False):
-        confirmed = True
-    elif sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            answer = input(
-                f"Type 'yes' to delete {len(result.bad_files)} bad file(s): "
-            ).strip()
-        except EOFError:
-            answer = ""
-        confirmed = answer == "yes"
-
-    if not confirmed:
-        print(
-            "prune-cas: confirmation required. "
-            "Use --yes flag or run interactively and type 'yes'.",
-            file=sys.stderr,
-        )
+    if not _confirm_destructive_action(
+        confirmed_flag=args.yes,
+        prompt=f"Type 'yes' to delete {len(result.bad_files)} bad file(s): ",
+        action_name="prune-cas",
+    ):
         return 1
 
     deleted, failed = prune_cas(result.bad_files)
@@ -801,24 +746,12 @@ def _handle_db_prune_cas(args: argparse.Namespace) -> int:
 
 
 def _handle_db_no_subcommand(args: argparse.Namespace) -> int:
-    db_parser = getattr(args, "_db_parser", None)
-    if db_parser is not None:
-        db_parser.print_help()
-    else:
-        print(
-            "Usage: bes db <backup|doctor|reindex-fts|verify-cas|prune-cas|"
-            "abandon-attachment-failure>",
-            file=sys.stderr,
-        )
+    args._db_parser.print_help()
     return 2
 
 
 def _handle_identity_no_subcommand(args: argparse.Namespace) -> int:
-    identity_parser = getattr(args, "_identity_parser", None)
-    if identity_parser is not None:
-        identity_parser.print_help()
-    else:
-        print("Usage: bes identity <add|remove|list>", file=sys.stderr)
+    args._identity_parser.print_help()
     return 2
 
 
@@ -905,7 +838,7 @@ def _handle_rebuild(args: argparse.Namespace) -> int:
             work_dir=args.work_dir,
             pst_paths=args.pst,
         )
-    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         print(_format_exception_message(exc), file=sys.stderr)
         return 2
 
@@ -1126,6 +1059,55 @@ def _handle_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_sync_config_error(exc: Exception, *, as_json: bool = False) -> int:
+    if as_json:
+        payload = {
+            "status": "failed",
+            "exit_code": 1,
+            "error": _format_exception_message(exc),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 1
+    print(f"mbsync: ERROR config: {_format_exception_message(exc)}")
+    print("ingest: SKIPPED (mbsync failed)")
+    print("exit code: 1")
+    return 1
+
+
+def _print_sync_summary(outcome: Mapping[str, object]) -> int:
+    exit_code = int(outcome.get("exit_code", 0))
+    if exit_code != 0:
+        print(
+            f"mbsync: ERROR {outcome.get('failure_stage') or 'sync'}: "
+            f"{outcome.get('failure_message') or 'sync failed'}"
+        )
+        inserted = int(outcome.get("inserted_messages", 0))
+        deduped = int(outcome.get("deduplicated_messages", 0))
+        failures = int(outcome.get("failure_count", 0))
+        if inserted > 0 or deduped > 0:
+            print(
+                f"ingest: PARTIAL ({inserted} inserted, {deduped} deduped, "
+                f"{failures} folders failed) — exit_code={exit_code}"
+            )
+        else:
+            print("ingest: SKIPPED (mbsync failed)")
+        print(_attachment_retry_line(outcome))
+        print(f"exit code: {exit_code}")
+        return exit_code
+    print(
+        f"mbsync: pulled {outcome.get('pulled_messages', 0)} new messages from "
+        f"{outcome.get('folder_count', 0)} folders"
+    )
+    print(
+        f"ingest: {outcome.get('candidate_messages', 0)} candidates "
+        f"→ {outcome.get('inserted_messages', 0)} inserted, "
+        f"{outcome.get('deduplicated_messages', 0)} deduped"
+    )
+    print(_attachment_retry_line(outcome))
+    print("exit code: 0")
+    return 0
+
+
 def _handle_sync_imap(args: argparse.Namespace) -> int:
     # --pre-task: enforce 15-minute minimum interval before running a live sync.
     # The scheduled daily sync path is a separate process (Windows Task Scheduler
@@ -1143,26 +1125,14 @@ def _handle_sync_imap(args: argparse.Namespace) -> int:
             )
             outcome = pre_task_sync_imap(
                 database_path=args.database,
-                compose_file=args.compose_file,
                 env_file=args.env_file,
                 maildir_root=args.maildir_root,
                 log_dir=args.log_dir,
                 attachment_root=attachment_root,
                 folder=args.folder,
             )
-        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
-            if getattr(args, "json", False):
-                payload = {
-                    "status": "failed",
-                    "exit_code": 1,
-                    "error": _format_exception_message(exc),
-                }
-                print(json.dumps(payload, ensure_ascii=False, indent=2))
-                return 1
-            print(f"mbsync: ERROR config: {_format_exception_message(exc)}")
-            print("ingest: SKIPPED (mbsync failed)")
-            print("exit code: 1")
-            return 1
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _print_sync_config_error(exc, as_json=getattr(args, "json", False))
 
         if getattr(args, "json", False):
             print(json.dumps(outcome, ensure_ascii=False, indent=2))
@@ -1190,37 +1160,7 @@ def _handle_sync_imap(args: argparse.Namespace) -> int:
             return 0
 
         # status == "synced" — print the standard summary
-        exit_code = int(outcome.get("exit_code", 0))
-        if exit_code != 0:
-            print(
-                f"mbsync: ERROR {outcome.get('failure_stage') or 'sync'}: "
-                f"{outcome.get('failure_message') or 'sync failed'}"
-            )
-            inserted = int(outcome.get("inserted_messages", 0))
-            deduped = int(outcome.get("deduplicated_messages", 0))
-            failures = int(outcome.get("failure_count", 0))
-            if inserted > 0 or deduped > 0:
-                print(
-                    f"ingest: PARTIAL ({inserted} inserted, {deduped} deduped, "
-                    f"{failures} folders failed) — exit_code={exit_code}"
-                )
-            else:
-                print("ingest: SKIPPED (mbsync failed)")
-            print(_attachment_retry_line(outcome))
-            print(f"exit code: {exit_code}")
-            return exit_code
-        print(
-            f"mbsync: pulled {outcome.get('pulled_messages', 0)} new messages from "
-            f"{outcome.get('folder_count', 0)} folders"
-        )
-        print(
-            f"ingest: {outcome.get('candidate_messages', 0)} candidates "
-            f"→ {outcome.get('inserted_messages', 0)} inserted, "
-            f"{outcome.get('deduplicated_messages', 0)} deduped"
-        )
-        print(_attachment_retry_line(outcome))
-        print("exit code: 0")
-        return 0
+        return _print_sync_summary(outcome)
 
     if args.full_resync:
         response = input(
@@ -1264,7 +1204,6 @@ def _handle_sync_imap(args: argparse.Namespace) -> int:
         )
         result = run_sync_imap(
             database_path=args.database,
-            compose_file=args.compose_file,
             env_file=args.env_file,
             maildir_root=args.maildir_root,
             log_dir=args.log_dir,
@@ -1272,42 +1211,10 @@ def _handle_sync_imap(args: argparse.Namespace) -> int:
             folder=args.folder,
             full_resync=args.full_resync,
         )
-    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
-        print(f"mbsync: ERROR config: {_format_exception_message(exc)}")
-        print("ingest: SKIPPED (mbsync failed)")
-        print("exit code: 1")
-        return 1
+    except (OSError, RuntimeError, ValueError) as exc:
+        return _print_sync_config_error(exc)
 
-    if result.exit_code != 0:
-        print(
-            "mbsync: ERROR "
-            f"{result.failure_stage or 'sync'}: "
-            f"{result.failure_message or 'sync failed'}"
-        )
-        if result.inserted_messages > 0 or result.deduplicated_messages > 0:
-            print(
-                f"ingest: PARTIAL ({result.inserted_messages} inserted, "
-                f"{result.deduplicated_messages} deduped, "
-                f"{result.failure_count} folders failed) — exit_code={result.exit_code}"
-            )
-        else:
-            print("ingest: SKIPPED (mbsync failed)")
-        print(_attachment_retry_line(result.to_dict()))
-        print(f"exit code: {result.exit_code}")
-        return result.exit_code
-
-    print(
-        f"mbsync: pulled {result.pulled_messages} new messages from "
-        f"{result.folder_count} folders"
-    )
-    print(
-        f"ingest: {result.candidate_messages} candidates "
-        f"→ {result.inserted_messages} inserted, "
-        f"{result.deduplicated_messages} deduped"
-    )
-    print(_attachment_retry_line(result.to_dict()))
-    print("exit code: 0")
-    return 0
+    return _print_sync_summary(result.to_dict())
 
 
 def _attachment_retry_line(outcome: Mapping[str, object]) -> str:
@@ -1343,10 +1250,7 @@ def _handle_scrape_archive(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             database_path=args.database,
         )
-    except NotImplementedError as exc:
-        print(_format_exception_message(exc))
-        return 2
-    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         print(_format_exception_message(exc))
         return 2
     return summary.exit_code
@@ -1363,12 +1267,6 @@ def _parse_optional_date(value: str | None) -> date | None:
     if value is None:
         return None
     return datetime.strptime(value, "%Y-%m-%d").date()
-
-
-def _format_exception_message(exc: Exception) -> str:
-    if isinstance(exc, KeyError) and exc.args:
-        return str(exc.args[0])
-    return str(exc)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
