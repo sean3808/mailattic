@@ -18,12 +18,6 @@ from .query import _to_domain_suffix_pattern
 from .storage import connect_database
 
 
-def _normalise_email(email: str | None) -> str:
-    if not email:
-        return ""
-    return email.strip().lower()
-
-
 def aggregate_contact_history(
     *,
     database_path: str | Path,
@@ -126,7 +120,7 @@ def _build_match_clause(
     """Return (WHERE clause fragment, parameters) for the message selector."""
     params: list[object] = []
     if query_type == "contact":
-        norm = _normalise_email(query_value)
+        norm = query_value.strip().lower()
         # Exact match: sender OR recipient row exists
         clause = (
             "(LOWER(m.sender_email) = ? "
@@ -216,23 +210,6 @@ def _run_aggregation(
     # Missing / blank sender: neither direction is knowable (#232).
     unknown_count: int = directions.count(None)
 
-    if total == 0:
-        return {
-            "query": query_value,
-            "query_type": query_type,
-            "date_from": date_from,
-            "date_to": date_to,
-            "first_message_at": None,
-            "last_message_at": None,
-            "total_messages": 0,
-            "inbound_count": 0,
-            "outbound_count": 0,
-            "unknown_count": 0,
-            "distinct_contacts": 0,
-            "contacts": [],
-            "attachments": {"total_count": 0, "recent": []},
-        }
-
     # --- Contacts aggregation ---
     # Collect from sender + to + cc roles, excluding self and bcc
     # Sender as participant (where sender is NOT self)
@@ -311,15 +288,10 @@ def _run_aggregation(
     ).fetchall()
 
     # Dedup filenames keeping most-recent occurrence
-    seen_names: set[str] = set()
-    recent_names: list[str] = []
-    for att_row in att_rows:
-        name = att_row["attachment_name"]
-        if name not in seen_names:
-            seen_names.add(name)
-            recent_names.append(name)
-
-    total_att_count = len(seen_names)
+    recent_names = list(
+        dict.fromkeys(att_row["attachment_name"] for att_row in att_rows)
+    )
+    total_att_count = len(recent_names)
     recent_truncated = recent_names[:attachments_limit]
 
     return {

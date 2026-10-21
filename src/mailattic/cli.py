@@ -54,6 +54,7 @@ from .quarantine import (
     unresolved_attachment_failures,
 )
 from .query_commands import (
+    _format_exception_message,
     add_database_argument,
     register_contact_history_command,
     register_message_commands,
@@ -1305,12 +1306,6 @@ def _parse_optional_date(value: str | None) -> date | None:
     if value is None:
         return None
     return datetime.strptime(value, "%Y-%m-%d").date()
-
-
-def _format_exception_message(exc: Exception) -> str:
-    if isinstance(exc, KeyError) and exc.args:
-        return str(exc.args[0])
-    return str(exc)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

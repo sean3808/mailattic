@@ -362,8 +362,6 @@ def register_contact_history_command(
 
 
 def _format_exception_message(exc: Exception) -> str:
-    # Same four lines as cli._format_exception_message: cli imports this
-    # module, so sharing it would be a cycle.
     if isinstance(exc, KeyError) and exc.args:
         return str(exc.args[0])
     return str(exc)
@@ -483,8 +481,8 @@ def _resolve_show_format(args: argparse.Namespace) -> str | None:
     - Both given, format == json  → "json"  (+ deprecation hint; not a conflict)
     - Both given, format != json  → conflict → return None
     """
-    json_flag = getattr(args, "json_flag", False)
-    fmt = getattr(args, "format", None)  # None = not explicitly set by user
+    json_flag = args.json_flag
+    fmt = args.format  # None = not explicitly set by user
 
     if not json_flag and fmt is None:
         # Neither flag: default to raw
@@ -544,18 +542,13 @@ def _print_message_text(message: dict[str, object], *, new_only: bool = False) -
     print(f"Sent: {message['sent_at']}")
     print(f"PST: {message['pst_source']}")
     print(f"Folder: {message['folder_path']}")
-    to_list = message.get("to", [])
-    if isinstance(to_list, list) and to_list:
-        to_str = ", ".join(
-            f"{r.get('name', '')} <{r.get('email', '')}>" for r in to_list
-        )
-        print(f"To: {to_str}")
-    cc_list = message.get("cc", [])
-    if isinstance(cc_list, list) and cc_list:
-        cc_str = ", ".join(
-            f"{r.get('name', '')} <{r.get('email', '')}>" for r in cc_list
-        )
-        print(f"Cc: {cc_str}")
+    for field, label in (("to", "To"), ("cc", "Cc")):
+        recipients = message.get(field, [])
+        if isinstance(recipients, list) and recipients:
+            formatted = ", ".join(
+                f"{r.get('name', '')} <{r.get('email', '')}>" for r in recipients
+            )
+            print(f"{label}: {formatted}")
     print("-" * 40)
     body = message.get("body_text")
     rendered = render_text(body if isinstance(body, str) else None)
@@ -616,9 +609,9 @@ def _print_attachment_export_summary(result: AttachmentExportResult) -> None:
 
 
 def _handle_show(args: argparse.Namespace) -> int:
-    headers_flag = getattr(args, "headers_flag", False)
-    json_flag = getattr(args, "json_flag", False)
-    fmt_arg = getattr(args, "format", None)
+    headers_flag = args.headers_flag
+    json_flag = args.json_flag
+    fmt_arg = args.format
 
     # --headers is a mutually exclusive independent output mode.
     # It cannot be combined with --format (any value), --json, or --new-only.
@@ -689,15 +682,12 @@ def _handle_thread(args: argparse.Namespace) -> int:
 
     try:
         messages = walk_thread(args.database, identifier_str)
-    except ThreadIdentifierError as exc:
+    except (ThreadIdentifierError, FileNotFoundError, sqlite3.Error) as exc:
         print(_format_exception_message(exc), file=sys.stderr)
         return 2
     except KeyError as exc:
         print(_format_exception_message(exc), file=sys.stderr)
         return 1
-    except (FileNotFoundError, sqlite3.Error) as exc:
-        print(_format_exception_message(exc), file=sys.stderr)
-        return 2
 
     fmt = args.format or "raw"
 
