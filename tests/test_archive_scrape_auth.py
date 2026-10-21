@@ -112,6 +112,11 @@ class TestLoadCredentials(unittest.TestCase):
                 f"{cls.__name__} not RuntimeError",
             )
 
+    def test_env_exception_classes_have_correct_exit_codes(self) -> None:
+        """各 exception class 的 exit_code 屬性對應常數。"""
+        self.assertEqual(EnvNotFoundError.exit_code, 1)
+        self.assertEqual(EnvMissingFieldError.exit_code, 1)
+
 
 class TestBuildSession(unittest.TestCase):
     """task 2.2 — build_session() unit tests（不連真實郵件伺服器）。"""

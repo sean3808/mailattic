@@ -1101,7 +1101,7 @@ def _extract_attachments(
 
         mime_type: str | None = part.get_content_type()
         if not filename and is_rfc822_attach:
-            # _walk_own_parts keeps this subtree out of the parent body, so
+            # _walk_own_parts_with_context keeps this subtree out of the parent body, so
             # skipping it for want of a filename would drop the mail entirely.
             try:
                 payload_0 = part.get_payload(0)
