@@ -66,6 +66,8 @@ def test_font_style_orders_latin_then_fallback_then_cjk() -> None:
     order = ["'Aptos'", "'Calibri'", "'微軟正黑體'", "'PingFang TC'", "sans-serif"]
     positions = [style.index(name) for name in order]
     assert positions == sorted(positions)
+    assert "mso-ascii-font-family: 'Aptos'" in style
+    assert "mso-hansi-font-family: 'Aptos'" in style
     assert "mso-fareast-font-family: '微軟正黑體'" in style
     assert "font-size: 12pt" in style
 
@@ -86,6 +88,7 @@ def test_one_font_key_alone_still_brings_both_fallbacks(
     assert "'Microsoft JhengHei'" in style
     assert "'PingFang TC'" in style
     assert f"mso-fareast-font-family: '{fareast}'" in style
+    assert f"mso-ascii-font-family: '{env.get('MAIL_FONT_LATIN', 'Calibri')}'" in style
     assert "font-size" not in style
 
 

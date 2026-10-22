@@ -792,6 +792,10 @@ def reply_font_style(env: Mapping[str, str]) -> str:
         families = [latin, "Calibri", cjk, "Microsoft JhengHei", "PingFang TC"]
         quoted = (f"'{family}'" for family in dict.fromkeys(filter(None, families)))
         declarations.append(f"font-family: {', '.join(quoted)}, sans-serif")
+        # Outlook desktop picks a font per script from these, as in the
+        # HTML Outlook itself writes; other clients ignore mso-*.
+        for slot in ("ascii", "hansi"):
+            declarations.append(f"mso-{slot}-font-family: '{latin or 'Calibri'}'")
         declarations.append(f"mso-fareast-font-family: '{cjk or 'Microsoft JhengHei'}'")
     if size:
         declarations.append(f"font-size: {size}")
