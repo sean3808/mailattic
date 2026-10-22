@@ -29,6 +29,7 @@ from .outbound import (
     list_drafts,
     load_smtp_config,
     own_address_without_smtp_settings,
+    reply_font_style,
     resolve_smtp_env_file,
     send_batch,
     send_draft,
@@ -211,8 +212,10 @@ def register_outbound_commands(subparsers: argparse._SubParsersAction) -> None: 
 
 def _handle_draft_reply(args: argparse.Namespace) -> int:
     resolved_env_file = resolve_smtp_env_file(args.env_file)
+    env: dict[str, str] = {}
     try:
-        own_address = load_smtp_config(resolved_env_file).user
+        env = load_env_file(resolved_env_file)
+        own_address = load_smtp_config(env).user
     except FileNotFoundError:
         # #199: a missing file must not fall back to a sender the user never chose.
         print(_missing_smtp_env_file_error(resolved_env_file), file=sys.stderr)
@@ -249,6 +252,7 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
             allow_archive_anchor=args.allow_archive_anchor,
             on_archive_anchor=warn_archive_anchor,
             subject=args.subject,
+            font_style=reply_font_style(env),
         )
     except DraftReplyError as exc:
         print(exc, file=sys.stderr)
