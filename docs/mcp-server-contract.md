@@ -68,3 +68,8 @@ Claude Desktop 在約 150,000 字元截斷 tool result，且是用一個檔案�
 
 1. 所有工具維持 sync `def`，mcp 2.x 會把它們派到 worker thread 執行，安全性來自「每次呼叫各開一條 DB 連線」而非 sqlite3 本身 thread-safe —— 共用連線跨 thread 仍會拋 `ProgrammingError`。
 2. `mcp_delivery.build_call_tool_result` 要拿工具的 `fn_metadata` 才能把 two-channel 組裝**委派**給框架，這條路只有私有的 `server._tool_manager.get_tool()` 走得到（公開的列舉方法回的是協定層描述，不帶那個轉換），生產程式碼有 5 處這樣用（工具數是七，此處仍是五：`mail_sync_status` 與 `mail_attachment_export` 沿用共用的成功結果 helper，沒有自己再伸手一次 —— 兩個數字不必同步移動）。委派優於自己重做，因為重做只能事後偵測漂移、委派則讓漂移不可能發生——代價就是框架換代時本 repo 會是 spec 級變更而非單純升版。
+
+## 已知陷阱（2026-10-23 自 lesson-lookup 搬入）
+
+<!-- from lesson-lookup/mcp -->
+- **MCP 工具參數只要宣告成「不是純 `str`」的型別，框架就會先對字串值跑一次 `json.loads` 才交給你的函式；它只 catch `JSONDecodeError`，所以非 JSONDecodeError 的解析失敗會變成框架的錯誤，你的驗證邏輯根本不會執行**：實例：`mail_show(message_id: StrictInt | StrictStr)` 寫了完整的識別碼分類（含「超長數字串一律拒絕」）並實測每個邊界，唯獨 4301 位數字串拿到的不是我方訊息，而是 `Exceeds the limit (4300 digits) for integer string conversion`。追進 `mcp/server/mcpserver/utilities/func_metadata.py` 的 `pre_parse_json`：它對 `field_info.annotation is not str` 的字串參數無條件 `json.loads`，而 CPython 的 `sys.get_int_max_str_digits()`（預設 4300）拋的是**裸 `ValueError`**、不是 `JSONDecodeError`，於是穿過那個 `except` 直接冒到通用處理器。判準：(1) 參數宣告成 union（`int | str`）或任何非純 `str` 型別時，你的函式體**不是**第一道關卡——要驗「我方訊息」的測試，先確認該輸入真的到得了函式體；(2) 到不了的輸入，測試要打在**判定 helper 本身**，不要打在工具呼叫上（後者是在斷言框架的行為，不是自己的）；(3) 不要因為「框架反正會擋」就把自己規則裡的對應 clause 拿掉——規則要在自己的層次上是完整的，靠別人的 `except` 才成立的規則會在框架換代時無聲失效。negative signal：宣告為純 `str` 的參數（框架不會 pre-parse），以及 in-process 直接呼叫函式的測試路徑（完全不經過 `pre_parse_json`）不適用。 `[jean-wan-mail-platform 2026-07]`

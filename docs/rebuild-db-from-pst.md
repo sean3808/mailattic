@@ -287,3 +287,11 @@ uv run bes db verify-cas --attachment-root <work-dir>\attachments
 | 3 | `coverage-report` 用 readpst 整批解包一次才給缺口估計，代價與 import 同量級 —— 值不值得留在 `--all` 預設序列未定案 | 步驟 1 |
 | 4 | 全量重建自換 Outlook backend 後**尚未實跑過**，3.5–4 小時是從 dry-run 抽取速率外推 | 整體 |
 | 5 | **掛載中的 PST 能不能被別的行程開起來讀，未量測**（要量測必須先開 Outlook）。preflight 已不再做位元組可讀性檢查，正是因為若 Outlook 不放行外部開檔，「掛載成功」反而會讓檢查變紅。下次重建開著 Outlook 時順手驗一次，結論回填這裡 | 步驟 0 / 1 |
+
+## 已知陷阱（2026-10-23 自 lesson-lookup 搬入）
+
+<!-- from lesson-lookup/mail-sync -->
+- **Windows MinGW build 的 readpst `-j` 是啞 flag（永遠 single-thread）**：`-j` 上游靠 `fork()` 平行，Windows MinGW 無 fork emulation → silently ignored。辨識：binary 目錄無 `cygwin1.dll`/`msys-2.0.dll` = 純 MinGW = 沒 fork。驗證：啟動後看 `Get-Process readpst` 是否 N+1 process。要平行走 Python 層 ProcessPoolExecutor（PST 級）或 Linux container；MSYS2 build 綁 libpst issue #7（>0.71 parallel mail loss）不建議。同判準適用任何 Unix-origin C 工具在 Windows「應平行卻 single-thread」。 `[jean-wan-mail-platform 2026-05]`
+
+<!-- from lesson-lookup/mail-sync -->
+- **readpst `-e`（個別 .eml）vs `-r`（mbox concat）產生不同 MIME tree**：mbox 模式對嵌套 `message/rfc822` 展開更深（1 vs 77 attachment parts 極端案例），重 extraction 對既有 DB 比對會大量 false mismatch + mis-pairing 風險。重 extract 比對 ingest 結果**必須用同一組 readpst flags**（記下原 ingest 的）；對不齊時唯一安全路是 fresh re-ingest，不要 backfill 對齊。 `[jean-wan-mail-platform 2026-05]`

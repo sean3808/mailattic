@@ -135,3 +135,14 @@ from mailattic.query import search_messages, SearchFilters, get_message
 - `SearchFilters(keyword, sender, recipient, sender_domain, recipient_domain, participants_domain, sent_from, sent_to, attachment_name)` — 全 optional
 - `search_messages(filters, full_body=False)` — 預設 lightweight summary；`full_body=True` 加上 `rendered_body_text` / `dedup_key` / thread 欄位 / `to` / `cc` / `bcc`
 - `get_message(message_id_or_db_id)` — 完整 body / recipients / attachments
+
+## 已知陷阱（2026-10-23 自 lesson-lookup 搬入）
+
+<!-- from lesson-lookup/mail-sync -->
+- **mbsync `--full-resync` 不能 re-fetch「server 已過 retention」的訊息 — flag 名誤導**：它是「重建 local sync state」不是「重抓所有曾存在的 messages」；retention 過期對 mbsync 永遠不可達。任何 IMAP 同步工具的 `--full-resync`/`--rebuild` 類 flag，先問「server 現在保留多久」再評估可否重抓。歷史完整保留需 server 端 archive policy 配合。 `[jean-wan-mail-platform 2026-05]`
+
+<!-- from lesson-lookup/mail-sync -->
+- **IMAP 資料夾名是 modified UTF-7（RFC 3501），naive utf-8 decode 對 CJK folder 靜默產生 mojibake**：中文資料夾（`寄件備份`）在 LIST 回應是 `&W8RO9lCZTv0-` 形式；utf-8 decode 不報錯、原樣存進 DB 變亂碼。**不會讓 sync 崩**（SELECT/STATUS 用同 wire form round-trip），症狀只在依 folder 名 filter 時現形。修法：LIST 後做 mUTF-7 decode（`&..-` 間是 modified-base64 的 UTF-16BE，`,`→`/`，`&-`=literal `&`）；要 APPEND 到 CJK folder 需反向 encode。伴生事實：server 可能不支援 SPECIAL-USE；中文 locale Outlook 建中文名特殊資料夾。 `[jean-wan-mail-platform 2026-07]`
+
+<!-- from lesson-lookup/mail-sync -->
+- **IMAP 增量同步的 per-folder UID watermark 掉一筆，症狀是「那個資料夾整包重抓」而不是「同步壞掉」**——而擋在中間的 bulk guard 會讓它看起來像同步失敗。實例：INBOX 的 watermark 從 `.imap_watermarks.json` 消失，守門判定「watermark 為 None ＝ 全新世代」且待抓 2061 筆超過門檻 500，於是整個 folder 一封都沒進、exit 非零，其餘 8 個資料夾照常同步。診斷順序（先分辨兩種完全不同的成因，處置相反）：(1) 讀 watermark 檔，確認是「該 folder 的 key 不見了」還是「key 還在但 uidvalidity 不同」；(2) 連伺服器查該 folder 當下的 `UIDVALIDITY`（STATUS 即可，不必 SELECT），跟檔內其他 folder 的世代號比對——**同一批號 ＝ 伺服器沒換世代、是狀態檔掉了；號碼變了 ＝ 真的換世代、舊 UID 不可比較**；(3) 只有第二種才非重抓不可。**不要反射性用 `--full-resync`**：它通常實作成 `clear_all()`，清掉**所有** folder 的 watermark，把「一個 folder 的問題」放大成整個信箱重抓；要放行單一 folder 就指定 folder ＋放行守門的確認回呼。**也不要手寫 watermark 補成「DB 裡的最大 UID」**：看似精準，但會**永久跳過**該 UID 以下任何漏掉的信，而 UID 有缺號時你無法證明那個區間沒有漏（本例 3007 封散在 56794–59956，中間有缺號）——寧可多抓一次讓 dedup gate 吸收。順帶的認知修正：本地封數多於伺服器現有封數是正常的（本例 DB 3007 vs 伺服器 2061），長期歸檔庫本來就會保留伺服器上已被刪除／被 POP 收走的信，差額不是遺失。negative signal：一次性全量匯入（PST／mbox）沒有 watermark 概念；真的換了 UIDVALIDITY 世代時上面「不要重抓」的建議反過來。 `[jean-wan-mail-platform 2026-08]`

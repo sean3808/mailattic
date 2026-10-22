@@ -131,3 +131,20 @@ WSL `.venv` 是 May 25 設的；之後 `pyproject.toml` 加新 dependency（例�
 - **PC-041**：腳本內含 `export PATH=/root/.local/bin:$PATH` 必須寫進 .sh 檔，不可 inline 在 `bash -c '...'`（Git Bash outer shell 會展開 `(x86)` paren 字元炸 syntax）
 - **PC-017** / `scripts/rebuild-venv.ps1`：`.venv/lib64` reparse-point file lock 卡 uv sync 的修法
 - **Spectra 時期 `add-mbsync-imap-sync` change 的 design Decision 5（不隨本 repo 帶出）**：為何 mbsync 走 one-shot 而非 container 內 cron（WSL2 distro idle shutdown）
+
+## 已知陷阱（2026-10-23 自 lesson-lookup 搬入）
+
+<!-- from lesson-lookup/wsl -->
+- **WSL `rsync` / 大量小檔寫入 `/mnt/<drive>` 會把 Windows 儲存控制器壓出 timeout/reset，整顆硬碟短暫消失**：I/O path（Linux → drvfs → NTFS → Intel RST/VMD → SATA）對 metadata-heavy 寫入開銷大，觸發 `iaStorVD` Event 129 reset + `disk` 51 + `Ntfs` 50/141（delayed write failure）；BIOS 一度看不到 SSD（需完整斷電恢復），chkdsk 卻顯示 NTFS 正常 = 控制器層 timeout 非 FS 損毀。修法：(1) WSL→Windows 大量搬遷一律 Windows-native `robocopy SRC DST /E /Z /R:2 /W:2 /MT:8`（不要激進值）；(2) WSL 來源先 `tar -czf` 打包成單一檔；(3) 開發目錄要嘛全 WSL ext4 要嘛全 Windows，不混合 heavy-write 跨邊界。判準：寫入端在 WSL + 目的地 `/mnt/<drive>` + >1 萬檔或 metadata-heavy → 禁 rsync。退場：同碟再現三組 Event signature → SSD 直接退場。 `[host-maintenance 2026-05; jean-wan-mail-platform 2026-05]`
+
+<!-- from lesson-lookup/wsl -->
+- **production 跑 Docker container 用的 binary ≠ native WSL 也有**：container image 內 `apt-get install` 的工具（mbsync/isync 等）native distro 預設沒裝，直接跑報 exit 127。native 直跑的 script 要 pre-flight `command -v <bin>`；新 distro bootstrap doc 列清單。 `[jean-wan-mail-platform 2026-05]`
+
+<!-- from lesson-lookup/wsl -->
+- **Git Bash 呼叫 wsl.exe 傳 Linux 路徑要 `MSYS_NO_PATHCONV=1`**：MSYS 把 `/mnt/d/...` 自動轉成 Windows 路徑（前綴 Git 安裝目錄）→ wsl 內 bash 報 No such file。`MSYS_NO_PATHCONV=1 wsl -d <distro> -- bash /mnt/d/.../script.sh`。 `[jean-wan-mail-platform 2026-05]`
+
+<!-- from lesson-lookup/wsl -->
+- **`.venv/lib64` 是 wsl 建的 NTFS reparse point，會被 Windows file lock 卡住刪不掉**：症狀：venv 半毀（剩 lib64 + pyvenv.cfg）、`uv sync` 噴 `存取被拒 (os error 5)`。修法：用 .NET API 拆 reparse point（`[System.IO.Directory]::Delete($path, $false)`，**不可** `Remove-Item -Recurse`——會嘗試遞迴進 target）再刪 .venv 重建（jean-wan 有現成 `scripts/rebuild-venv.ps1`，Claude Code Bash 可直接跑）。預防：同一 venv 別混用 wsl uv 與 Windows uv。 `[jean-wan-mail-platform 2026-05]`
+
+<!-- from lesson-lookup/docker -->
+- **Docker Engine on WSL2 不會把 `docker.exe` 裝到 Windows PATH**：Windows-side 程式 `subprocess.run(["docker", ...])` 直接 `FileNotFoundError`（Docker Desktop 才裝 Windows CLI + socket share）。修法依侵入性：(1) user-facing wrapper `wsl -e bash -c "docker compose ..."`；(2) source 偵測 `sys.platform=="win32" and not shutil.which("docker")` 時加 wsl prefix；(3) 裝 Windows-side docker CLI 指向 WSL daemon。寫「Windows 程式喊 docker」前先問「目標機一定有 Docker Desktop 嗎？」。 `[jean-wan-mail-platform 2026-05]`
