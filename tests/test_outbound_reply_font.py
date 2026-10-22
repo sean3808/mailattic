@@ -70,6 +70,25 @@ def test_font_style_orders_latin_then_fallback_then_cjk() -> None:
     assert "font-size: 12pt" in style
 
 
+@pytest.mark.parametrize(
+    ("env", "fareast"),
+    [
+        ({"MAIL_FONT_LATIN": "Aptos"}, "Microsoft JhengHei"),
+        ({"MAIL_FONT_CJK": "微軟正黑體"}, "微軟正黑體"),
+    ],
+)
+def test_one_font_key_alone_still_brings_both_fallbacks(
+    env: dict[str, str], fareast: str
+) -> None:
+    style = reply_font_style(env)
+
+    assert "'Calibri'" in style
+    assert "'Microsoft JhengHei'" in style
+    assert "'PingFang TC'" in style
+    assert f"mso-fareast-font-family: '{fareast}'" in style
+    assert "font-size" not in style
+
+
 def test_no_font_settings_means_no_style() -> None:
     assert reply_font_style({"SMTP_USER": "sean3808@mailattic.test"}) == ""
 
@@ -100,12 +119,19 @@ def test_font_style_wraps_reply_and_quoted_block() -> None:
     assert "Original body text" in html_body
 
 
-def test_empty_font_style_leaves_bodies_unchanged() -> None:
-    original = _make_original()
+def test_without_font_the_html_body_is_the_pre_13_markup() -> None:
+    """Pinned by hand from the pre-#13 builder, not derived from today's code."""
+    _, html_body = build_quoted_reply_bodies(_make_original(), "My reply")
 
-    assert build_quoted_reply_bodies(
-        original, "My reply", font_style=""
-    ) == build_quoted_reply_bodies(original, "My reply")
+    assert html_body == (
+        "My reply\n<div>\n<hr>\n"
+        "<b>From:</b> Alice Chen &lt;alice@example.com&gt;<br>\n"
+        "<b>Sent:</b> Tuesday, May 26, 2026 05:03:07 PM<br>\n"
+        "<b>To:</b> Sean Example &lt;sean3808@mailattic.test&gt;<br>\n"
+        "<b>Subject:</b> Test subject<br>\n"
+        "<br>\n"
+        "Original body text\n</div>"
+    )
 
 
 def test_cli_draft_html_carries_configured_font(tmp_path: Path) -> None:

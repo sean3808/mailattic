@@ -766,7 +766,8 @@ def reply_font_style(env: Mapping[str, str]) -> str:
     ``MAIL_FONT_LATIN`` / ``MAIL_FONT_CJK`` / ``MAIL_FONT_SIZE`` are optional;
     none set returns ``""`` (no styling, the draft is unchanged). Latin text
     falls back to Calibri, CJK text to Microsoft JhengHei / PingFang TC, and
-    Outlook desktop gets the CJK font through ``mso-fareast-font-family``.
+    Outlook desktop gets the CJK font through ``mso-fareast-font-family``;
+    either font key alone still brings in both fallback chains.
     A malformed value raises ``DraftReplyError`` naming the key.
     """
     latin = env.get("MAIL_FONT_LATIN", "").strip()
@@ -786,13 +787,12 @@ def reply_font_style(env: Mapping[str, str]) -> str:
 
     declarations = []
     if latin or cjk:
-        families = [latin, "Calibri"] if latin else []
-        if cjk:
-            families += [cjk, "Microsoft JhengHei", "PingFang TC"]
-        quoted = (f"'{family}'" for family in dict.fromkeys(families))
+        # Either key alone fills in the other side's fallbacks too, so CJK
+        # text is never left to the client default (Sean, #13 review).
+        families = [latin, "Calibri", cjk, "Microsoft JhengHei", "PingFang TC"]
+        quoted = (f"'{family}'" for family in dict.fromkeys(filter(None, families)))
         declarations.append(f"font-family: {', '.join(quoted)}, sans-serif")
-    if cjk:
-        declarations.append(f"mso-fareast-font-family: '{cjk}'")
+        declarations.append(f"mso-fareast-font-family: '{cjk or 'Microsoft JhengHei'}'")
     if size:
         declarations.append(f"font-size: {size}")
     return "; ".join(declarations)
