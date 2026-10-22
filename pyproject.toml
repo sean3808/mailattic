@@ -66,6 +66,14 @@ markers = [
     "release: release, installation, or Git-hook end-to-end tests",
 ]
 
+# /closeout runs the canonical launcher instead of a raw pytest (ai-agent-setting-backup#85).
+# 17 = another pytest holds the project lock, 18 = runtime root volume not established:
+# the suite did not run, which is not a test failure.
+[tool.closeout]
+smoke = ["pwsh", "-NoProfile", "-File", "scripts/invoke-pytest.ps1", "-Route", "Quick"]
+full = ["pwsh", "-NoProfile", "-File", "scripts/invoke-pytest.ps1", "-Route", "Full"]
+undetermined_exit_codes = [17, 18]
+
 [tool.pyright]
 include = [
     "src/mailattic/mcp_server.py",
