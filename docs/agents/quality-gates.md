@@ -82,6 +82,10 @@ it is not release evidence:
 pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route Quick
 ```
 
+Because Quick skips `tests/test_report_diff_coverage.py` (marked `slow`, #12),
+a change to `scripts/report-diff-coverage.ps1` runs
+`-Route Targeted tests\test_report_diff_coverage.py` before closeout.
+
 ### full
 
 Run for medium/high closeout and release. It is authoritative and keeps all

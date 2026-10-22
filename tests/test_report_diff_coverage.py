@@ -41,6 +41,10 @@ from tests._pwsh_support import (
     run_pwsh_file,
 )
 
+# ~170 s for the file (every test spawns pwsh and builds a git repo): Quick
+# skips it, Full runs it (#12).
+pytestmark = pytest.mark.slow
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "report-diff-coverage.ps1"
 REAL_ENV_HELPER = REPO_ROOT / "scripts" / "project-tool-environment.ps1"

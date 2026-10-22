@@ -164,7 +164,7 @@ def test_pytest_discovery_and_marker_policy_is_explicit() -> None:
 
     assert config["testpaths"] == ["tests"]
     assert set(config["markers"]) == {
-        "slow: pathological MCP response-budget tests",
+        "slow: pathological MCP response-budget and slow tooling-integration tests",
         "release: release, installation, or Git-hook end-to-end tests",
     }
     assert "--strict-markers" in config["addopts"]

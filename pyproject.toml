@@ -62,7 +62,7 @@ testpaths = ["tests"]
 addopts = "--strict-markers --basetemp=.project-runtime/pytest"
 cache_dir = ".project-runtime/pytest-cache"
 markers = [
-    "slow: pathological MCP response-budget tests",
+    "slow: pathological MCP response-budget and slow tooling-integration tests",
     "release: release, installation, or Git-hook end-to-end tests",
 ]
 
