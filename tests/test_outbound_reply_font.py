@@ -17,16 +17,16 @@ from mailattic.outbound import (
 )
 from mailattic.outbound_commands import _handle_draft_reply
 from mailattic.storage import initialize_database
-from tests.test_mcp_send import _seed_message
+from tests.test_mcp_send import _declare_self, _seed_message
 from tests.test_outbound_draft import PLACEHOLDER_SMTP_SETTINGS
 from tests.test_outbound_quoted_reply import _make_original, _seed_db
 
-FONT_SETTINGS = "MAIL_FONT_LATIN=Aptos\nMAIL_FONT_CJK=微軟正黑體\nMAIL_FONT_SIZE=12pt\n"
 FONT_ENV = {
     "MAIL_FONT_LATIN": "Aptos",
     "MAIL_FONT_CJK": "微軟正黑體",
     "MAIL_FONT_SIZE": "12pt",
 }
+FONT_SETTINGS = "".join(f"{key}={value}\n" for key, value in FONT_ENV.items())
 
 
 def _env_file(tmp_path: Path, extra: str = "") -> Path:
@@ -96,7 +96,7 @@ def test_font_style_wraps_reply_and_quoted_block() -> None:
 
     assert html_body.startswith(f'<div style="{style}">')
     assert html_body.rstrip().endswith("</div>")
-    assert html_body.index("My reply") > len(style)
+    assert "My reply" in html_body
     assert "Original body text" in html_body
 
 
@@ -130,6 +130,34 @@ def test_cli_draft_refuses_malformed_font_without_writing(
     assert _cli_draft(tmp_path, env_file) == 2
     assert "MAIL_FONT_SIZE" in capsys.readouterr().err
     assert not list((tmp_path / "outbound" / "drafts").glob("*.eml"))
+
+
+def test_cli_draft_ignores_font_when_smtp_settings_do_not_load(
+    tmp_path: Path,
+) -> None:
+    """Same rule as the MCP path: no usable settings, no font."""
+    env_file = tmp_path / "smtp.env"
+    env_file.write_text(FONT_SETTINGS, encoding="utf-8")
+    db_path = _seed_db(tmp_path)
+    _declare_self(db_path, "sean3808@mailattic.test")
+    body_file = tmp_path / "body.txt"
+    body_file.write_text("reply", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "draft-reply",
+            "<quoted-reply-test@mailattic.test>",
+            "--body-from",
+            str(body_file),
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(env_file),
+        ]
+    )
+
+    assert _handle_draft_reply(args) == 0
+    draft = next((tmp_path / "outbound" / "drafts").glob("*.eml"))
+    assert "font-family" not in _draft_html(draft)
 
 
 def test_mcp_draft_html_carries_configured_font(

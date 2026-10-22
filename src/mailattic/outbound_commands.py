@@ -222,7 +222,9 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
         return 2
     except (OSError, ValueError):
         # Unreadable or incomplete settings; anything else is a bug and
-        # must not be relabelled as "set SMTP_USER".
+        # must not be relabelled as "set SMTP_USER". Fonts, like the MCP
+        # path, apply only from settings that load (#13).
+        env = {}
         try:
             own_address = own_address_without_smtp_settings(args.database)
         except DraftReplyError as refusal:
