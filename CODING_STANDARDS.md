@@ -74,6 +74,18 @@ IMAP `UID N:*` may legally return the last already-synced UID when nothing is ne
 
 _Source: `1e0ae06` (#192, `imap_native.py`)._
 
+### C4 — Normalise both sides through the ingest path's own normaliser before diffing a recomputed value against the DB
+
+Recomputing every subject and comparing with the stored value showed 361 differing rows, 340 of them only leading/trailing whitespace, and a parser-bug ticket was opened on it. The ingest path (`_coerce_text`) already strips, so the DB held 0 such subjects. The real gap was on the other side: the recompute function returned an un-normalised value and a backfill script wrote it straight in, which would put a shape ingest never produces into the DB. Find out what ingest does to the field (strip, casefold, NFC, ...) and run both sides of the diff through that one function; before filing a "parser bug", run one SQL query asking whether the DB really contains that shape. Not applicable when both sides come out of the same function.
+
+_Source: `[mailattic-dev 2026-09]`._
+
+### C5 — When fixing a read-side parse (unescape, literal decoding), check the write-side is its inverse and trace who uses the parsed value as a key
+
+The parsed result is often sent back to a server (a name), or used as a state key or directory name. Fixing only the parse yields a correctly decoded value that can no longer be selected, and existing data whose key changes after the restore gets rescanned from scratch. Ask the implementer to trace the consumers up front in the dispatch; that catches it earlier than review.
+
+_Source: `[mailattic-dev 2026-10]`._
+
 ---
 
 ## D. Paths and host independence
@@ -117,6 +129,18 @@ _Source: `dec0c25`._
 "Still within budget" alone stays green when a removed field comes back. Assert both that restoring the removed fields breaks the budget and that the current shape stays within it.
 
 _Source: `878d897` (#178, `tests/test_mcp_search_attachment_budget.py`)._
+
+### E4 — A paired/ratio guard can compare one payload with itself; print the ratio once and prove the fixture reaches the guarded path
+
+A ratio test written to keep a relaxed snippet within the delivery budget (keyword-path payload <= 1.25x the no-keyword payload) was green; the measured ratio was **0.98**. The fixture put the keyword at the start of the body, so the hit window (133 chars) was shorter than the old 160 cap and both sides were the same payload: pass rate 100%, discrimination 0. After writing a ratio assertion: (1) print the value once; near 1.0 means the two sides do not differ; (2) add an assertion that the fixture really takes the guarded path (at least one row exceeds the old cap); (3) set the bound from the measurement (measured 1.08 -> bound 1.15) — the margin is for fixture drift, not for next round's growth. Not applicable when the two sides come from different code paths that are certain to run.
+
+_Source: `[mailattic-dev 2026-08]`._
+
+### E5 — De-identification is accepted by "an industry reader cannot tell who this is", not by "0 hits on the blocklist"; renaming does not hide business shape
+
+Renamed test data still carried the product type, document kind, shipping lane, unit price and customer country, so a blocklist scan found nothing while a human recognised the industry. (1) Build test data from scratch as a fictional scenario in an unrelated industry; do not "rewrite a real email". (2) When the real source is reachable, do a two-way reverse lookup (real names / domains / attachment names / codes searched in the public tree, and public-tree codes searched in the real data); any hit is a leak. (3) Change only values that identify a person or company; keep operational values (constants, default filenames, number ranges, spot-check keywords) and prove behaviour is unchanged with "AST identical after stripping comments/docstrings". (4) Leave no seam wording after cleaning. Not applicable to pure public-data projects. See also D-20261018-2 for the value-level criteria and accepted residuals.
+
+_Source: `[mailattic-dev 2026-10]`._
 
 ---
 
