@@ -24,6 +24,7 @@ import html
 import json
 import mimetypes
 import os
+import re
 import smtplib
 import sqlite3
 import ssl
@@ -65,6 +66,7 @@ __all__ = [
     "reply_all_recipients",
     "build_thread_headers",
     "build_quoted_reply_bodies",
+    "reply_font_style",
     "resolve_attachment_mime_type",
     "resolve_smtp_env_file",
     "DEFAULT_SMTP_ENV_FILE",
@@ -487,6 +489,8 @@ def _format_recipient_header(entries_raw: object) -> str:
 def build_quoted_reply_bodies(
     original: dict[str, object],
     reply_text: str,
+    *,
+    font_style: str = "",
 ) -> tuple[str, str]:
     """Build plain-text and HTML quoted-reply bodies from an original message dict.
 
@@ -495,6 +499,8 @@ def build_quoted_reply_bodies(
     The quoted block is placed below the caller-provided reply text, preceded by a
     visual separator.  Field order: From / Sent / To / [Cc] / Subject.  The Cc line
     is omitted entirely when the original has no CC recipients.
+    A non-empty ``font_style`` (from :func:`reply_font_style`) wraps the whole
+    HTML body, reply and quoted block alike, in one styled ``div``.
     """
     sender_name = original.get("sender_name")
     sender_email = str(original.get("sender_email") or "")
@@ -561,6 +567,8 @@ def build_quoted_reply_bodies(
         + _esc(body_text_val)
         + "\n</div>"
     )
+    if font_style:
+        html_body = f'<div style="{font_style}">\n{html_body}\n</div>'
 
     return plain_body, html_body
 
@@ -746,6 +754,54 @@ class DraftReplyError(Exception):
     """Expected refusal from ``assemble_draft_reply``; its message is user-facing."""
 
 
+# A font name lands inside a quoted CSS value inside an HTML attribute, so
+# anything that could close either is refused rather than escaped (#13).
+_FONT_NAME_FORBIDDEN = frozenset("\"'`;:<>&\\{}()\r\n")
+_FONT_SIZE_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+)?(?:pt|px)")
+
+
+def reply_font_style(env: Mapping[str, str]) -> str:
+    """CSS for the reply's HTML body from the SMTP settings file (#13).
+
+    ``MAIL_FONT_LATIN`` / ``MAIL_FONT_CJK`` / ``MAIL_FONT_SIZE`` are optional;
+    none set returns ``""`` (no styling, the draft is unchanged). Latin text
+    falls back to Calibri, CJK text to Microsoft JhengHei / PingFang TC, and
+    Outlook desktop gets the CJK font through ``mso-fareast-font-family``;
+    either font key alone still brings in both fallback chains.
+    A malformed value raises ``DraftReplyError`` naming the key.
+    """
+    latin = env.get("MAIL_FONT_LATIN", "").strip()
+    cjk = env.get("MAIL_FONT_CJK", "").strip()
+    size = env.get("MAIL_FONT_SIZE", "").strip()
+    for key, name in (("MAIL_FONT_LATIN", latin), ("MAIL_FONT_CJK", cjk)):
+        if any(char in _FONT_NAME_FORBIDDEN for char in name):
+            raise DraftReplyError(
+                f"{key} in the SMTP settings file must be a plain font name, "
+                f"got {name!r}."
+            )
+    if size and not _FONT_SIZE_PATTERN.fullmatch(size):
+        raise DraftReplyError(
+            "MAIL_FONT_SIZE in the SMTP settings file must look like 12pt or "
+            f"16px, got {size!r}."
+        )
+
+    declarations = []
+    if latin or cjk:
+        # Either key alone fills in the other side's fallbacks too, so CJK
+        # text is never left to the client default (Sean, #13 review).
+        families = [latin, "Calibri", cjk, "Microsoft JhengHei", "PingFang TC"]
+        quoted = (f"'{family}'" for family in dict.fromkeys(filter(None, families)))
+        declarations.append(f"font-family: {', '.join(quoted)}, sans-serif")
+        # Outlook desktop picks a font per script from these, as in the
+        # HTML Outlook itself writes; other clients ignore mso-*.
+        for slot in ("ascii", "hansi"):
+            declarations.append(f"mso-{slot}-font-family: '{latin or 'Calibri'}'")
+        declarations.append(f"mso-fareast-font-family: '{cjk or 'Microsoft JhengHei'}'")
+    if size:
+        declarations.append(f"font-size: {size}")
+    return "; ".join(declarations)
+
+
 def _declared_self_addresses(
     database_path: str | Path, *, read_only: bool = False
 ) -> list[str]:
@@ -832,6 +888,7 @@ def assemble_draft_reply(
     on_archive_anchor: Callable[[], None] | None = None,
     read_only: bool = False,
     subject: str | None = None,
+    font_style: str = "",
 ) -> DraftReplyResult:
     """Build a reply draft to ``message_id`` and write ``<draft_dir>/<draft_id>.eml``.
 
@@ -842,6 +899,7 @@ def assemble_draft_reply(
     is allowed, ``on_archive_anchor`` fires before any later step can fail.
     ``subject`` replaces the default "Re: <original subject>" verbatim (no
     prefix added); threading headers still come from the anchor.
+    ``font_style`` styles the HTML body (see :func:`build_quoted_reply_bodies`).
     Expected refusals (bad recipients, unknown or archive-scraped anchor,
     unreadable body or attachment) raise ``DraftReplyError``; anything else,
     such as a failed draft write, propagates unwrapped.
@@ -929,7 +987,9 @@ def assemble_draft_reply(
     msg["References"] = thread_headers["references"]
     msg["Subject"] = thread_headers["subject"] if subject is None else subject
     msg["Date"] = formatdate(localtime=True)
-    plain_body, html_body = build_quoted_reply_bodies(original, body_text)
+    plain_body, html_body = build_quoted_reply_bodies(
+        original, body_text, font_style=font_style
+    )
     msg.set_content(plain_body, charset="utf-8")
     msg.add_alternative(html_body, subtype="html", charset="utf-8")
 

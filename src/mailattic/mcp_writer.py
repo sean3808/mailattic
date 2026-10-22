@@ -47,6 +47,7 @@ from .outbound import (
     assemble_draft_reply,
     load_smtp_config,
     own_address_without_smtp_settings,
+    reply_font_style,
 )
 
 _SEND_LOCK = threading.Lock()
@@ -267,8 +268,9 @@ class MailWriter:
         # the configured account, so the send-time from-invariant accepts
         # what was reviewed. No account configured and no single declared
         # self address means no draft -- there is no built-in address.
+        env: Mapping[str, str] = {}
         try:
-            _, smtp_config = _load_mcp_smtp_env()
+            env, smtp_config = _load_mcp_smtp_env()
             own_address = smtp_config.user
         except ValueError:
             own_address = own_address_without_smtp_settings(
@@ -287,6 +289,7 @@ class MailWriter:
             replace_recipients=replace_recipients,
             attachments=attachments,
             read_only=True,
+            font_style=reply_font_style(env),
         )
 
     def send_draft(
