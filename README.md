@@ -29,7 +29,7 @@ pwsh -ExecutionPolicy Bypass -File scripts\reinstall-global.ps1
 setx MAILATTIC_DB C:\path\to\mailattic.db
 ```
 
-The global `bes` is a snapshot of the build, so run the script again after you pull new code. Removal and the database path order are in [`docs/global-install-and-release.md`](docs/global-install-and-release.md). To register the MCP server with Claude Desktop, see [`docs/cowork-mcp-bridge-validation.md`](docs/cowork-mcp-bridge-validation.md) (written in Traditional Chinese).
+The global `bes` is a snapshot of the build, so run the script again after you pull new code. Removal and the database path order are in [`docs/global-install-and-release.md`](docs/global-install-and-release.md). To register the MCP server with Claude Desktop, add a stdio server to `claude_desktop_config.json` whose command is `uv run --project <repo> python -m mailattic.mcp_server` (quit Claude Desktop from the tray before editing the file, then restart it).
 
 ## Why query an archive
 

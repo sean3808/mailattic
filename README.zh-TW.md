@@ -29,7 +29,7 @@ pwsh -ExecutionPolicy Bypass -File scripts\reinstall-global.ps1
 setx MAILATTIC_DB C:\path\to\mailattic.db
 ```
 
-全域 `bes` 是建置當下的快照，拉了新程式碼要再跑一次腳本。移除方式與資料庫路徑的優先順序見 [`docs/global-install-and-release.md`](docs/global-install-and-release.md)；要把 MCP server 加進 Claude Desktop，見 [`docs/cowork-mcp-bridge-validation.md`](docs/cowork-mcp-bridge-validation.md)。
+全域 `bes` 是建置當下的快照，拉了新程式碼要再跑一次腳本。移除方式與資料庫路徑的優先順序見 [`docs/global-install-and-release.md`](docs/global-install-and-release.md)；要把 MCP server 加進 Claude Desktop，在 `claude_desktop_config.json` 加一個 stdio server，指令是 `uv run --project <repo> python -m mailattic.mcp_server`（編輯前先從系統匣結束 Claude Desktop，改完再重開）。
 
 ## 為什麼從存檔查
 
