@@ -757,7 +757,7 @@ class DraftReplyError(Exception):
 # A font name lands inside a quoted CSS value inside an HTML attribute, so
 # anything that could close either is refused rather than escaped (#13).
 _FONT_NAME_FORBIDDEN = frozenset("\"'`;:<>&\\{}()\r\n")
-_FONT_SIZE_PATTERN = re.compile(r"\d+(?:\.\d+)?(?:pt|px)")
+_FONT_SIZE_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+)?(?:pt|px)")
 
 
 def reply_font_style(env: Mapping[str, str]) -> str:

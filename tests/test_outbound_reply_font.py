@@ -99,6 +99,7 @@ def test_no_font_settings_means_no_style() -> None:
         ("MAIL_FONT_LATIN", 'Aptos"><script>'),
         ("MAIL_FONT_CJK", "微軟正黑體; color: red"),
         ("MAIL_FONT_SIZE", "12"),
+        ("MAIL_FONT_SIZE", "１２pt"),
         ("MAIL_FONT_SIZE", "12pt; color: red"),
     ],
 )
