@@ -314,11 +314,20 @@ def test_unreadable_filename_keeps_attachment_with_stable_distinct_names(
     item = _unnamed_item(["raise", "empty"], [b"first bytes", b"second bytes"])
     summary = _import_again(tmp_path, item)
 
+    from mailattic import attachment_store
+
     rows = _rows(tmp_path)
     assert summary.imported_messages == 1
-    assert [r[1] for r in rows] == [len(b"first bytes"), len(b"second bytes")]
-    assert len({r[0] for r in rows}) == 2
-    assert all(r[0] and r[2] for r in rows)
+    assert len(rows) == 2
+    # Names are the parser's unnamed fallback, distinct within the message.
+    assert [r[0] for r in rows] == [
+        "unnamed-attachment-1.pdf",
+        "unnamed-attachment-2.pdf",
+    ]
+    stored = [
+        attachment_store.read_attachment(r[2], tmp_path / "attachments") for r in rows
+    ]
+    assert stored == [b"first bytes", b"second bytes"]
     assert summary.failure_count == 0
 
     # Same input again: names are positional, so a re-import is idempotent.
