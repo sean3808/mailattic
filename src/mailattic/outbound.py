@@ -428,7 +428,9 @@ def _original_subject(original: dict[str, object]) -> str:
 def build_thread_headers(original: dict[str, object]) -> dict[str, str]:
     """Build thread-continuity headers for a reply draft."""
     message_id_value = original.get("message_id")
-    if not isinstance(message_id_value, str) or not message_id_value.strip():
+    if not isinstance(message_id_value, str) or not normalize_message_id(
+        message_id_value
+    ):
         raise ValueError(
             "Cannot build thread headers: original message has no Message-ID"
         )
@@ -441,7 +443,10 @@ def build_thread_headers(original: dict[str, object]) -> dict[str, str]:
         if references_value is not None and str(references_value).strip()
         else []
     )
-    if not reference_tokens or reference_tokens[-1] != message_id_value:
+    # Emit the normalised id (no outer CFWS); keep brackets only if stored with them.
+    clean_id = normalize_message_id(message_id_value)
+    message_id_value = f"<{clean_id}>" if "<" in message_id_value else clean_id
+    if not reference_tokens or normalize_message_id(reference_tokens[-1]) != clean_id:
         reference_tokens.append(message_id_value)
 
     subject = _original_subject(original)

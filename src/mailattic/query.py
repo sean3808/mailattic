@@ -27,14 +27,24 @@ from .storage import SYNC_STATE_KEY, connect_database
 _REF_RE = re.compile(r"<([^>]+)>")
 
 
+_CFWS_COMMENT = r"(?:\([^()]*\)\s*)*"
+_BRACKETED_ID_RE = re.compile(rf"^\s*{_CFWS_COMMENT}<([^<>]*)>\s*{_CFWS_COMMENT}$")
+_BARE_ID_RE = re.compile(rf"^\s*{_CFWS_COMMENT}([^\s()<>]+)\s*{_CFWS_COMMENT}$")
+
+
 def normalize_message_id(value: str | None) -> str:
     """Canonical derived identity of a Message-ID (#22).
 
-    Outer whitespace (RFC 5322 CFWS) is dropped before the angle brackets, so
-    ``"<a@x>  "`` and ``"a@x"`` are the same identity. Case is preserved
-    (D-20260813-1). Stored headers are never rewritten; only derived lookups use this.
+    Outer CFWS (whitespace and ``(comments)`` outside the angle brackets, RFC
+    5322 3.6.4) is dropped, so ``"<a@x>  "``, ``"(c) <a@x> (note)"`` and ``"a@x"``
+    are one identity. The id inside the brackets keeps its case and content
+    (only edge whitespace is trimmed). Stored headers are never rewritten.
     """
-    return (value or "").strip().strip("<>").strip()
+    text = value or ""
+    match = _BRACKETED_ID_RE.match(text) or _BARE_ID_RE.match(text)
+    if match:
+        return match.group(1).strip()
+    return text.strip().strip("<>").strip()
 
 
 def select_rows_by_message_id(
@@ -45,22 +55,31 @@ def select_rows_by_message_id(
 ) -> list[sqlite3.Row]:
     """Rows whose stored ``message_id`` normalises to *clean_id*.
 
-    Uses two index range seeks (bare and bracketed prefix) as a superset, then
-    verifies with :func:`normalize_message_id`, so stored values carrying outer
-    whitespace are found without a full scan. ``columns`` must not name
-    ``message_id`` (it is always appended).
+    Index range seeks form a superset: the bare and bracketed prefixes, plus the
+    rare stored values that start with whitespace or a ``(comment)``. Each row
+    is then verified exactly with :func:`normalize_message_id`, so any outer
+    CFWS is found without a full scan. ``columns`` must be trusted constants;
+    ``message_id`` is always appended as ``_mid``.
     """
     if not clean_id:
         return []
-    rows: list[sqlite3.Row] = []
-    for prefix in (clean_id, f"<{clean_id}"):
+    ranges = (
+        (clean_id, clean_id + "\U0010ffff"),
+        (f"<{clean_id}", f"<{clean_id}\U0010ffff"),
+        ("", "!"),  # leading whitespace / control characters
+        ("(", ")"),  # leading comment
+    )
+    rows: dict[int, sqlite3.Row] = {}
+    for low, high in ranges:
         cursor = connection.execute(
             f"SELECT {columns}, message_id AS _mid FROM messages"
             " WHERE message_id >= ? AND message_id < ? AND id IS NOT ?",
-            [prefix, prefix + "\U0010ffff", exclude_id],
+            [low, high, exclude_id],
         )
-        rows.extend(r for r in cursor if normalize_message_id(r["_mid"]) == clean_id)
-    return list({int(r["id"]): r for r in rows}.values())
+        for r in cursor:
+            if normalize_message_id(r["_mid"]) == clean_id:
+                rows[int(r["id"])] = r
+    return list(rows.values())
 
 
 def _tokenize_references(header: str | None) -> list[str]:

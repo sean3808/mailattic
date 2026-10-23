@@ -89,3 +89,97 @@ def test_draft_anchor_lookup_finds_whitespace_message_id(tmp_path: Path) -> None
     ids = _insert(db, ("root", "child"))
     found = _get_message_by_rfc822_message_id(db, "<root@example.test>")
     assert int(found["id"]) == ids["root"]  # type: ignore[call-overload]
+
+
+# --- review round: leading whitespace + CFWS comments, both paths -----------
+
+CFWS_FORMS = [
+    "  <root@example.test>",
+    "<root@example.test> (note)",
+    "(c) <root@example.test>",
+    " (c) <root@example.test>  (d) ",
+]
+
+
+@pytest.mark.parametrize("stored", CFWS_FORMS)
+@pytest.mark.parametrize("order", list(itertools.permutations(("root", "child"))))
+def test_cfws_forms_incremental_equals_bulk(
+    tmp_path: Path, stored: str, order: tuple[str, str]
+) -> None:
+    db = initialize_database(tmp_path / "t.db")
+    ids: dict[str, int] = {}
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        for name in order:
+            msg = (
+                make_message(stored)
+                if name == "root"
+                else make_message(CHILD_MID, in_reply_to="<root@example.test>")
+            )
+            ids[name] = persist_message(conn, msg).stored_message_id
+        conn.commit()
+        rows = [
+            (r["id"], r["message_id"], r["in_reply_to"], r["references_header"])
+            for r in conn.execute(
+                "SELECT id, message_id, in_reply_to, references_header FROM messages"
+            )
+        ]
+        incremental = {
+            r["id"]: r["thread_key"]
+            for r in conn.execute("SELECT id, thread_key FROM messages")
+        }
+    finally:
+        conn.close()
+    assert compute_thread_keys(rows) == incremental
+    assert len(set(incremental.values())) == 1
+    assert sorted(resolve_thread_message_ids(db, "<root@example.test>")) == sorted(
+        ids.values()
+    )
+
+
+def test_normalize_keeps_inner_case_and_content() -> None:
+    from mailattic.query import normalize_message_id
+
+    assert normalize_message_id("(c) <Ab.C@Ex.Test> (n)") == "Ab.C@Ex.Test"
+    assert normalize_message_id("bare@x") == "bare@x"
+    assert normalize_message_id(None) == ""
+
+
+def test_thread_headers_use_normalised_id() -> None:
+    from mailattic.outbound import build_thread_headers
+
+    h = build_thread_headers(
+        {
+            "message_id": "<root@example.test>  ",
+            "references_header": "<a@x> <root@example.test>",
+            "subject": "s",
+        }
+    )
+    assert h["in_reply_to"] == "<root@example.test>"
+    assert h["references"] == "<a@x> <root@example.test>"
+    h = build_thread_headers({"message_id": "<r@x> (n)", "subject": "s"})
+    assert h["in_reply_to"] == "<r@x>"
+    assert h["references"] == "<r@x>"
+
+
+def test_backfill_cli_requires_explicit_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from backfill_thread_key import main
+
+    with pytest.raises(SystemExit) as exc:
+        main([])
+    assert exc.value.code != 0
+    db = initialize_database(tmp_path / "t.db")
+    ids = _insert(db, ("root", "child"))
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE messages SET thread_key = id")
+    conn.commit()
+    conn.close()
+    assert main(["--database", str(db), "--verify"]) == 0
+    out = capsys.readouterr().out
+    assert "Affected rows (thread_key differs from stored): 1 of 2" in out
+    assert "UNEXPLAINED diff: 0" in out
+    assert "Sampled threads : 1" in out
+    assert sorted(resolve_thread_message_ids(db, ids["root"])) == sorted(ids.values())

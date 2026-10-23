@@ -4,8 +4,8 @@ Computes connected-component thread_key values via union-find (reusing
 thread_key.compute_thread_keys) and writes them as a shadow column.
 
 Usage:
-    uv run python scripts/backfill_thread_key.py [--database <path>]
-    uv run python scripts/backfill_thread_key.py [--database <path>]
+    uv run python scripts/backfill_thread_key.py --database <scratch path>
+    uv run python scripts/backfill_thread_key.py --database <scratch path>
         --verify [--sample N]
 
 Exit codes:
@@ -32,13 +32,11 @@ if str(SRC_ROOT) not in sys.path:
 from mailattic.query import (  # noqa: E402
     _escape_like,
     _tokenize_references,
+    normalize_message_id,
+    select_rows_by_message_id,
 )
 from mailattic.thread_key import compute_thread_keys  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Default DB path (mirrors CLI convention — absolute, cwd-invariant)
-# ---------------------------------------------------------------------------
-_DEFAULT_DB = REPO_ROOT / "mailattic.db"
 _BATCH_SIZE = 2_000
 # Threshold for the frozen old-BFS oracle, used by _classify_diff to attribute
 # >ceiling truncation (design.md Decision 3).
@@ -110,9 +108,9 @@ def _old_bfs_component(
     def _enqueue_ids_from_row(row: sqlite3.Row) -> None:
         """Collect ancestor IDs from in_reply_to + references_header."""
         if row["in_reply_to"]:
-            pending_message_ids.add(row["in_reply_to"].strip("<>"))
+            pending_message_ids.add(normalize_message_id(row["in_reply_to"]))
         for ref_id in _tokenize_references(row["references_header"]):
-            pending_message_ids.add(ref_id.strip("<>"))
+            pending_message_ids.add(normalize_message_id(ref_id))
 
     def _enqueue_descendant_ids(msg_id: str) -> list[sqlite3.Row]:
         """Find descendants using the OLD angle-bracket LIKE query.
@@ -123,17 +121,22 @@ def _old_bfs_component(
         hits <abc@x.com.tw> because '<abc@x.com>' appears as a substring
         of '<abc@x.com.tw>').
         """
-        clean = msg_id.strip("<>")
-        bracketed = f"<{clean}>"
+        clean = normalize_message_id(msg_id)
         escaped_clean = _escape_like(clean)
         rows = con.execute(
-            "SELECT id, message_id, in_reply_to, references_header "
+            "SELECT id, message_id, in_reply_to, references_header, "
+            "       references_header LIKE ? ESCAPE '\\' AS ref_hit "
             "FROM messages "
-            "WHERE in_reply_to IN (?, ?) "
+            "WHERE in_reply_to LIKE ? ESCAPE '\\' "
             "   OR references_header LIKE ? ESCAPE '\\'",
-            [clean, bracketed, f"%<{escaped_clean}>%"],
+            [f"%<{escaped_clean}>%", f"%{escaped_clean}%", f"%<{escaped_clean}>%"],
         ).fetchall()
-        return rows
+        # in_reply_to LIKE is a superset prefilter; verify the exact identity.
+        return [
+            r
+            for r in rows
+            if r["ref_hit"] or normalize_message_id(r["in_reply_to"]) == clean
+        ]
 
     def _visit_row(row: sqlite3.Row) -> None:
         _enqueue_ids_from_row(row)
@@ -143,7 +146,9 @@ def _old_bfs_component(
                 if child_db_id in visited_db_ids:
                     continue
                 if desc_row["message_id"]:
-                    pending_message_ids.add(desc_row["message_id"].strip("<>"))
+                    pending_message_ids.add(
+                        normalize_message_id(desc_row["message_id"])
+                    )
                 else:
                     visited_db_ids.add(child_db_id)
                     _enqueue_ids_from_row(desc_row)
@@ -157,15 +162,13 @@ def _old_bfs_component(
         batch = list(pending_message_ids)
         pending_message_ids.clear()
 
-        bare_ids = [mid.strip("<>") for mid in batch]
-        bracketed_ids = [f"<{mid}>" for mid in bare_ids]
-        all_forms = bare_ids + bracketed_ids
-        placeholders = ",".join("?" for _ in all_forms)
-        rows = con.execute(
-            f"SELECT id, message_id, in_reply_to, references_header "
-            f"FROM messages WHERE message_id IN ({placeholders})",
-            all_forms,
-        ).fetchall()
+        rows = [
+            r
+            for mid in dict.fromkeys(normalize_message_id(m) for m in batch)
+            for r in select_rows_by_message_id(
+                con, mid, "id, in_reply_to, references_header, message_id"
+            )
+        ]
 
         for row in rows:
             db_id = int(row["id"])
@@ -240,6 +243,17 @@ def run_backfill(database_path: Path) -> None:
         print("[backfill] Computing thread_key via union-find …")
         thread_key_map: dict[int, int] = compute_thread_keys(tuples)
         print(f"[backfill] Union-find complete — {len(thread_key_map):,} mappings.")
+
+        before = {
+            int(r["id"]): r["thread_key"]
+            for r in con.execute("SELECT id, thread_key FROM messages")
+        }
+        changed = sum(1 for i, tk in thread_key_map.items() if before.get(i) != tk)
+        print(
+            f"[backfill] Affected rows (thread_key differs from stored): "
+            f"{changed:,} of {len(thread_key_map):,} "
+            f"(after re-run this is 0)."
+        )
 
         print(f"[backfill] Writing thread_key in batches of {_BATCH_SIZE:,} …")
         items = list(thread_key_map.items())
@@ -317,7 +331,7 @@ def _classify_diff(
     # a full <token>.
     like_fp_ids: list[int] = []
     if root_message_id:
-        clean_id = root_message_id.strip("<>")
+        clean_id = normalize_message_id(root_message_id)
         escaped = _escape_like(clean_id)
         candidates = in_old_not_new + in_new_not_old
         if candidates:
@@ -338,7 +352,9 @@ def _classify_diff(
                 refs = fp_row["references_header"] or ""
                 # It's a LIKE false-positive if the LIKE matched (substring)
                 # but the full-token parse does NOT find this id.
-                parsed_tokens = {t.strip("<>") for t in _tokenize_references(refs)}
+                parsed_tokens = {
+                    normalize_message_id(t) for t in _tokenize_references(refs)
+                }
                 if clean_id not in parsed_tokens:
                     like_fp_ids.append(int(fp_row["id"]))
 
@@ -507,9 +523,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--database",
         type=Path,
-        default=_DEFAULT_DB,
+        required=True,
         metavar="PATH",
-        help=f"Path to the SQLite database (default: {_DEFAULT_DB})",
+        help=(
+            "Path to the SQLite database (required; no default, so the "
+            "production DB is never targeted implicitly -- point it at a scratch "
+            "copy; production writes are run by Sean only)."
+        ),
     )
     p.add_argument(
         "--verify",
