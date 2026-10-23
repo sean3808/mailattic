@@ -137,14 +137,19 @@ def _backfill_pst(
             if not pending_rows:
                 continue
 
-            summary["matched_messages"] += 1
-            matched = _match_pending(
-                all_rows, pending_rows, list(_iter_attachment_parts(message))
-            )
-            if matched is None:
+            try:
+                matched = _match_pending(
+                    all_rows, pending_rows, list(_iter_attachment_parts(message))
+                )
+            except ValueError as refusal:
                 # Ambiguous or count-mismatched: refuse, write nothing.
                 summary["errors"] += 1
+                print(
+                    f"refused message_id={message_id} db_id={row['id']}: {refusal}",
+                    file=sys.stderr,
+                )
                 continue
+            summary["matched_messages"] += 1
             for attachment_row, part, payload in matched:
                 record = write_attachment(
                     payload,
@@ -182,24 +187,29 @@ def _match_pending(
     all_rows: Sequence[sqlite3.Row],
     pending_rows: Sequence[sqlite3.Row],
     parts: Sequence[Message],
-) -> list[tuple[sqlite3.Row, Message, bytes]] | None:
+) -> list[tuple[sqlite3.Row, Message, bytes]]:
     """Pair each pending placeholder with its original part by unique name.
 
-    Returns None (caller refuses the whole message) when counts differ, a name is
-    not unique on either side, or a payload cannot be decoded.
+    Raises ValueError (caller refuses the whole message) with the cause when counts
+    differ, a name is not unique on either side, or a payload cannot be decoded.
     """
     if len(parts) != len(all_rows):
-        return None
+        raise ValueError(
+            f"attachment count mismatch: {len(all_rows)} DB rows vs {len(parts)} parts"
+        )
     matched: list[tuple[sqlite3.Row, Message, bytes]] = []
     for row in pending_rows:
         name = row["attachment_name"]
         same_rows = [r for r in all_rows if r["attachment_name"] == name]
         same_parts = [p for p in parts if p.get_filename() == name]
         if len(same_rows) != 1 or len(same_parts) != 1:
-            return None
+            raise ValueError(
+                f"ambiguous name {name!r}: {len(same_rows)} DB rows, "
+                f"{len(same_parts)} parts"
+            )
         payload = same_parts[0].get_payload(decode=True)
         if not isinstance(payload, bytes):
-            return None
+            raise ValueError(f"undecodable payload for {name!r}")
         matched.append((row, same_parts[0], payload))
     return matched
 

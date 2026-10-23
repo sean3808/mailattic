@@ -104,7 +104,8 @@ class BackfillMappingTests(unittest.TestCase):
         parts: list[tuple[str, bytes]],
         db_names: list[str],
         complete: dict[str, bytes],
-    ) -> tuple[int, list[sqlite3.Row], Path]:
+        runs: int = 1,
+    ) -> tuple[int, list[sqlite3.Row], dict[str, bytes]]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             database_path = initialize_database(temp_root / "evidence.db")
@@ -157,19 +158,20 @@ class BackfillMappingTests(unittest.TestCase):
                 connection.commit()
             finally:
                 connection.close()
-            exit_code = backfill_main(
-                [
-                    "--database",
-                    str(database_path),
-                    "--readpst-path",
-                    str(fake_readpst),
-                    "--pst",
-                    str(fake_pst),
-                    "--attachment-root",
-                    str(attachment_root),
-                ]
-            )
-            rows = _attachment_rows(database_path)
+            for _ in range(runs):
+                exit_code = backfill_main(
+                    [
+                        "--database",
+                        str(database_path),
+                        "--readpst-path",
+                        str(fake_readpst),
+                        "--pst",
+                        str(fake_pst),
+                        "--attachment-root",
+                        str(attachment_root),
+                    ]
+                )
+                rows = _attachment_rows(database_path)
             payloads = {}
             for row in rows:
                 if row["storage_path"]:
@@ -177,7 +179,7 @@ class BackfillMappingTests(unittest.TestCase):
                     if not stored.is_absolute():
                         stored = attachment_root.parent / stored
                     payloads[row["attachment_name"]] = stored.read_bytes()
-        return exit_code, rows, payloads  # type: ignore[return-value]
+        return exit_code, rows, payloads
 
     def test_complete_a_pending_b_gets_b_bytes(self) -> None:
         exit_code, _rows, payloads = self._run(
@@ -189,12 +191,29 @@ class BackfillMappingTests(unittest.TestCase):
         self.assertEqual(payloads, {"a.pdf": b"A-data", "b.pdf": b"B-data"})
 
     def test_reordered_original_does_not_mismatch(self) -> None:
+        # Pending rows b, c sit at positions 2, 3 in the DB but 2, 1 in the
+        # original, so a positional zip hands b the c bytes.
         exit_code, _rows, payloads = self._run(
-            [("b.pdf", b"B-data"), ("a.pdf", b"A-data")],
-            ["a.pdf", "b.pdf"],
+            [("c.pdf", b"C-data"), ("b.pdf", b"B-data"), ("a.pdf", b"A-data")],
+            ["a.pdf", "b.pdf", "c.pdf"],
             {"a.pdf": b"A-data"},
         )
         self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            payloads,
+            {"a.pdf": b"A-data", "b.pdf": b"B-data", "c.pdf": b"C-data"},
+        )
+
+    def test_rerun_after_subset_backfill_is_idempotent(self) -> None:
+        args = (
+            [("a.pdf", b"A-data"), ("b.pdf", b"B-data")],
+            ["a.pdf", "b.pdf"],
+            {"a.pdf": b"A-data"},
+        )
+        _, once_rows, _ = self._run(*args)
+        exit_code, twice_rows, payloads = self._run(*args, runs=2)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual([dict(r) for r in once_rows], [dict(r) for r in twice_rows])
         self.assertEqual(payloads, {"a.pdf": b"A-data", "b.pdf": b"B-data"})
 
     def test_duplicate_names_refused_without_writing(self) -> None:
