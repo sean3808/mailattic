@@ -415,8 +415,12 @@ class OutlookComReader:
         extracted: list[dict[str, object]] = []
         for index in range(1, int(attachments.Count) + 1):
             source_attachment = attachments.Item(index)
+            # An unreadable display name must not drop a readable payload: fall
+            # back to a positional name (stable per collection order, so
+            # re-imports are idempotent), like the MIME parser's unnamed fallback.
+            file_name = str(_safe_attr(source_attachment, "FileName") or "").strip()
             attachment: dict[str, object] = {
-                "attachment_name": str(_safe_attr(source_attachment, "FileName") or ""),
+                "attachment_name": file_name or f"unnamed-attachment-{index}",
                 "content_hash": None,
                 "size_bytes": None,
                 "mime_type": None,

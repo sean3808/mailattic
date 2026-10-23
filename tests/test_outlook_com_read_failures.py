@@ -265,3 +265,77 @@ def test_zero_attachment_count_adds_no_failure(tmp_path: Path) -> None:
     assert counts == {"messages": 1, "attachments": 0}
     assert failures == []
     assert summary.failure_count == 0
+
+
+# --- #20: unreadable FileName must not drop a healthy attachment payload ---
+
+
+class _RaisingName:
+    """Attachment whose FileName getter raises."""
+
+    def __init__(self, props: dict) -> None:
+        self.PropertyAccessor = _Accessor(props)
+
+    @property
+    def FileName(self):  # noqa: N802
+        raise RuntimeError("simulated COM FileName unavailable")
+
+
+def _unnamed_item(kinds: list[str], payloads: list[bytes | None]):
+    from mailattic import outlook_pst
+
+    atts = []
+    for kind, data in zip(kinds, payloads, strict=True):
+        props = {outlook_pst.PR_ATTACH_MIME_TAG: "application/pdf"}
+        if data is not None:
+            props[outlook_pst.PR_ATTACH_DATA_BIN] = data
+        if kind == "raise":
+            atts.append(_RaisingName(props))
+        else:
+            atts.append(SimpleNamespace(FileName="", PropertyAccessor=_Accessor(props)))
+    collection = SimpleNamespace(Count=len(atts), Item=lambda i: atts[i - 1])
+    return SimpleNamespace(Class=43, Attachments=collection, **_fields())
+
+
+def _rows(tmp_path: Path):
+    with connect_database(tmp_path / "data.db", read_only=True) as conn:
+        return [
+            tuple(r)
+            for r in conn.execute(
+                "SELECT attachment_name, size_bytes, storage_path "
+                "FROM message_attachments ORDER BY id"
+            )
+        ]
+
+
+def test_unreadable_filename_keeps_attachment_with_stable_distinct_names(
+    tmp_path: Path,
+) -> None:
+    item = _unnamed_item(["raise", "empty"], [b"first bytes", b"second bytes"])
+    summary = _import_again(tmp_path, item)
+
+    rows = _rows(tmp_path)
+    assert summary.imported_messages == 1
+    assert [r[1] for r in rows] == [len(b"first bytes"), len(b"second bytes")]
+    assert len({r[0] for r in rows}) == 2
+    assert all(r[0] and r[2] for r in rows)
+    assert summary.failure_count == 0
+
+    # Same input again: names are positional, so a re-import is idempotent.
+    again = _import_again(
+        tmp_path, _unnamed_item(["raise", "empty"], [b"first bytes", b"second bytes"])
+    )
+    assert _rows(tmp_path) == rows
+    assert again.imported_messages == 0
+
+
+def test_unreadable_filename_and_bytes_leaves_failure_evidence(
+    tmp_path: Path,
+) -> None:
+    summary = _import_again(tmp_path, _unnamed_item(["raise"], [None]))
+
+    assert summary.failure_count == 1
+    assert len(_rows(tmp_path)) == 1
+    with connect_database(tmp_path / "data.db", read_only=True) as conn:
+        stages = [r[0] for r in conn.execute("SELECT error_stage FROM ingest_failures")]
+    assert stages == ["attachment-decode"]
