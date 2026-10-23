@@ -57,11 +57,16 @@ from .datetime_bounds import TAIPEI
 from .identity import list_self_addresses
 from .imap_native import NativeImapClient
 from .imap_runtime import load_env_file
-from .models import MailboxParticipant, NormalizedAttachment, NormalizedMessage
+from .models import (
+    IngestFailure,
+    MailboxParticipant,
+    NormalizedAttachment,
+    NormalizedMessage,
+)
 from .mutf7 import encode_mutf7
 from .parser import subject_from_raw_headers
 from .query import get_message, render_text
-from .storage import connect_database, persist_message
+from .storage import connect_database, persist_message, record_ingest_failure
 
 __all__ = [
     "reply_all_recipients",
@@ -1677,15 +1682,18 @@ def _submit_prepared_draft(
     try:
         connection = connect_database(database_path)
         try:
-            persist_message(
-                connection,
-                _normalized_from_draft(
-                    msg,
-                    draft_id,
-                    message_id,
-                    database_path=database_path,
-                ),
+            normalized, attachment_failures = _normalized_from_draft(
+                msg,
+                draft_id,
+                message_id,
+                database_path=database_path,
             )
+            persisted = persist_message(connection, normalized)
+            if persisted.inserted:
+                # #18: placeholder rows need their ledger entry, or no later
+                # healthy Sent copy may fill them (storage._backfill_empty_attachments).
+                for failure in attachment_failures:
+                    record_ingest_failure(connection, failure)
             connection.commit()
         finally:
             connection.close()
@@ -2009,13 +2017,21 @@ def _extract_envelope_recipients(msg: Message) -> list[str]:
     return recipients
 
 
+_OUTBOUND_PST_SOURCE = "outbound-bes"
+
+
 def _extract_draft_attachments(
     msg: EmailMessage,
     attachment_root: Path,
     draft_id: str,
     message_id: str,
+    failures: list[IngestFailure] | None = None,
 ) -> tuple[NormalizedAttachment, ...]:
+    """Extract draft attachments into the CAS; per-attachment failures append a
+    placeholder row and (when ``failures`` is given) an IngestFailure (#18)."""
     attachments: list[NormalizedAttachment] = []
+    if failures is None:
+        failures = []
     try:
         parts = list(msg.iter_attachments())
     except Exception as exc:  # noqa: BLE001 -- best effort post-submit bookkeeping
@@ -2031,6 +2047,7 @@ def _extract_draft_attachments(
             " \"'\t\r\n"
         ) or f"attachment-{index}"
         mime_type = part.get_content_type()
+        payload = None
         try:
             if mime_type == "message/rfc822":
                 payload = part.get_payload(0).as_bytes()
@@ -2059,6 +2076,28 @@ def _extract_draft_attachments(
                 f"for draft_id={draft_id} (message_id={message_id}): {exc}",
                 file=sys.stderr,
             )
+            # #18: keep a placeholder + open ledger entry (the draft file stays
+            # the retry source) so a healthy copy of this mail can fill it later.
+            size = len(payload) if payload is not None else None
+            attachments.append(
+                NormalizedAttachment(
+                    attachment_name=filename, size_bytes=size, mime_type=mime_type
+                )
+            )
+            failures.append(
+                IngestFailure(
+                    pst_source=_OUTBOUND_PST_SOURCE,
+                    folder_path="Sent",
+                    logical_locator=f"outbound:{draft_id}",
+                    source_input_mode="outbound",
+                    source_requested_from="bes:send-draft",
+                    error_stage="attachment-store",
+                    error_type=type(exc).__name__,
+                    error_message=f"Attachment binary failure for: {filename}",
+                    attachment_name=filename,
+                    attachment_size=size,
+                )
+            )
     return tuple(attachments)
 
 
@@ -2067,19 +2106,22 @@ def _normalized_from_draft(
     draft_id: str,
     message_id: str,
     database_path: Path | str,
-) -> NormalizedMessage:
+) -> tuple[NormalizedMessage, list[IngestFailure]]:
     attachment_root = resolve_store_root(
         Path(database_path),
         env_override=os.environ.get("MAILATTIC_ATTACHMENT_ROOT"),
     )
-    attachments = _extract_draft_attachments(msg, attachment_root, draft_id, message_id)
+    failures: list[IngestFailure] = []
+    attachments = _extract_draft_attachments(
+        msg, attachment_root, draft_id, message_id, failures
+    )
     from_display, from_addr = parseaddr(str(msg.get("From", "")))
     sent_at = (
         _parse_message_datetime(str(msg["Date"]))
         if msg["Date"]
         else datetime.now(tz=UTC)
     )
-    return NormalizedMessage(
+    normalized = NormalizedMessage(
         subject=str(msg["Subject"] or ""),
         sender=MailboxParticipant(
             display_name=from_display or None,
@@ -2095,12 +2137,13 @@ def _normalized_from_draft(
         message_id=message_id,
         in_reply_to=str(msg["In-Reply-To"]) if msg["In-Reply-To"] else None,
         references=str(msg["References"]) if msg["References"] else None,
-        pst_source="outbound-bes",
+        pst_source=_OUTBOUND_PST_SOURCE,
         folder_path="Sent",
         logical_locator=f"outbound:{draft_id}",
         source_input_mode="outbound",
         source_requested_from="bes:send-draft",
     )
+    return normalized, failures
 
 
 def _participants_from_headers(
