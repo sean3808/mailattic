@@ -641,30 +641,35 @@ def _assign_thread_key_for_new_message(
     _tokenize_references() parser, so bracket-free References values (#191)
     are found without the LIKE substring match producing false positives.
     """
-    from .query import _escape_like, _tokenize_references  # noqa: PLC0415
+    from .query import (  # noqa: PLC0415
+        _escape_like,
+        _tokenize_references,
+        normalize_message_id,
+        select_rows_by_message_id,
+    )
 
     def _row_actually_references(row: sqlite3.Row, target_id: str) -> bool:
         """Confirm a LIKE-prefiltered candidate genuinely references target_id."""
-        row_mid = (row["message_id"] or "").strip("<>").strip()
+        row_mid = normalize_message_id(row["message_id"])
         if row_mid == target_id:
             return True
-        row_irt = (row["in_reply_to"] or "").strip("<>").strip()
+        row_irt = normalize_message_id(row["in_reply_to"])
         if row_irt == target_id:
             return True
         return any(
-            tok.strip("<>").strip() == target_id
+            normalize_message_id(tok) == target_id
             for tok in _tokenize_references(row["references_header"])
         )
 
-    new_mid = message_id.strip("<>").strip() if message_id else None
+    new_mid = normalize_message_id(message_id) or None
 
     ref_ids: list[str] = []
     if in_reply_to:
-        stripped = in_reply_to.strip("<>").strip()
+        stripped = normalize_message_id(in_reply_to)
         if stripped:
             ref_ids.append(stripped)
     for token in _tokenize_references(references_header):
-        stripped = token.strip("<>").strip()
+        stripped = normalize_message_id(token)
         if stripped:
             ref_ids.append(stripped)
     unique_ref_ids = list(dict.fromkeys(ref_ids))  # dedupe, preserve order
@@ -678,29 +683,21 @@ def _assign_thread_key_for_new_message(
     # Step 1: ancestor-row lookup, index-only (unique index on message_id).
     # One query per referenced id, but each is a direct index seek, not a scan.
     for ref_id in unique_ref_ids:
-        rows = connection.execute(
-            "SELECT id, thread_key FROM messages"
-            " WHERE id != ? AND (message_id = ? OR message_id = ?)",
-            [new_db_id, ref_id, f"<{ref_id}>"],
-        ).fetchall()
+        rows = select_rows_by_message_id(
+            connection, ref_id, "id, thread_key", exclude_id=new_db_id
+        )
         for row in rows:
             _add_existing_key(row)
 
     if thread_bridge_target:
         target = thread_bridge_target.strip()
-        stripped_target = target.strip("<>").strip()
-        bridge_rows = connection.execute(
-            """
-            SELECT id, thread_key
-            FROM messages
-            WHERE id != ?
-              AND (
-                    message_id = ?
-                 OR message_id = ?
-                 OR dedup_key = ?
-              )
-            """,
-            [new_db_id, stripped_target, f"<{stripped_target}>", target],
+        stripped_target = normalize_message_id(target)
+        bridge_rows = select_rows_by_message_id(
+            connection, stripped_target, "id, thread_key", exclude_id=new_db_id
+        )
+        bridge_rows += connection.execute(
+            "SELECT id, thread_key FROM messages WHERE id != ? AND dedup_key = ?",
+            [new_db_id, target],
         ).fetchall()
         for row in bridge_rows:
             _add_existing_key(row)
@@ -724,11 +721,14 @@ def _assign_thread_key_for_new_message(
         conditions: list[str] = []
         params: list[object] = [new_db_id]
         for candidate in batch:
+            # LIKE is a superset prefilter (tolerates outer whitespace, #22);
+            # _row_actually_references() verifies exactly.
             conditions.append(
-                "(in_reply_to = ? OR in_reply_to = ?"
+                "(in_reply_to LIKE ? ESCAPE '\\'"
                 " OR references_header LIKE ? ESCAPE '\\')"
             )
-            params.extend([candidate, f"<{candidate}>", f"%{_escape_like(candidate)}%"])
+            pattern = f"%{_escape_like(candidate)}%"
+            params.extend([pattern, pattern])
         scan_rows = connection.execute(
             "SELECT id, thread_key, message_id, in_reply_to, references_header"
             " FROM messages WHERE id != ? AND (" + " OR ".join(conditions) + ")",

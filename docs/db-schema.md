@@ -4,7 +4,7 @@
 
 | Table | 重點 |
 |---|---|
-| `messages` | 核心 `subject` / `sender_*` / `sent_at` / `received_at` / `body_text`；thread `message_id` / `in_reply_to` / `references_header`；traceability `pst_source` / `folder_path` / `logical_locator`；discovery audit `source_input_mode` / `source_requested_from`；dedup `dedup_key` / `dedup_basis`；檢索 `recipient_search_text` / `attachment_search_text`；`thread_key`（indexed，connected-component 最小 `db_id`，`bes thread` 靠它單一等值查詢；**derivable cache**，`scripts/backfill_thread_key.py` 可重建）；`thread_bridge_target`（inferred bridge 的 target **stable logical id**：`message_id` 或 `dedup_key`，不是 raw `messages.id`）／`thread_bridge_source`（只允許 `subject_heuristic` 或 NULL） |
+| `messages` | 核心 `subject` / `sender_*` / `sent_at` / `received_at` / `body_text`；thread `message_id` / `in_reply_to` / `references_header`；traceability `pst_source` / `folder_path` / `logical_locator`；discovery audit `source_input_mode` / `source_requested_from`；dedup `dedup_key` / `dedup_basis`；檢索 `recipient_search_text` / `attachment_search_text`；`thread_key`（indexed，connected-component 最小 `db_id`，`bes thread` 靠它單一等值查詢；**derivable cache**，`scripts/backfill_thread_key.py` 可重建；Message-ID 身分一律經 `query.normalize_message_id`：先去外側空白、再去角括號，大小寫不動，原始 header 不改寫；舊 cache 對 scratch DB 重跑 backfill 即修復，正式 DB 只有 Sean 親跑）；`thread_bridge_target`（inferred bridge 的 target **stable logical id**：`message_id` 或 `dedup_key`，不是 raw `messages.id`）／`thread_bridge_source`（只允許 `subject_heuristic` 或 NULL） |
 | `message_recipients` | `recipient_type` ∈ {to, cc, bcc}, `email`, `display_name` |
 | `message_attachments` | 附件**檔名**索引；未做 OCR / 內文抽取 |
 | `imap_sync_progress` | IMAP 增量同步水位（per account/folder/uidvalidity 的 last UID），與信件同一個 commit、隨 DB 備份/還原；`.imap_watermarks.json` 只是鏡像 |

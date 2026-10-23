@@ -27,6 +27,42 @@ from .storage import SYNC_STATE_KEY, connect_database
 _REF_RE = re.compile(r"<([^>]+)>")
 
 
+def normalize_message_id(value: str | None) -> str:
+    """Canonical derived identity of a Message-ID (#22).
+
+    Outer whitespace (RFC 5322 CFWS) is dropped before the angle brackets, so
+    ``"<a@x>  "`` and ``"a@x"`` are the same identity. Case is preserved
+    (D-20260813-1). Stored headers are never rewritten; only derived lookups use this.
+    """
+    return (value or "").strip().strip("<>").strip()
+
+
+def select_rows_by_message_id(
+    connection: sqlite3.Connection,
+    clean_id: str,
+    columns: str,
+    exclude_id: int | None = None,
+) -> list[sqlite3.Row]:
+    """Rows whose stored ``message_id`` normalises to *clean_id*.
+
+    Uses two index range seeks (bare and bracketed prefix) as a superset, then
+    verifies with :func:`normalize_message_id`, so stored values carrying outer
+    whitespace are found without a full scan. ``columns`` must not name
+    ``message_id`` (it is always appended).
+    """
+    if not clean_id:
+        return []
+    rows: list[sqlite3.Row] = []
+    for prefix in (clean_id, f"<{clean_id}"):
+        cursor = connection.execute(
+            f"SELECT {columns}, message_id AS _mid FROM messages"
+            " WHERE message_id >= ? AND message_id < ? AND id IS NOT ?",
+            [prefix, prefix + "\U0010ffff", exclude_id],
+        )
+        rows.extend(r for r in cursor if normalize_message_id(r["_mid"]) == clean_id)
+    return list({int(r["id"]): r for r in rows}.values())
+
+
 def _tokenize_references(header: str | None) -> list[str]:
     """Extract Message-IDs from a ``References`` header value.
 
@@ -822,16 +858,15 @@ def resolve_thread_message_ids(
         if is_db_id:
             resolved_db_id = _normalize_thread_db_id_string(identifier_str)
         else:
-            clean_id = identifier_str.strip("<>")
+            clean_id = normalize_message_id(identifier_str)
 
     connection = connect_database(database_path, create=False, read_only=read_only)
     try:
         if resolved_db_id is None:
-            start_row = connection.execute(
-                "SELECT id, thread_key FROM messages "
-                "WHERE message_id = ? OR message_id = ?",
-                [clean_id, f"<{clean_id}>"],
-            ).fetchone()
+            found = select_rows_by_message_id(
+                connection, clean_id or "", "id, thread_key"
+            )
+            start_row = min(found, key=lambda r: int(r["id"])) if found else None
         else:
             start_row = connection.execute(
                 "SELECT id, thread_key FROM messages WHERE id = ?",

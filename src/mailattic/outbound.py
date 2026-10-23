@@ -65,7 +65,12 @@ from .models import (
 )
 from .mutf7 import encode_mutf7
 from .parser import subject_from_raw_headers
-from .query import get_message, render_text
+from .query import (
+    get_message,
+    normalize_message_id,
+    render_text,
+    select_rows_by_message_id,
+)
 from .storage import connect_database, persist_message, record_ingest_failure
 
 __all__ = [
@@ -609,20 +614,13 @@ def _get_message_by_rfc822_message_id(
     *,
     read_only: bool = False,
 ) -> dict[str, object]:
-    identifier = message_id.strip()
-    clean_identifier = identifier.strip("<>")
-    candidates = list(
-        dict.fromkeys([identifier, clean_identifier, f"<{clean_identifier}>"])
-    )
+    clean_identifier = normalize_message_id(message_id)
 
     connection = connect_database(database_path, create=False, read_only=read_only)
     try:
-        placeholders = ",".join("?" for _ in candidates)
-        rows = connection.execute(
-            "SELECT id, source_input_mode, pst_source FROM messages "
-            f"WHERE message_id IN ({placeholders})",
-            candidates,
-        ).fetchall()
+        rows = select_rows_by_message_id(
+            connection, clean_identifier, "id, source_input_mode, pst_source"
+        )
     finally:
         connection.close()
 
