@@ -40,6 +40,7 @@ from email.errors import HeaderParseError
 from email.header import decode_header, make_header
 from email.headerregistry import Address
 from email.message import EmailMessage, Message
+from email.parser import BytesParser
 from email.utils import (
     formataddr,
     formatdate,
@@ -1008,6 +1009,14 @@ def assemble_draft_reply(
 
     for path, data in attachment_payloads:
         maintype, subtype = resolve_attachment_mime_type(path.name)
+        if (maintype, subtype) == ("message", "rfc822"):
+            # RFC 2046 5.2.1: message/rfc822 may not be base64; hand the content
+            # manager a parsed message so it nests it with a legal 7bit/8bit CTE.
+            msg.add_attachment(
+                BytesParser(policy=policy.default).parsebytes(data),
+                filename=path.name,
+            )
+            continue
         msg.add_attachment(
             data,
             maintype=maintype,
