@@ -118,6 +118,9 @@ class _ReadOnlyProbeConnection:
                 )
             except sqlite3.OperationalError as exc:
                 self.write_error = exc
+                # Python's implicit BEGIN before the failed INSERT would stay
+                # open and collide with the aggregation's own BEGIN.
+                self._connection.rollback()
         return self._connection.execute(sql, parameters)
 
     def close(self) -> None:
@@ -1058,6 +1061,96 @@ class TestBlankDateBoundIsUnsupplied(unittest.TestCase):
         self.assertIsNone(omitted_summary["date_to"])
         self.assertIsNone(blank_summary["date_from"])
         self.assertIsNone(blank_summary["date_to"])
+
+
+class _MidAggregationWriter:
+    """Connection proxy: right before the first-message edge query (after the
+    core message fetch), a second connection commits one more message."""
+
+    def __init__(self, connection: sqlite3.Connection, write) -> None:
+        self._connection = connection
+        self._write = write
+        self._fired = False
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        if not self._fired and "ORDER BY unixepoch(m.sent_at) ASC" in sql:
+            self._fired = True
+            self._write()
+        return self._connection.execute(sql, parameters)
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+class TestAggregationUsesOneReadSnapshot(unittest.TestCase):
+    """#25: a sync commit between the aggregation's SELECTs must not leak in."""
+
+    def _run(self, *, read_only: bool) -> dict[str, object]:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _make_db(tmp)
+            conn = connect_database(db)
+            try:
+                _insert(
+                    conn,
+                    {
+                        "subject": "One",
+                        "sender": {"email": "buyer1@acme.com"},
+                        "to": [{"email": "sean3808@mailattic.test"}],
+                        "sent_at": "2024-10-20T10:00:00+08:00",
+                        "body_text": "b",
+                        "message_id": "<one@x>",
+                        "attachment_names": ["one.pdf"],
+                    },
+                    locator="Inbox/1",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            def write_second() -> None:
+                writer = connect_database(db)
+                try:
+                    _insert(
+                        writer,
+                        {
+                            "subject": "Two",
+                            "sender": {"email": "sean3808@mailattic.test"},
+                            "to": [{"email": "buyer2@acme.com"}],
+                            "sent_at": "2024-10-21T10:00:00+08:00",
+                            "body_text": "b",
+                            "message_id": "<two@x>",
+                            "attachment_names": ["two.pdf"],
+                        },
+                        locator="Inbox/2",
+                    )
+                    writer.commit()
+                finally:
+                    writer.close()
+
+            def fake_connect(database_path, *, create=True, read_only=False):
+                return _MidAggregationWriter(
+                    connect_database(database_path, create=create, read_only=read_only),
+                    write_second,
+                )
+
+            with patch("mailattic.contact_history.connect_database", new=fake_connect):
+                return aggregate_contact_history(
+                    database_path=db, domain="acme.com", read_only=read_only
+                )
+
+    def _assert_pre_write_snapshot(self, summary: dict[str, object]) -> None:
+        self.assertEqual(summary["total_messages"], 1)
+        self.assertEqual(summary["inbound_count"], 1)
+        self.assertEqual(summary["outbound_count"], 0)
+        self.assertEqual(summary["last_message_at"], "2024-10-20T10:00:00+08:00")
+        self.assertEqual(summary["attachments"]["total_count"], 1)
+        self.assertEqual([c["email"] for c in summary["contacts"]], ["buyer1@acme.com"])
+
+    def test_writer_commit_mid_aggregation_is_not_visible(self) -> None:
+        self._assert_pre_write_snapshot(self._run(read_only=False))
+
+    def test_writer_commit_mid_aggregation_is_not_visible_read_only(self) -> None:
+        self._assert_pre_write_snapshot(self._run(read_only=True))
 
 
 class TestReadOnlyAndBlankSelectorValidation(unittest.TestCase):

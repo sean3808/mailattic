@@ -66,6 +66,10 @@ def aggregate_contact_history(
 
     conn = connect_database(database_path, create=False, read_only=read_only)
     try:
+        # Deferred BEGIN: the first SELECT pins one WAL read snapshot for the
+        # whole aggregation (#25) without blocking a concurrent sync writer.
+        # close() in `finally` ends the transaction, including on exceptions.
+        conn.execute("BEGIN")
         result = _run_aggregation(
             conn,
             query_value=query_value,
