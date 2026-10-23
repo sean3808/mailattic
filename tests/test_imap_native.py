@@ -465,10 +465,32 @@ def test_write_rfc822_to_maildir_is_idempotent(tmp_path: Path) -> None:
         account_name="acct",
         folder_name="INBOX",
         uid=1,
-        rfc822=b"v2",
+        rfc822=b"v1",
     )
-    final = maildir / "acct" / "INBOX" / "new" / "uid-1.eml"
-    assert final.read_bytes() == b"v2"
+    new_dir = maildir / "acct" / "INBOX" / "new"
+    assert [p.name for p in new_dir.iterdir()] == ["uid-1.eml"]
+    assert (new_dir / "uid-1.eml").read_bytes() == b"v1"
+
+
+def test_write_rfc822_to_maildir_keeps_old_raw_when_uid_is_reused(
+    tmp_path: Path,
+) -> None:
+    """#17: different bytes under a used UID name never replace it."""
+    maildir = tmp_path / "maildir"
+    kwargs = {
+        "maildir_root": maildir,
+        "account_name": "acct",
+        "folder_name": "INBOX",
+        "uid": 1,
+    }
+    write_rfc822_to_maildir(rfc822=b"old", **kwargs)
+    reused = write_rfc822_to_maildir(rfc822=b"new", **kwargs)
+    again = write_rfc822_to_maildir(rfc822=b"new", **kwargs)
+    new_dir = maildir / "acct" / "INBOX" / "new"
+    assert (new_dir / "uid-1.eml").read_bytes() == b"old"
+    assert reused != new_dir / "uid-1.eml"
+    assert reused == again
+    assert reused.read_bytes() == b"new"
 
 
 # ---------------------------------------------------------------------------

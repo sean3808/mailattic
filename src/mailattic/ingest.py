@@ -480,23 +480,36 @@ def retry_attachment_failures(
     recovered = still_failing = missing = 0
     for (pst_source, folder_path, locator), count in by_mail.items():
         relative = (locator or "")[len(folder_path or "") + 1 :]
-        message_path = folder_dir = None
-        # staging first; #256 quarantine second
+        message_path = folder_dir = source = None
+        # staging first; #256 quarantine second. #17: a file at the locator only
+        # counts when it is the stored mail of that locator (a reused UID or a
+        # pruned name can leave another mail there); otherwise it is "missing".
         for root_dirs in (folder_dirs, quarantine_dirs):
             candidate_dir = root_dirs.get(folder_path or "")
-            if candidate_dir and relative and (candidate_dir / relative).is_file():
+            if not (
+                candidate_dir and relative and (candidate_dir / relative).is_file()
+            ):
+                continue
+            candidate_source = MaildirSource(
+                path=candidate_dir,
+                account_email=account_email,
+                account_name=account_name,
+                folder_name=folder_path or "",
+                requested_from=account_root,
+            )
+            if _is_stored_mail(
+                connection,
+                candidate_source,
+                candidate_dir / relative,
+                pst_source,
+                locator,
+            ):
                 folder_dir, message_path = candidate_dir, candidate_dir / relative
+                source = candidate_source
                 break
-        if message_path is None or folder_dir is None:
+        if message_path is None or folder_dir is None or source is None:
             missing += count
             continue
-        source = MaildirSource(
-            path=folder_dir,
-            account_email=account_email,
-            account_name=account_name,
-            folder_name=folder_path or "",
-            requested_from=account_root,
-        )
         try:
             summary = import_maildir_message(
                 connection=connection,
@@ -551,6 +564,44 @@ def retry_attachment_failures(
                     file=sys.stderr,
                 )
     return AttachmentRetryResult(recovered, still_failing, missing)
+
+
+def _is_stored_mail(
+    connection: sqlite3.Connection,
+    source: MaildirSource,
+    path: Path,
+    pst_source: str,
+    locator: str | None,
+) -> bool:
+    """#17: is *path* the mail the DB stored under (pst_source, locator)?
+
+    Conservative: two stored mails sharing one locator (legacy reused UID) or a
+    file that does not parse to the stored dedup key cannot be told apart, so
+    it is not a usable repair source. No stored mail yet = nothing to confuse.
+    """
+    rows = connection.execute(
+        "SELECT dedup_key FROM messages WHERE pst_source = ? AND logical_locator IS ?",
+        [pst_source, locator],
+    ).fetchall()
+    if not rows:
+        return True
+    if len(rows) > 1:
+        return False
+    parsed = _parse_maildir_message(
+        source=source, message_path=path, attachment_root=None
+    )
+    if parsed.message is None:
+        return False
+    try:
+        fresh = build_normalized_message(
+            parsed.message.raw_message,
+            source=source,
+            folder_path=parsed.message.folder_path,
+            logical_locator=parsed.message.logical_locator,
+        )
+    except Exception:
+        return True  # the import repeats this failure and settles nothing
+    return fresh.dedup_key == rows[0]["dedup_key"]
 
 
 def _local_folder_dirs(account_root: Path) -> dict[str, Path]:

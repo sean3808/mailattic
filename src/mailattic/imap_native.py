@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import imaplib
 import logging
 import re
@@ -595,13 +596,22 @@ def write_rfc822_to_maildir(
 
     Writes to ``tmp/uid-N.eml`` first, then ``Path.replace`` (os.replace) to
     ``new/uid-N.eml`` so the MaildirParser never sees a partial write (D3).
-    Idempotent: a retry with the same uid overwrites the previous content.
+    Idempotent: a retry with the same uid and bytes rewrites the same file;
+    different bytes under a used name go to a content-named file (#17).
     """
     folder_dir = Path(maildir_root) / account_name / folder_name
     for bucket in ("cur", "new", "tmp"):
         (folder_dir / bucket).mkdir(parents=True, exist_ok=True)
-    tmp_path = folder_dir / "tmp" / f"uid-{uid}.eml"
-    final_path = folder_dir / "new" / f"uid-{uid}.eml"
+    name = f"uid-{uid}.eml"
+    existing = folder_dir / "new" / name
+    if existing.is_file() and existing.read_bytes() != rfc822:
+        # #17: within one UIDVALIDITY a UID's bytes never change, so different
+        # bytes under the same name are a reused UID (reset). Never replace the
+        # old raw mail (it may be the only source for a pending repair): the
+        # new mail gets its own content-named file, hence its own locator.
+        name = f"uid-{uid}.{hashlib.sha256(rfc822).hexdigest()[:12]}.eml"
+    tmp_path = folder_dir / "tmp" / name
+    final_path = folder_dir / "new" / name
     tmp_path.write_bytes(rfc822)
     tmp_path.replace(final_path)
     return final_path

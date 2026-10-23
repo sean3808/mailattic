@@ -336,6 +336,17 @@ def _backfill_empty_attachments(
         "SELECT pst_source, logical_locator FROM messages WHERE id = ?",
         [stored_message_id],
     ).fetchone()
+    # #17: ledger entries are keyed by locator; when another stored mail shares
+    # it (legacy reused UID) they cannot be attributed to this one -- settle none.
+    if (
+        connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE pst_source = ?"
+            " AND logical_locator IS ?",
+            [existing["pst_source"], existing["logical_locator"]],
+        ).fetchone()[0]
+        > 1
+    ):
+        return 0
     fresh_by_name: dict[str, list] = {}
     for attachment in message.attachments:
         fresh_by_name.setdefault(attachment.attachment_name, []).append(attachment)
