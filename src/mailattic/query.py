@@ -897,6 +897,16 @@ def _is_word_char(ch: str) -> bool:
     return _is_alnum_or_mark(ch) and not _is_cjk(ch)
 
 
+def _is_cjk_word_char(ch: str) -> bool:
+    """CJK ideograph / fullwidth alphanumeric; excludes CJK punctuation and U+3000.
+
+    ``_is_cjk`` also spans CJK symbols and fullwidth punctuation, which unicode61
+    drops at index time. Inside an unquoted bareword run they must act as
+    separators (like ASCII ``,`` / ``&``), not glue two terms into one phrase.
+    """
+    return _is_cjk(ch) and _is_alnum_or_mark(ch)
+
+
 def _build_fts_match_expr(keyword: str) -> str | None:
     """Build a controlled FTS5 MATCH expression for *keyword*.
 
@@ -936,9 +946,9 @@ def _build_fts_match_expr(keyword: str) -> str | None:
         elif ch in "()":
             tokens.append(ch)
             i += 1
-        elif _is_cjk(ch):
+        elif _is_cjk_word_char(ch):
             run_chars: list[str] = []
-            while i < n and _is_cjk(keyword[i]):
+            while i < n and _is_cjk_word_char(keyword[i]):
                 run_chars.append(keyword[i])
                 i += 1
             tokens.append(quote_phrase("".join(run_chars)))
