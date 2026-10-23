@@ -1067,15 +1067,15 @@ class _MidAggregationWriter:
     """Connection proxy: right before the first-message edge query (after the
     core message fetch), a second connection commits one more message."""
 
-    def __init__(self, connection: sqlite3.Connection, write) -> None:
+    def __init__(self, connection: sqlite3.Connection, hook, fired: list) -> None:
         self._connection = connection
-        self._write = write
-        self._fired = False
+        self._hook = hook
+        self._fired = fired
 
     def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
         if not self._fired and "ORDER BY unixepoch(m.sent_at) ASC" in sql:
-            self._fired = True
-            self._write()
+            self._fired.append(sql)
+            self._hook()
         return self._connection.execute(sql, parameters)
 
     def close(self) -> None:
@@ -1085,7 +1085,7 @@ class _MidAggregationWriter:
 class TestAggregationUsesOneReadSnapshot(unittest.TestCase):
     """#25: a sync commit between the aggregation's SELECTs must not leak in."""
 
-    def _run(self, *, read_only: bool) -> dict[str, object]:
+    def _run(self, *, read_only: bool, fail: bool = False) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as tmp:
             db = _make_db(tmp)
             conn = connect_database(db)
@@ -1127,16 +1127,45 @@ class TestAggregationUsesOneReadSnapshot(unittest.TestCase):
                 finally:
                     writer.close()
 
+            def boom() -> None:
+                raise RuntimeError("boom")
+
+            fired: list = []
+
             def fake_connect(database_path, *, create=True, read_only=False):
                 return _MidAggregationWriter(
                     connect_database(database_path, create=create, read_only=read_only),
-                    write_second,
+                    boom if fail else write_second,
+                    fired,
                 )
 
-            with patch("mailattic.contact_history.connect_database", new=fake_connect):
-                return aggregate_contact_history(
-                    database_path=db, domain="acme.com", read_only=read_only
-                )
+            try:
+                with patch(
+                    "mailattic.contact_history.connect_database", new=fake_connect
+                ):
+                    result = aggregate_contact_history(
+                        database_path=db, domain="acme.com", read_only=read_only
+                    )
+            except RuntimeError:
+                if not fail:
+                    raise
+                # The failed aggregation must have released its read
+                # transaction: a writer commits and a TRUNCATE checkpoint
+                # (which needs zero live readers) is not busy.
+                write_second()
+                check = connect_database(db)
+                try:
+                    busy = check.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                finally:
+                    check.close()
+                self.assertEqual(busy[0], 0)
+                self.assertTrue(fired, "interleave hook never fired")
+                return {}
+            self.assertFalse(fail, "expected the aggregation to raise")
+            # Guards against the edge SQL being reworded: a hook that never
+            # ran would let the snapshot assertions pass vacuously.
+            self.assertTrue(fired, "interleave hook never fired")
+            return result
 
     def _assert_pre_write_snapshot(self, summary: dict[str, object]) -> None:
         self.assertEqual(summary["total_messages"], 1)
@@ -1151,6 +1180,11 @@ class TestAggregationUsesOneReadSnapshot(unittest.TestCase):
 
     def test_writer_commit_mid_aggregation_is_not_visible_read_only(self) -> None:
         self._assert_pre_write_snapshot(self._run(read_only=True))
+
+    def test_exception_mid_aggregation_releases_read_transaction(self) -> None:
+        for read_only in (False, True):
+            with self.subTest(read_only=read_only):
+                self._run(read_only=read_only, fail=True)
 
 
 class TestReadOnlyAndBlankSelectorValidation(unittest.TestCase):
