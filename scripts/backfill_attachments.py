@@ -124,31 +124,31 @@ def _backfill_pst(
                 summary["skipped_messages"] += 1
                 continue
 
-            attachment_rows = connection.execute(
+            all_rows = connection.execute(
                 """
-                SELECT id, attachment_name
+                SELECT id, attachment_name, storage_path
                 FROM message_attachments
-                WHERE message_id = ? AND storage_path IS NULL
+                WHERE message_id = ?
                 ORDER BY id
                 """,
                 [row["id"]],
             ).fetchall()
-            if not attachment_rows:
+            pending_rows = [r for r in all_rows if r["storage_path"] is None]
+            if not pending_rows:
                 continue
 
             summary["matched_messages"] += 1
-            attachment_parts = list(_iter_attachment_parts(message))
-            for attachment_row, part in zip(
-                attachment_rows, attachment_parts, strict=False
-            ):
-                payload = part.get_payload(decode=True)
-                if payload is None:
-                    summary["errors"] += 1
-                    continue
-                filename = part.get_filename() or attachment_row["attachment_name"]
+            matched = _match_pending(
+                all_rows, pending_rows, list(_iter_attachment_parts(message))
+            )
+            if matched is None:
+                # Ambiguous or count-mismatched: refuse, write nothing.
+                summary["errors"] += 1
+                continue
+            for attachment_row, part, payload in matched:
                 record = write_attachment(
                     payload,
-                    filename,
+                    attachment_row["attachment_name"],
                     part.get_content_type(),
                     store_root,
                 )
@@ -176,6 +176,32 @@ def _backfill_pst(
                     pending_updates = 0
         if pending_updates:
             connection.commit()
+
+
+def _match_pending(
+    all_rows: Sequence[sqlite3.Row],
+    pending_rows: Sequence[sqlite3.Row],
+    parts: Sequence[Message],
+) -> list[tuple[sqlite3.Row, Message, bytes]] | None:
+    """Pair each pending placeholder with its original part by unique name.
+
+    Returns None (caller refuses the whole message) when counts differ, a name is
+    not unique on either side, or a payload cannot be decoded.
+    """
+    if len(parts) != len(all_rows):
+        return None
+    matched: list[tuple[sqlite3.Row, Message, bytes]] = []
+    for row in pending_rows:
+        name = row["attachment_name"]
+        same_rows = [r for r in all_rows if r["attachment_name"] == name]
+        same_parts = [p for p in parts if p.get_filename() == name]
+        if len(same_rows) != 1 or len(same_parts) != 1:
+            return None
+        payload = same_parts[0].get_payload(decode=True)
+        if not isinstance(payload, bytes):
+            return None
+        matched.append((row, same_parts[0], payload))
+    return matched
 
 
 def _iter_extracted_messages(output_root: Path) -> Iterable[Message]:
