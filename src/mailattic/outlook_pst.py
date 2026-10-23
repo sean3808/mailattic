@@ -428,6 +428,9 @@ class OutlookComReader:
                     payload = _optional_property(accessor, PR_ATTACH_DATA_BIN)
                     if not isinstance(payload, bytes | bytearray):
                         raise TypeError("Attachment binary property is unavailable")
+                    # Kept before the CAS write so a failed write still leaves the
+                    # size that shared duplicate repair matches against.
+                    attachment["_expected_size"] = len(payload)
                     mime_type = _coerce_optional_text(
                         _optional_property(accessor, PR_ATTACH_MIME_TAG)
                     )
