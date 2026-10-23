@@ -315,6 +315,24 @@ def record_ingest_failure(
     )
 
 
+def stored_dedup_keys_at_locator(
+    connection: sqlite3.Connection, pst_source: str, locator: str | None
+) -> list[str]:
+    """Dedup keys of the stored mails recorded at (pst_source, locator).
+
+    More than one means a legacy reused UID: ledger rows keyed by that locator
+    cannot be attributed to either mail (#17).
+    """
+    return [
+        r["dedup_key"]
+        for r in connection.execute(
+            "SELECT dedup_key FROM messages"
+            " WHERE pst_source = ? AND logical_locator IS ?",
+            [pst_source, locator],
+        )
+    ]
+
+
 def _backfill_empty_attachments(
     connection: sqlite3.Connection,
     stored_message_id: int,
@@ -339,11 +357,11 @@ def _backfill_empty_attachments(
     # #17: ledger entries are keyed by locator; when another stored mail shares
     # it (legacy reused UID) they cannot be attributed to this one -- settle none.
     if (
-        connection.execute(
-            "SELECT COUNT(*) FROM messages WHERE pst_source = ?"
-            " AND logical_locator IS ?",
-            [existing["pst_source"], existing["logical_locator"]],
-        ).fetchone()[0]
+        len(
+            stored_dedup_keys_at_locator(
+                connection, existing["pst_source"], existing["logical_locator"]
+            )
+        )
         > 1
     ):
         return 0

@@ -30,6 +30,7 @@ from .storage import (
     connect_database,
     persist_message,
     record_ingest_failure,
+    stored_dedup_keys_at_locator,
 )
 
 
@@ -481,6 +482,7 @@ def retry_attachment_failures(
     for (pst_source, folder_path, locator), count in by_mail.items():
         relative = (locator or "")[len(folder_path or "") + 1 :]
         message_path = folder_dir = source = None
+        unproven = False
         # staging first; #256 quarantine second. #17: a file at the locator only
         # counts when it is the stored mail of that locator (a reused UID or a
         # pruned name can leave another mail there); otherwise it is "missing".
@@ -497,7 +499,7 @@ def retry_attachment_failures(
                 folder_name=folder_path or "",
                 requested_from=account_root,
             )
-            if _is_stored_mail(
+            if _matches_stored_dedup_key(
                 connection,
                 candidate_source,
                 candidate_dir / relative,
@@ -507,8 +509,13 @@ def retry_attachment_failures(
                 folder_dir, message_path = candidate_dir, candidate_dir / relative
                 source = candidate_source
                 break
+            unproven = True
         if message_path is None or folder_dir is None or source is None:
-            missing += count
+            # a file exists but is not provably this mail: still owed, not missing
+            if unproven:
+                still_failing += count
+            else:
+                missing += count
             continue
         try:
             summary = import_maildir_message(
@@ -566,7 +573,7 @@ def retry_attachment_failures(
     return AttachmentRetryResult(recovered, still_failing, missing)
 
 
-def _is_stored_mail(
+def _matches_stored_dedup_key(
     connection: sqlite3.Connection,
     source: MaildirSource,
     path: Path,
@@ -579,13 +586,10 @@ def _is_stored_mail(
     file that does not parse to the stored dedup key cannot be told apart, so
     it is not a usable repair source. No stored mail yet = nothing to confuse.
     """
-    rows = connection.execute(
-        "SELECT dedup_key FROM messages WHERE pst_source = ? AND logical_locator IS ?",
-        [pst_source, locator],
-    ).fetchall()
-    if not rows:
+    keys = stored_dedup_keys_at_locator(connection, pst_source, locator)
+    if not keys:
         return True
-    if len(rows) > 1:
+    if len(keys) > 1:
         return False
     parsed = _parse_maildir_message(
         source=source, message_path=path, attachment_root=None
@@ -600,8 +604,8 @@ def _is_stored_mail(
             logical_locator=parsed.message.logical_locator,
         )
     except Exception:
-        return True  # the import repeats this failure and settles nothing
-    return fresh.dedup_key == rows[0]["dedup_key"]
+        return False  # identity unprovable: fail closed
+    return fresh.dedup_key == keys[0]
 
 
 def _local_folder_dirs(account_root: Path) -> dict[str, Path]:

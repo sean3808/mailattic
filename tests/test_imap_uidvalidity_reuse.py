@@ -13,6 +13,8 @@ from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from mailattic import attachment_store
 from mailattic.imap_native import NativeImapClient, sync_native
 from mailattic.storage import initialize_database
@@ -93,16 +95,27 @@ class Mailbox:
 OLD = "<old@example.test>"
 NEW = "<new@example.test>"
 OLD_RAW = _mime(OLD, b"old payload")
-NEW_RAW = _mime(NEW, b"new payload")  # same 11 bytes, same name
 
 
-def test_reused_uid_keeps_both_repairs_independent(tmp_path: Path) -> None:
+@pytest.mark.parametrize("quarantined_first", [False, True])
+@pytest.mark.parametrize("new_payload", [b"new payload", b"a longer new payload"])
+def test_reused_uid_repairs_each_mail_independently(
+    tmp_path: Path, quarantined_first: bool, new_payload: bytes
+) -> None:
+    """The issue's four controls: old raw quarantined first x same/different size."""
+    new_raw = _mime(NEW, new_payload)
     box = Mailbox(tmp_path)
     box.sync(epoch=100, uid_to_raw={1: OLD_RAW}, cas_ok=False)
-    box.sync(epoch=200, uid_to_raw={1: NEW_RAW}, cas_ok=False)
+    staged = tmp_path / "maildir" / "testaccount" / "INBOX" / "new" / "uid-1.eml"
+    held = box.quarantine / "testaccount" / "INBOX" / "new" / "uid-1.eml"
+    if quarantined_first:  # what prune does to a raw mail with an open failure
+        held.parent.mkdir(parents=True)
+        shutil.move(staged, held)
+    box.sync(epoch=200, uid_to_raw={1: new_raw}, cas_ok=False)
     assert box.open_failures() == 2
+    assert (held if quarantined_first else staged).read_bytes() == OLD_RAW
 
-    box.sync(epoch=200, uid_to_raw={1: NEW_RAW}, cas_ok=True)  # healthy retry
+    box.sync(epoch=200, uid_to_raw={1: new_raw}, cas_ok=True)  # healthy retry
 
     hashes = box.attachments()
     assert hashes[OLD] is not None
@@ -110,20 +123,43 @@ def test_reused_uid_keeps_both_repairs_independent(tmp_path: Path) -> None:
     assert box.open_failures() == 0
 
 
-def test_reused_uid_with_quarantined_old_raw_neither_settles_nor_deletes(
+def test_legacy_shared_locator_settles_nothing_and_keeps_the_raw(
     tmp_path: Path,
 ) -> None:
+    """Two stored mails already share one locator (pre-fix reuse): stay owed."""
     box = Mailbox(tmp_path)
     box.sync(epoch=100, uid_to_raw={1: OLD_RAW}, cas_ok=False)
-    # what prune does to a raw mail with an open attachment failure
-    staged = tmp_path / "maildir" / "testaccount" / "INBOX" / "new" / "uid-1.eml"
-    held = box.quarantine / "testaccount" / "INBOX" / "new" / "uid-1.eml"
-    held.parent.mkdir(parents=True)
-    shutil.move(staged, held)
-    box.sync(epoch=200, uid_to_raw={1: NEW_RAW}, cas_ok=False)
+    box.sync(epoch=200, uid_to_raw={1: _mime(NEW, b"new payload")}, cas_ok=False)
+    with sqlite3.connect(box.db) as c:  # rewrite history to the legacy shape
+        c.execute(
+            "UPDATE messages SET logical_locator = 'INBOX/new/uid-1.eml'"
+            " WHERE message_id = ?",
+            [NEW],
+        )
+        c.execute("UPDATE ingest_failures SET logical_locator = 'INBOX/new/uid-1.eml'")
+    box.sync(epoch=200, uid_to_raw={1: _mime(NEW, b"new payload")}, cas_ok=True)
 
-    box.sync(epoch=200, uid_to_raw={1: NEW_RAW}, cas_ok=True)
-
-    assert held.read_bytes() == OLD_RAW  # original kept
     assert box.attachments()[OLD] is None
-    assert box.open_failures() >= 1  # the unrepaired old attachment is still owed
+    assert box.open_failures() == 2
+
+
+def test_unprovable_identity_is_not_a_repair_source(tmp_path: Path) -> None:
+    """A repair source whose identity cannot be proven is not used (fail closed)."""
+    import mailattic.ingest as ingest_mod
+
+    real = ingest_mod.build_normalized_message
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the identity check; later calls are the import
+            raise RuntimeError("synthetic identity-check failure")
+        return real(*args, **kwargs)
+
+    box = Mailbox(tmp_path)
+    box.sync(epoch=100, uid_to_raw={1: OLD_RAW}, cas_ok=False)
+    with patch.object(ingest_mod, "build_normalized_message", flaky):
+        box.sync(epoch=100, uid_to_raw={1: OLD_RAW}, cas_ok=True)
+
+    assert box.attachments()[OLD] is None
+    assert box.open_failures() == 1
