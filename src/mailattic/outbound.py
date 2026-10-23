@@ -146,6 +146,30 @@ _ATTACHMENT_MIME_TYPES: dict[str, str] = {
 }
 
 
+def _round_trippable_nested_message(data: bytes) -> EmailMessage | None:
+    """Parse ``data`` for nesting as message/rfc822, or None if that would alter it.
+
+    RFC 2046 5.2.1 forbids base64 on message/rfc822, so the part must carry a
+    parsed message. Serialising it can rewrite bytes (raw UTF-8 headers become
+    ``=?unknown-8bit?``), so the exact send-then-extract path is replayed here and
+    the result must equal the original, allowing only CRLF -> LF normalisation.
+    """
+    try:
+        nested = BytesParser(policy=policy.default).parsebytes(data)
+        if nested.defects:
+            return None
+        probe = EmailMessage()
+        probe.add_attachment(nested)
+        reparsed = BytesParser(policy=policy.default).parsebytes(probe.as_bytes())
+        (part,) = reparsed.iter_attachments()
+        stored = part.get_payload(0).as_bytes()
+    except Exception:  # noqa: BLE001 -- any failure means: use the binary fallback
+        return None
+    if stored.replace(b"\r\n", b"\n") != data.replace(b"\r\n", b"\n"):
+        return None
+    return nested
+
+
 def resolve_attachment_mime_type(filename: str) -> tuple[str, str]:
     """Return the ``(maintype, subtype)`` to send an attachment under.
 
@@ -1010,13 +1034,13 @@ def assemble_draft_reply(
     for path, data in attachment_payloads:
         maintype, subtype = resolve_attachment_mime_type(path.name)
         if (maintype, subtype) == ("message", "rfc822"):
-            # RFC 2046 5.2.1: message/rfc822 may not be base64; hand the content
-            # manager a parsed message so it nests it with a legal 7bit/8bit CTE.
-            msg.add_attachment(
-                BytesParser(policy=policy.default).parsebytes(data),
-                filename=path.name,
-            )
-            continue
+            nested = _round_trippable_nested_message(data)
+            if nested is not None:
+                msg.add_attachment(nested, filename=path.name)
+                continue
+            # Not provably preserved as a nested message (raw 8-bit headers,
+            # parse defects): keep the original bytes as a binary attachment.
+            maintype, subtype = "application", "octet-stream"
         msg.add_attachment(
             data,
             maintype=maintype,
