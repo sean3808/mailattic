@@ -14,7 +14,11 @@ from .datetime_bounds import (
     whole_day_bound,
 )
 from .identity import compute_direction, extract_address, resolve_self_addresses
-from .query import _to_domain_suffix_pattern
+from .query import (
+    _to_like_pattern,
+    sender_domain_params,
+    sender_domain_sql,
+)
 from .storage import connect_database
 
 
@@ -66,6 +70,10 @@ def aggregate_contact_history(
 
     conn = connect_database(database_path, create=False, read_only=read_only)
     try:
+        # Deferred BEGIN: the first SELECT pins one WAL read snapshot for the
+        # whole aggregation (#25) without blocking a concurrent sync writer.
+        # close() in `finally` ends the transaction, including on exceptions.
+        conn.execute("BEGIN")
         result = _run_aggregation(
             conn,
             query_value=query_value,
@@ -124,18 +132,20 @@ def _build_match_clause(
         # Exact match: sender OR recipient row exists
         clause = (
             "(LOWER(m.sender_email) = ? "
+            "OR (m.sender_email LIKE '%<%' AND m.sender_email LIKE ? ESCAPE '\\' "
+            "  AND sender_address_match(m.sender_email, ?)) "
             "OR EXISTS ("
             "  SELECT 1 FROM message_recipients r "
             "  WHERE r.message_id = m.id AND LOWER(r.email) = ?"
             "))"
         )
-        params.extend([norm, norm])
+        params.extend([norm, _to_like_pattern(norm), norm, norm])
     else:
         clause = (
-            "(m.sender_email LIKE ? ESCAPE '\\' "
+            f"({sender_domain_sql('m.sender_email')} "
             "OR recipient_domain_match(m.recipient_search_text, ?))"
         )
-        params.append(_to_domain_suffix_pattern(query_value))
+        params.extend(sender_domain_params(query_value))
         params.append(query_value)
 
     if parsed_date_from is not None:

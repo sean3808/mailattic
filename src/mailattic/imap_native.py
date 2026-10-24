@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import imaplib
 import logging
 import re
@@ -586,7 +587,9 @@ def write_rfc822_to_maildir(
     account_name: str,
     folder_name: str,
     uid: int,
+    uidvalidity: int,
     rfc822: bytes,
+    quarantine_root: Path | None = None,
 ) -> Path:
     """Atomically write RFC822 bytes for *uid* to the maildir new/ bucket.
 
@@ -595,13 +598,36 @@ def write_rfc822_to_maildir(
 
     Writes to ``tmp/uid-N.eml`` first, then ``Path.replace`` (os.replace) to
     ``new/uid-N.eml`` so the MaildirParser never sees a partial write (D3).
-    Idempotent: a retry with the same uid overwrites the previous content.
+    Idempotent: a retry with the same uid and bytes rewrites the same file;
+    different bytes under a name used in staging or quarantine go to
+    ``uid-N.v<uidvalidity>.eml`` (content-hash suffix only if that name is also
+    taken by other bytes) (#17).
     """
     folder_dir = Path(maildir_root) / account_name / folder_name
     for bucket in ("cur", "new", "tmp"):
         (folder_dir / bucket).mkdir(parents=True, exist_ok=True)
-    tmp_path = folder_dir / "tmp" / f"uid-{uid}.eml"
-    final_path = folder_dir / "new" / f"uid-{uid}.eml"
+
+    # #17: within one UIDVALIDITY a UID's bytes never change, so different
+    # bytes under the same name (in staging, or in the quarantine prune moved
+    # the old raw mail to) are a reused UID. Never replace or shadow the old raw
+    # mail (it may be the only source for a pending repair): the new mail gets
+    # a generation-bearing name, hence its own locator.
+    def taken(candidate: str) -> bool:
+        homes = [folder_dir / "new" / candidate]
+        if quarantine_root is not None:
+            homes.append(
+                Path(quarantine_root) / account_name / folder_name / "new" / candidate
+            )
+        return any(h.is_file() and h.read_bytes() != rfc822 for h in homes)
+
+    name = f"uid-{uid}.eml"
+    if taken(name):
+        name = f"uid-{uid}.v{uidvalidity}.eml"
+        if taken(name):
+            digest = hashlib.sha256(rfc822).hexdigest()[:12]
+            name = f"uid-{uid}.v{uidvalidity}.{digest}.eml"
+    tmp_path = folder_dir / "tmp" / name
+    final_path = folder_dir / "new" / name
     tmp_path.write_bytes(rfc822)
     tmp_path.replace(final_path)
     return final_path
@@ -806,6 +832,9 @@ def sync_native(
                     attachment_root=attachment_root,
                     bulk_threshold=bulk_threshold,
                     confirm_fn=confirm_fn,
+                    quarantine_root=quarantine_root
+                    if quarantine_root is not None
+                    else default_quarantine_root(database_path),
                 )
                 total_pulled += pulled
                 total_inserted += inserted
@@ -959,6 +988,7 @@ def _sync_one_folder(
     attachment_root: Path | None,
     bulk_threshold: int,
     confirm_fn: Callable[[int], bool] | None,
+    quarantine_root: Path,
 ) -> tuple[int, int, int]:
     """Sync one folder; returns (pulled, inserted, deduped).
 
@@ -1017,7 +1047,9 @@ def _sync_one_folder(
                 account_name=account_name,
                 folder_name=wire_name,
                 uid=uid,
+                uidvalidity=uidvalidity,
                 rfc822=rfc822,
+                quarantine_root=quarantine_root,
             )
             pulled += 1
             summary = import_maildir_message(

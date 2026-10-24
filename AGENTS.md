@@ -175,6 +175,7 @@ Every entry here is a canonical location; globbing around them usually finds a s
 | What *should* the system do? | `## Behaviour contracts` + the code |
 | What changed recently? | PRs / `git log`. There is deliberately no `CHANGELOG.md` ([D-20260609-1](docs/decisions/D-20260609-1-no-changelog-file.md); the change archive that decision named as the change-history canon was not carried into this repo) |
 | What exactly does this term mean? | [`GLOSSARY.md`](GLOSSARY.md), the one glossary in the repo |
+| Writing or reviewing code/tests: defect shapes that already bit this repo (derived-value diffs, parse/write inverses, ratio-test fixtures, test-data de-identification) | [`CODING_STANDARDS.md`](CODING_STANDARDS.md) |
 | Deployment state, watchpoints, pending externals | `docs/current-status.md` (a local working file outside version control, [D-20261018-1](docs/decisions/D-20261018-1-internal-working-notes-stay-local.md); a fresh clone lacks it) |
 | Picking up in-flight work; items waiting on Sean's ruling | All in GitHub issues + PRs (waiting items are labelled `ready-for-human`); `session-continuity.md` (maintained by `/session-park`) only lists ticket numbers as pointers |
 | Issue / label operations | [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md) (`gh`, `sean3808/mailattic`), [`docs/agents/triage-labels.md`](docs/agents/triage-labels.md) |

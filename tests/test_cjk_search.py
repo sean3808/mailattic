@@ -336,6 +336,23 @@ class TestBuildFtsMatchExpr(unittest.TestCase):
         result = _build_fts_match_expr("發票&帳款")
         self.assertEqual(result, '"發 票" "帳 款"')
 
+    def test_cjk_punctuation_is_separator_not_phrase_member(self) -> None:
+        # Issue #24: fullwidth punctuation must separate bareword runs like
+        # ASCII "," / "&", not be swallowed into one adjacency phrase.
+        expected = '"發 票" "報 價"'
+        for sep in ("、", "，", "。", "　", "；", "：", "！", "？"):
+            with self.subTest(sep=sep):
+                self.assertEqual(_build_fts_match_expr(f"發票{sep}報價"), expected)
+
+    def test_cjk_punctuation_only_returns_impossible_sentinel(self) -> None:
+        from mailattic.query import _FTS_MATCH_IMPOSSIBLE
+
+        self.assertEqual(_build_fts_match_expr("、，。"), _FTS_MATCH_IMPOSSIBLE)
+
+    def test_quoted_phrase_keeps_cjk_punctuation(self) -> None:
+        # Explicit double quotes remain a phrase, punctuation included.
+        self.assertEqual(_build_fts_match_expr('"發票、報價"'), '"發 票、報 價"')
+
     def test_boolean_operator_contracts(self) -> None:
         cases = [
             (
@@ -1141,6 +1158,57 @@ class TestStructuredFilterRegression(unittest.TestCase):
         self.assertNotIn(self.msg_b_id, ids)
         self.assertNotIn(self.msg_c_id, ids)
         self.assertNotIn(self.msg_d_id, ids)
+
+
+class TestCjkPunctuationSearch(unittest.TestCase):
+    """Issue #24: unquoted CJK punctuation separates terms end to end."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = _make_db(self._tmp.name)
+        self.near = _insert(
+            self.db,
+            body_text="發票與報價",
+            message_id="<near@example.com>",
+            logical_locator="Inbox/near",
+        )
+        # Reversed order and extra distance: proves terms are separated, not
+        # a fixed adjacent phrase.
+        self.far = _insert(
+            self.db,
+            body_text="報價已確認，另外請處理其他事項，最後才是發票",
+            message_id="<far@example.com>",
+            logical_locator="Inbox/far",
+        )
+        _insert(
+            self.db,
+            body_text="只有發票",
+            message_id="<one@example.com>",
+            logical_locator="Inbox/one",
+        )
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _ids(self, keyword: str) -> set[object]:
+        rows = search_messages(
+            database_path=self.db,
+            filters=SearchFilters(keyword=keyword),
+            limit=20,
+        )
+        return {r["id"] for r in rows}
+
+    def test_fullwidth_separators_match_like_ascii(self) -> None:
+        both = {self.near, self.far}
+        for kw in ("發票,報價", "發票 報價", "發票、報價", "發票，報價", "發票。報價"):
+            with self.subTest(keyword=kw):
+                self.assertEqual(self._ids(kw), both)
+
+    def test_quoted_phrase_still_requires_adjacency(self) -> None:
+        self.assertEqual(self._ids('"發票報價"'), set())
+
+    def test_punctuation_only_matches_nothing(self) -> None:
+        self.assertEqual(self._ids("、，。"), set())
 
 
 if __name__ == "__main__":

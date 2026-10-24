@@ -40,6 +40,7 @@ from email.errors import HeaderParseError
 from email.header import decode_header, make_header
 from email.headerregistry import Address
 from email.message import EmailMessage, Message
+from email.parser import BytesParser
 from email.utils import (
     formataddr,
     formatdate,
@@ -56,11 +57,21 @@ from .datetime_bounds import TAIPEI
 from .identity import list_self_addresses
 from .imap_native import NativeImapClient
 from .imap_runtime import load_env_file
-from .models import MailboxParticipant, NormalizedAttachment, NormalizedMessage
+from .models import (
+    IngestFailure,
+    MailboxParticipant,
+    NormalizedAttachment,
+    NormalizedMessage,
+)
 from .mutf7 import encode_mutf7
 from .parser import subject_from_raw_headers
-from .query import get_message, render_text
-from .storage import connect_database, persist_message
+from .query import (
+    get_message,
+    normalize_message_id,
+    render_text,
+    select_rows_by_message_id,
+)
+from .storage import connect_database, persist_message, record_ingest_failure
 
 __all__ = [
     "reply_all_recipients",
@@ -143,6 +154,30 @@ _ATTACHMENT_MIME_TYPES: dict[str, str] = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".zip": "application/zip",
 }
+
+
+def _round_trippable_nested_message(data: bytes) -> EmailMessage | None:
+    """Parse ``data`` for nesting as message/rfc822, or None if that would alter it.
+
+    RFC 2046 5.2.1 forbids base64 on message/rfc822, so the part must carry a
+    parsed message. Serialising it can rewrite bytes (raw UTF-8 headers become
+    ``=?unknown-8bit?``), so the exact send-then-extract path is replayed here and
+    the result must equal the original, allowing only CRLF -> LF normalisation.
+    """
+    try:
+        nested = BytesParser(policy=policy.default).parsebytes(data)
+        if nested.defects:
+            return None
+        probe = EmailMessage()
+        probe.add_attachment(nested)
+        reparsed = BytesParser(policy=policy.default).parsebytes(probe.as_bytes())
+        (part,) = reparsed.iter_attachments()
+        stored = part.get_payload(0).as_bytes()
+    except Exception:  # noqa: BLE001 -- any failure means: use the binary fallback
+        return None
+    if stored.replace(b"\r\n", b"\n") != data.replace(b"\r\n", b"\n"):
+        return None
+    return nested
 
 
 def resolve_attachment_mime_type(filename: str) -> tuple[str, str]:
@@ -393,7 +428,9 @@ def _original_subject(original: dict[str, object]) -> str:
 def build_thread_headers(original: dict[str, object]) -> dict[str, str]:
     """Build thread-continuity headers for a reply draft."""
     message_id_value = original.get("message_id")
-    if not isinstance(message_id_value, str) or not message_id_value.strip():
+    if not isinstance(message_id_value, str) or not normalize_message_id(
+        message_id_value
+    ):
         raise ValueError(
             "Cannot build thread headers: original message has no Message-ID"
         )
@@ -406,7 +443,10 @@ def build_thread_headers(original: dict[str, object]) -> dict[str, str]:
         if references_value is not None and str(references_value).strip()
         else []
     )
-    if not reference_tokens or reference_tokens[-1] != message_id_value:
+    # Emit the normalised id (no outer CFWS); keep brackets only if stored with them.
+    clean_id = normalize_message_id(message_id_value)
+    message_id_value = f"<{clean_id}>" if "<" in message_id_value else clean_id
+    if not reference_tokens or normalize_message_id(reference_tokens[-1]) != clean_id:
         reference_tokens.append(message_id_value)
 
     subject = _original_subject(original)
@@ -579,20 +619,13 @@ def _get_message_by_rfc822_message_id(
     *,
     read_only: bool = False,
 ) -> dict[str, object]:
-    identifier = message_id.strip()
-    clean_identifier = identifier.strip("<>")
-    candidates = list(
-        dict.fromkeys([identifier, clean_identifier, f"<{clean_identifier}>"])
-    )
+    clean_identifier = normalize_message_id(message_id)
 
     connection = connect_database(database_path, create=False, read_only=read_only)
     try:
-        placeholders = ",".join("?" for _ in candidates)
-        rows = connection.execute(
-            "SELECT id, source_input_mode, pst_source FROM messages "
-            f"WHERE message_id IN ({placeholders})",
-            candidates,
-        ).fetchall()
+        rows = select_rows_by_message_id(
+            connection, clean_identifier, "id, source_input_mode, pst_source"
+        )
     finally:
         connection.close()
 
@@ -1008,6 +1041,14 @@ def assemble_draft_reply(
 
     for path, data in attachment_payloads:
         maintype, subtype = resolve_attachment_mime_type(path.name)
+        if (maintype, subtype) == ("message", "rfc822"):
+            nested = _round_trippable_nested_message(data)
+            if nested is not None:
+                msg.add_attachment(nested, filename=path.name)
+                continue
+            # Not provably preserved as a nested message (raw 8-bit headers,
+            # parse defects): keep the original bytes as a binary attachment.
+            maintype, subtype = "application", "octet-stream"
         msg.add_attachment(
             data,
             maintype=maintype,
@@ -1644,15 +1685,18 @@ def _submit_prepared_draft(
     try:
         connection = connect_database(database_path)
         try:
-            persist_message(
-                connection,
-                _normalized_from_draft(
-                    msg,
-                    draft_id,
-                    message_id,
-                    database_path=database_path,
-                ),
+            normalized, attachment_failures = _normalized_from_draft(
+                msg,
+                draft_id,
+                message_id,
+                database_path=database_path,
             )
+            persisted = persist_message(connection, normalized)
+            if persisted.inserted:
+                # #18: placeholder rows need their ledger entry, or no later
+                # healthy Sent copy may fill them (storage._backfill_empty_attachments).
+                for failure in attachment_failures:
+                    record_ingest_failure(connection, failure)
             connection.commit()
         finally:
             connection.close()
@@ -1976,13 +2020,21 @@ def _extract_envelope_recipients(msg: Message) -> list[str]:
     return recipients
 
 
+_OUTBOUND_PST_SOURCE = "outbound-bes"
+
+
 def _extract_draft_attachments(
     msg: EmailMessage,
     attachment_root: Path,
     draft_id: str,
     message_id: str,
+    failures: list[IngestFailure] | None = None,
 ) -> tuple[NormalizedAttachment, ...]:
+    """Extract draft attachments into the CAS; per-attachment failures append a
+    placeholder row and (when ``failures`` is given) an IngestFailure (#18)."""
     attachments: list[NormalizedAttachment] = []
+    if failures is None:
+        failures = []
     try:
         parts = list(msg.iter_attachments())
     except Exception as exc:  # noqa: BLE001 -- best effort post-submit bookkeeping
@@ -1998,6 +2050,7 @@ def _extract_draft_attachments(
             " \"'\t\r\n"
         ) or f"attachment-{index}"
         mime_type = part.get_content_type()
+        payload = None
         try:
             if mime_type == "message/rfc822":
                 payload = part.get_payload(0).as_bytes()
@@ -2026,6 +2079,28 @@ def _extract_draft_attachments(
                 f"for draft_id={draft_id} (message_id={message_id}): {exc}",
                 file=sys.stderr,
             )
+            # #18: keep a placeholder + open ledger entry (the draft file stays
+            # the retry source) so a healthy copy of this mail can fill it later.
+            size = len(payload) if payload is not None else None
+            attachments.append(
+                NormalizedAttachment(
+                    attachment_name=filename, size_bytes=size, mime_type=mime_type
+                )
+            )
+            failures.append(
+                IngestFailure(
+                    pst_source=_OUTBOUND_PST_SOURCE,
+                    folder_path="Sent",
+                    logical_locator=f"outbound:{draft_id}",
+                    source_input_mode="outbound",
+                    source_requested_from="bes:send-draft",
+                    error_stage="attachment-store",
+                    error_type=type(exc).__name__,
+                    error_message=f"Attachment binary failure for: {filename}",
+                    attachment_name=filename,
+                    attachment_size=size,
+                )
+            )
     return tuple(attachments)
 
 
@@ -2034,19 +2109,24 @@ def _normalized_from_draft(
     draft_id: str,
     message_id: str,
     database_path: Path | str,
-) -> NormalizedMessage:
-    attachment_root = resolve_store_root(
-        Path(database_path),
-        env_override=os.environ.get("MAILATTIC_ATTACHMENT_ROOT"),
+    attachment_root: Path | None = None,
+) -> tuple[NormalizedMessage, list[IngestFailure]]:
+    if attachment_root is None:
+        attachment_root = resolve_store_root(
+            Path(database_path),
+            env_override=os.environ.get("MAILATTIC_ATTACHMENT_ROOT"),
+        )
+    failures: list[IngestFailure] = []
+    attachments = _extract_draft_attachments(
+        msg, attachment_root, draft_id, message_id, failures
     )
-    attachments = _extract_draft_attachments(msg, attachment_root, draft_id, message_id)
     from_display, from_addr = parseaddr(str(msg.get("From", "")))
     sent_at = (
         _parse_message_datetime(str(msg["Date"]))
         if msg["Date"]
         else datetime.now(tz=UTC)
     )
-    return NormalizedMessage(
+    normalized = NormalizedMessage(
         subject=str(msg["Subject"] or ""),
         sender=MailboxParticipant(
             display_name=from_display or None,
@@ -2062,12 +2142,13 @@ def _normalized_from_draft(
         message_id=message_id,
         in_reply_to=str(msg["In-Reply-To"]) if msg["In-Reply-To"] else None,
         references=str(msg["References"]) if msg["References"] else None,
-        pst_source="outbound-bes",
+        pst_source=_OUTBOUND_PST_SOURCE,
         folder_path="Sent",
         logical_locator=f"outbound:{draft_id}",
         source_input_mode="outbound",
         source_requested_from="bes:send-draft",
     )
+    return normalized, failures
 
 
 def _participants_from_headers(

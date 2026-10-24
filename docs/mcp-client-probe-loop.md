@@ -143,3 +143,8 @@ Tool-description explanations remain hypotheses until a controlled description c
 ## CoWork closeout
 
 Reopening Claude Desktop or CoWork is a closeout-only acceptance check, not a per-round step. The headless loop supplies iterative evidence; closeout confirms the long-running application still loads the final working-tree server configuration.
+
+## 已知陷阱（2026-10-23 自 lesson-lookup 搬入）
+
+<!-- from lesson-lookup/mcp -->
+- **stdio MCP server 由 client 生行程，拿到的是 client 給的精簡環境，不是你 shell 的環境**：任何「在我終端機跑得好好的」啟動命令都可能在 client 底下失敗。實例：某 server 突然連不上，同一條命令在 PowerShell 手打完全正常；log 才顯示真因是 uv 想在**不可寫的工作目錄**下建相對路徑的快取目錄而 `存取被拒 (os error 5)`——client 給的環境沒帶使用者層的 `UV_CACHE_DIR`，工具退回讀 repo 設定檔的相對路徑，而 client 給的 cwd 不是 repo。判準：(1) MCP server 連不上先讀 `%APPDATA%\Claude\logs\mcp-server-<name>.log`，**不要**先在自己的 shell 重跑命令——環境不一樣，重跑通常會「正常」而誤導；(2) 重現時要同時模擬兩件事：把 cwd 切到不可寫的目錄（如 `C:\Windows\System32`）**且**清掉相關環境變數，只做其中一件重現不出來；(3) stdio server 的啟動命令與其依賴的所有設定**路徑一律絕對化**，需要的環境變數明寫進 config 的 `env` 區塊，不要指望繼承；(4) `Server transport closed unexpectedly` 的意思是「子行程提早死了」，不是網路問題——stdio 模型下行程即連線。negative signal：HTTP／SSE transport 的 remote MCP server 不由 client 生行程，無環境繼承問題。 `[jean-wan-mail-platform 2026-07]`

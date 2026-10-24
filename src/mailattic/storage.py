@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .cjk_segmentation import segment_cjk
+from .identity import extract_address
 from .models import IngestFailure, NormalizedMessage
 from .schema import SCHEMA_SQL
 
@@ -38,6 +39,21 @@ def _recipient_domain_match(recipient_text: str | None, domain: str | None) -> i
         return 0
     pattern = "@" + re.escape(normalized_domain) + r"(?![\w.-])"
     return 1 if re.search(pattern, recipient_text, re.IGNORECASE) else 0
+
+
+def _sender_domain_match(sender: str | None, domain: str | None) -> int:
+    """True when the address in a (possibly packed ``Name<addr>``) sender ends
+    with ``@domain`` -- same address rule as ``compute_direction`` (#23)."""
+    if not sender or not domain:
+        return 0
+    suffix = "@" + domain.strip().lstrip("@").lower()
+    return 1 if extract_address(sender).endswith(suffix) else 0
+
+
+def _sender_address_match(sender: str | None, address: str | None) -> int:
+    if not sender or not address:
+        return 0
+    return 1 if extract_address(sender) == extract_address(address) else 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +103,14 @@ def connect_database(
     # match -- see design.md > "Failure modes".
     connection.create_function(
         "recipient_domain_match", 2, _recipient_domain_match, deterministic=True
+    )
+    # Same contract for sender selectors (sender_domain_sql in query.py and the
+    # contact selector in contact_history.py): see through packed Name<addr>.
+    connection.create_function(
+        "sender_domain_match", 2, _sender_domain_match, deterministic=True
+    )
+    connection.create_function(
+        "sender_address_match", 2, _sender_address_match, deterministic=True
     )
     return connection
 
@@ -315,6 +339,24 @@ def record_ingest_failure(
     )
 
 
+def stored_dedup_keys_at_locator(
+    connection: sqlite3.Connection, pst_source: str, locator: str | None
+) -> list[str]:
+    """Dedup keys of the stored mails recorded at (pst_source, locator).
+
+    More than one means a legacy reused UID: ledger rows keyed by that locator
+    cannot be attributed to either mail (#17).
+    """
+    return [
+        r["dedup_key"]
+        for r in connection.execute(
+            "SELECT dedup_key FROM messages"
+            " WHERE pst_source = ? AND logical_locator IS ?",
+            [pst_source, locator],
+        )
+    ]
+
+
 def _backfill_empty_attachments(
     connection: sqlite3.Connection,
     stored_message_id: int,
@@ -336,6 +378,17 @@ def _backfill_empty_attachments(
         "SELECT pst_source, logical_locator FROM messages WHERE id = ?",
         [stored_message_id],
     ).fetchone()
+    # #17: ledger entries are keyed by locator; when another stored mail shares
+    # it (legacy reused UID) they cannot be attributed to this one -- settle none.
+    if (
+        len(
+            stored_dedup_keys_at_locator(
+                connection, existing["pst_source"], existing["logical_locator"]
+            )
+        )
+        > 1
+    ):
+        return 0
     fresh_by_name: dict[str, list] = {}
     for attachment in message.attachments:
         fresh_by_name.setdefault(attachment.attachment_name, []).append(attachment)
@@ -612,30 +665,35 @@ def _assign_thread_key_for_new_message(
     _tokenize_references() parser, so bracket-free References values (#191)
     are found without the LIKE substring match producing false positives.
     """
-    from .query import _escape_like, _tokenize_references  # noqa: PLC0415
+    from .query import (  # noqa: PLC0415
+        _escape_like,
+        _tokenize_references,
+        normalize_message_id,
+        select_rows_by_message_id,
+    )
 
     def _row_actually_references(row: sqlite3.Row, target_id: str) -> bool:
         """Confirm a LIKE-prefiltered candidate genuinely references target_id."""
-        row_mid = (row["message_id"] or "").strip("<>").strip()
+        row_mid = normalize_message_id(row["message_id"])
         if row_mid == target_id:
             return True
-        row_irt = (row["in_reply_to"] or "").strip("<>").strip()
+        row_irt = normalize_message_id(row["in_reply_to"])
         if row_irt == target_id:
             return True
         return any(
-            tok.strip("<>").strip() == target_id
+            normalize_message_id(tok) == target_id
             for tok in _tokenize_references(row["references_header"])
         )
 
-    new_mid = message_id.strip("<>").strip() if message_id else None
+    new_mid = normalize_message_id(message_id) or None
 
     ref_ids: list[str] = []
     if in_reply_to:
-        stripped = in_reply_to.strip("<>").strip()
+        stripped = normalize_message_id(in_reply_to)
         if stripped:
             ref_ids.append(stripped)
     for token in _tokenize_references(references_header):
-        stripped = token.strip("<>").strip()
+        stripped = normalize_message_id(token)
         if stripped:
             ref_ids.append(stripped)
     unique_ref_ids = list(dict.fromkeys(ref_ids))  # dedupe, preserve order
@@ -649,29 +707,21 @@ def _assign_thread_key_for_new_message(
     # Step 1: ancestor-row lookup, index-only (unique index on message_id).
     # One query per referenced id, but each is a direct index seek, not a scan.
     for ref_id in unique_ref_ids:
-        rows = connection.execute(
-            "SELECT id, thread_key FROM messages"
-            " WHERE id != ? AND (message_id = ? OR message_id = ?)",
-            [new_db_id, ref_id, f"<{ref_id}>"],
-        ).fetchall()
+        rows = select_rows_by_message_id(
+            connection, ref_id, "id, thread_key", exclude_id=new_db_id
+        )
         for row in rows:
             _add_existing_key(row)
 
     if thread_bridge_target:
         target = thread_bridge_target.strip()
-        stripped_target = target.strip("<>").strip()
-        bridge_rows = connection.execute(
-            """
-            SELECT id, thread_key
-            FROM messages
-            WHERE id != ?
-              AND (
-                    message_id = ?
-                 OR message_id = ?
-                 OR dedup_key = ?
-              )
-            """,
-            [new_db_id, stripped_target, f"<{stripped_target}>", target],
+        stripped_target = normalize_message_id(target)
+        bridge_rows = select_rows_by_message_id(
+            connection, stripped_target, "id, thread_key", exclude_id=new_db_id
+        )
+        bridge_rows += connection.execute(
+            "SELECT id, thread_key FROM messages WHERE id != ? AND dedup_key = ?",
+            [new_db_id, target],
         ).fetchall()
         for row in bridge_rows:
             _add_existing_key(row)
@@ -695,11 +745,14 @@ def _assign_thread_key_for_new_message(
         conditions: list[str] = []
         params: list[object] = [new_db_id]
         for candidate in batch:
+            # LIKE is a superset prefilter (tolerates outer whitespace, #22);
+            # _row_actually_references() verifies exactly.
             conditions.append(
-                "(in_reply_to = ? OR in_reply_to = ?"
+                "(in_reply_to LIKE ? ESCAPE '\\'"
                 " OR references_header LIKE ? ESCAPE '\\')"
             )
-            params.extend([candidate, f"<{candidate}>", f"%{_escape_like(candidate)}%"])
+            pattern = f"%{_escape_like(candidate)}%"
+            params.extend([pattern, pattern])
         scan_rows = connection.execute(
             "SELECT id, thread_key, message_id, in_reply_to, references_header"
             " FROM messages WHERE id != ? AND (" + " OR ".join(conditions) + ")",

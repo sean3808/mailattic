@@ -124,31 +124,36 @@ def _backfill_pst(
                 summary["skipped_messages"] += 1
                 continue
 
-            attachment_rows = connection.execute(
+            all_rows = connection.execute(
                 """
-                SELECT id, attachment_name
+                SELECT id, attachment_name, storage_path
                 FROM message_attachments
-                WHERE message_id = ? AND storage_path IS NULL
+                WHERE message_id = ?
                 ORDER BY id
                 """,
                 [row["id"]],
             ).fetchall()
-            if not attachment_rows:
+            pending_rows = [r for r in all_rows if r["storage_path"] is None]
+            if not pending_rows:
                 continue
 
+            try:
+                matched = _match_pending(
+                    all_rows, pending_rows, list(_iter_attachment_parts(message))
+                )
+            except ValueError as refusal:
+                # Ambiguous or count-mismatched: refuse, write nothing.
+                summary["errors"] += 1
+                print(
+                    f"refused message_id={message_id} db_id={row['id']}: {refusal}",
+                    file=sys.stderr,
+                )
+                continue
             summary["matched_messages"] += 1
-            attachment_parts = list(_iter_attachment_parts(message))
-            for attachment_row, part in zip(
-                attachment_rows, attachment_parts, strict=False
-            ):
-                payload = part.get_payload(decode=True)
-                if payload is None:
-                    summary["errors"] += 1
-                    continue
-                filename = part.get_filename() or attachment_row["attachment_name"]
+            for attachment_row, part, payload in matched:
                 record = write_attachment(
                     payload,
-                    filename,
+                    attachment_row["attachment_name"],
                     part.get_content_type(),
                     store_root,
                 )
@@ -176,6 +181,37 @@ def _backfill_pst(
                     pending_updates = 0
         if pending_updates:
             connection.commit()
+
+
+def _match_pending(
+    all_rows: Sequence[sqlite3.Row],
+    pending_rows: Sequence[sqlite3.Row],
+    parts: Sequence[Message],
+) -> list[tuple[sqlite3.Row, Message, bytes]]:
+    """Pair each pending placeholder with its original part by unique name.
+
+    Raises ValueError (caller refuses the whole message) with the cause when counts
+    differ, a name is not unique on either side, or a payload cannot be decoded.
+    """
+    if len(parts) != len(all_rows):
+        raise ValueError(
+            f"attachment count mismatch: {len(all_rows)} DB rows vs {len(parts)} parts"
+        )
+    matched: list[tuple[sqlite3.Row, Message, bytes]] = []
+    for row in pending_rows:
+        name = row["attachment_name"]
+        same_rows = [r for r in all_rows if r["attachment_name"] == name]
+        same_parts = [p for p in parts if p.get_filename() == name]
+        if len(same_rows) != 1 or len(same_parts) != 1:
+            raise ValueError(
+                f"ambiguous name {name!r}: {len(same_rows)} DB rows, "
+                f"{len(same_parts)} parts"
+            )
+        payload = same_parts[0].get_payload(decode=True)
+        if not isinstance(payload, bytes):
+            raise ValueError(f"undecodable payload for {name!r}")
+        matched.append((row, same_parts[0], payload))
+    return matched
 
 
 def _iter_extracted_messages(output_root: Path) -> Iterable[Message]:

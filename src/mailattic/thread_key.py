@@ -8,8 +8,8 @@ touching the database.  Designed to be reused by:
 
 Parsing semantics are intentionally identical to walk_thread() in query.py:
 - references_header is parsed via the reused _tokenize_references() helper
-- in_reply_to and each reference token are normalised with .strip("<>")
-- Message-ID normalisation: .strip("<>") (same as walk_thread batch lookup)
+- in_reply_to, each reference token and Message-ID are normalised with
+  query.normalize_message_id (outer whitespace, then angle brackets; #22)
 
 This ensures connected-component membership here == connected-component
 membership from walk_thread's BFS, minus the LIKE substring false-positives
@@ -25,7 +25,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 # Import parsing helpers from query.py — do NOT reimplement.
-from .query import _tokenize_references  # noqa: PLC2701 (internal helper, by design)
+from .query import (  # noqa: PLC2701 (internal helpers, by design)
+    _tokenize_references,
+    normalize_message_id,
+)
 
 # ---------------------------------------------------------------------------
 # Union-Find (path-compressed, union-by-rank)
@@ -122,9 +125,7 @@ def compute_thread_keys(
        final {db_id -> thread_key}.
 
     Parsing normalisation (mirrors query.py walk_thread exactly):
-    - ``in_reply_to.strip("<>")``
-    - ``_tokenize_references(references_header)`` → each token ``.strip("<>")``
-    - Message-ID: ``.strip("<>")``
+    - every identity goes through ``query.normalize_message_id``
     """
     # Materialise so we can iterate twice.
     raw_rows = list(messages)
@@ -149,7 +150,7 @@ def compute_thread_keys(
 
     def _node_for_row(db_id: int, message_id: str | None) -> str:
         """Return the union-find node key for this row."""
-        mid = (message_id or "").strip("<>").strip()
+        mid = normalize_message_id(message_id)
         if mid:
             return mid
         return f"{_SINGLETON_PREFIX}{db_id}"
@@ -161,7 +162,7 @@ def compute_thread_keys(
         if not value:
             return
         anchor_to_node[value] = node
-        stripped = value.strip("<>").strip()
+        stripped = normalize_message_id(value)
         if stripped:
             anchor_to_node[stripped] = node
 
@@ -187,10 +188,10 @@ def compute_thread_keys(
         ref_ids: list[str] = []
 
         if in_reply_to:
-            ref_ids.append(in_reply_to.strip("<>"))
+            ref_ids.append(normalize_message_id(in_reply_to))
 
         for tok in _tokenize_references(references_header):
-            ref_ids.append(tok.strip("<>"))
+            ref_ids.append(normalize_message_id(tok))
 
         for ref_id in ref_ids:
             ref_id = ref_id.strip()
@@ -204,7 +205,7 @@ def compute_thread_keys(
         if bridge_target:
             target_node = anchor_to_node.get(bridge_target.strip())
             if target_node is None:
-                target_node = anchor_to_node.get(bridge_target.strip("<>").strip())
+                target_node = anchor_to_node.get(normalize_message_id(bridge_target))
             if target_node is not None:
                 uf.union(src_node, target_node)
 

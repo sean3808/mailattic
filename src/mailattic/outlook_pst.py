@@ -21,6 +21,7 @@ from .models import (
     PstSource,
     _coerce_optional_text,
 )
+from .parser import _fallback_attachment_name
 
 # MK_E_UNAVAILABLE (0x800401E3): nothing registered in the Running Object Table,
 # which for a fixed ProgID means "that application is not running". Measured, not
@@ -413,10 +414,26 @@ class OutlookComReader:
         if attachments is None:
             return []
         extracted: list[dict[str, object]] = []
+        unnamed_seq = 0
         for index in range(1, int(attachments.Count) + 1):
             source_attachment = attachments.Item(index)
+            # An unreadable display name must not drop a readable payload: use the
+            # MIME parser's unnamed fallback (counter over unnamed ones only, so
+            # it is stable per collection order and re-imports are idempotent).
+            file_name = str(_safe_attr(source_attachment, "FileName") or "")
+            if not file_name.strip():
+                unnamed_seq += 1
+                file_name = _fallback_attachment_name(
+                    _coerce_optional_text(
+                        _optional_property(
+                            _safe_attr(source_attachment, "PropertyAccessor"),
+                            PR_ATTACH_MIME_TAG,
+                        )
+                    ),
+                    unnamed_seq,
+                )
             attachment: dict[str, object] = {
-                "attachment_name": str(_safe_attr(source_attachment, "FileName") or ""),
+                "attachment_name": file_name,
                 "content_hash": None,
                 "size_bytes": None,
                 "mime_type": None,
@@ -428,6 +445,9 @@ class OutlookComReader:
                     payload = _optional_property(accessor, PR_ATTACH_DATA_BIN)
                     if not isinstance(payload, bytes | bytearray):
                         raise TypeError("Attachment binary property is unavailable")
+                    # Kept before the CAS write so a failed write still leaves the
+                    # size that shared duplicate repair matches against.
+                    attachment["_expected_size"] = len(payload)
                     mime_type = _coerce_optional_text(
                         _optional_property(accessor, PR_ATTACH_MIME_TAG)
                     )

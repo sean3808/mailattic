@@ -27,6 +27,61 @@ from .storage import SYNC_STATE_KEY, connect_database
 _REF_RE = re.compile(r"<([^>]+)>")
 
 
+_CFWS_COMMENT = r"(?:\([^()]*\)\s*)*"
+_BRACKETED_ID_RE = re.compile(rf"^\s*{_CFWS_COMMENT}<([^<>]*)>\s*{_CFWS_COMMENT}$")
+_BARE_ID_RE = re.compile(rf"^\s*{_CFWS_COMMENT}([^\s()<>]+)\s*{_CFWS_COMMENT}$")
+
+
+def normalize_message_id(value: str | None) -> str:
+    """Canonical derived identity of a Message-ID (#22).
+
+    Outer CFWS (whitespace and ``(comments)`` outside the angle brackets, RFC
+    5322 3.6.4) is dropped, so ``"<a@x>  "``, ``"(c) <a@x> (note)"`` and ``"a@x"``
+    are one identity. The id inside the brackets keeps its case and content
+    (only edge whitespace is trimmed). Stored headers are never rewritten.
+    """
+    text = value or ""
+    match = _BRACKETED_ID_RE.match(text) or _BARE_ID_RE.match(text)
+    if match:
+        return match.group(1).strip()
+    return text.strip().strip("<>").strip()
+
+
+def select_rows_by_message_id(
+    connection: sqlite3.Connection,
+    clean_id: str,
+    columns: str,
+    exclude_id: int | None = None,
+) -> list[sqlite3.Row]:
+    """Rows whose stored ``message_id`` normalises to *clean_id*.
+
+    Index range seeks form a superset: the bare and bracketed prefixes, plus the
+    rare stored values that start with whitespace or a ``(comment)``. Each row
+    is then verified exactly with :func:`normalize_message_id`, so any outer
+    CFWS is found without a full scan. ``columns`` must be trusted constants;
+    ``message_id`` is always appended as ``_mid``.
+    """
+    if not clean_id:
+        return []
+    ranges = (
+        (clean_id, clean_id + "\U0010ffff"),
+        (f"<{clean_id}", f"<{clean_id}\U0010ffff"),
+        ("", "!"),  # leading whitespace / control characters
+        ("(", ")"),  # leading comment
+    )
+    rows: dict[int, sqlite3.Row] = {}
+    for low, high in ranges:
+        cursor = connection.execute(
+            f"SELECT {columns}, message_id AS _mid FROM messages"
+            " WHERE message_id >= ? AND message_id < ? AND id IS NOT ?",
+            [low, high, exclude_id],
+        )
+        for r in cursor:
+            if normalize_message_id(r["_mid"]) == clean_id:
+                rows[int(r["id"])] = r
+    return list(rows.values())
+
+
 def _tokenize_references(header: str | None) -> list[str]:
     """Extract Message-IDs from a ``References`` header value.
 
@@ -822,16 +877,15 @@ def resolve_thread_message_ids(
         if is_db_id:
             resolved_db_id = _normalize_thread_db_id_string(identifier_str)
         else:
-            clean_id = identifier_str.strip("<>")
+            clean_id = normalize_message_id(identifier_str)
 
     connection = connect_database(database_path, create=False, read_only=read_only)
     try:
         if resolved_db_id is None:
-            start_row = connection.execute(
-                "SELECT id, thread_key FROM messages "
-                "WHERE message_id = ? OR message_id = ?",
-                [clean_id, f"<{clean_id}>"],
-            ).fetchone()
+            found = select_rows_by_message_id(
+                connection, clean_id or "", "id, thread_key"
+            )
+            start_row = min(found, key=lambda r: int(r["id"])) if found else None
         else:
             start_row = connection.execute(
                 "SELECT id, thread_key FROM messages WHERE id = ?",
@@ -897,6 +951,16 @@ def _is_word_char(ch: str) -> bool:
     return _is_alnum_or_mark(ch) and not _is_cjk(ch)
 
 
+def _is_cjk_word_char(ch: str) -> bool:
+    """CJK ideograph / fullwidth alphanumeric; excludes CJK punctuation and U+3000.
+
+    ``_is_cjk`` also spans CJK symbols and fullwidth punctuation, which unicode61
+    drops at index time. Inside an unquoted bareword run they must act as
+    separators (like ASCII ``,`` / ``&``), not glue two terms into one phrase.
+    """
+    return _is_cjk(ch) and _is_alnum_or_mark(ch)
+
+
 def _build_fts_match_expr(keyword: str) -> str | None:
     """Build a controlled FTS5 MATCH expression for *keyword*.
 
@@ -936,9 +1000,9 @@ def _build_fts_match_expr(keyword: str) -> str | None:
         elif ch in "()":
             tokens.append(ch)
             i += 1
-        elif _is_cjk(ch):
+        elif _is_cjk_word_char(ch):
             run_chars: list[str] = []
-            while i < n and _is_cjk(keyword[i]):
+            while i < n and _is_cjk_word_char(keyword[i]):
                 run_chars.append(keyword[i])
                 i += 1
             tokens.append(quote_phrase("".join(run_chars)))
@@ -1906,10 +1970,11 @@ def _append_search_filter_conditions(
     _sender_domains = _normalize_domain_filter(filters.sender_domain)
     if _sender_domains:
         or_clauses = " OR ".join(
-            f"{sender_email_sql} LIKE ? ESCAPE '\\'" for _ in _sender_domains
+            sender_domain_sql(sender_email_sql) for _ in _sender_domains
         )
         conditions.append(f"({or_clauses})")
-        parameters.extend(_to_domain_suffix_pattern(d) for d in _sender_domains)
+        for domain in _sender_domains:
+            parameters.extend(sender_domain_params(domain))
 
     _recipient_domains = _normalize_domain_filter(filters.recipient_domain)
     if _recipient_domains:
@@ -1922,13 +1987,13 @@ def _append_search_filter_conditions(
     _participants_domains = _normalize_domain_filter(filters.participants_domain)
     if _participants_domains:
         or_clauses = " OR ".join(
-            f"{sender_email_sql} LIKE ? ESCAPE '\\' "
+            f"{sender_domain_sql(sender_email_sql)} "
             f"OR recipient_domain_match({recipient_sql}, ?)"
             for _ in _participants_domains
         )
         conditions.append(f"({or_clauses})")
         for domain in _participants_domains:
-            parameters.append(_to_domain_suffix_pattern(domain))
+            parameters.extend(sender_domain_params(domain))
             parameters.append(domain)
 
     if filters.sent_from:
@@ -1959,6 +2024,22 @@ def _normalize_domain_filter(
         stripped = value.strip()
         return [stripped] if stripped else []
     return [v.strip() for v in value if v.strip()]
+
+
+def sender_domain_sql(column: str) -> str:
+    """Sender-domain condition. Plain address rows keep the single suffix LIKE;
+    only packed values (contain ``<``) that also contain the domain reach the
+    Python verifier. Params: :func:`sender_domain_params`."""
+    return (
+        f"({column} LIKE ? ESCAPE '\\' "
+        f"OR ({column} LIKE '%<%' AND {column} LIKE ? ESCAPE '\\' "
+        f"AND sender_domain_match({column}, ?)))"
+    )
+
+
+def sender_domain_params(domain: str) -> list[object]:
+    bare = domain.lstrip("@")
+    return [_to_domain_suffix_pattern(domain), f"%@{_escape_like(bare)}%", bare]
 
 
 def _to_domain_suffix_pattern(domain: str) -> str:

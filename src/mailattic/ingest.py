@@ -30,6 +30,7 @@ from .storage import (
     connect_database,
     persist_message,
     record_ingest_failure,
+    stored_dedup_keys_at_locator,
 )
 
 
@@ -480,23 +481,42 @@ def retry_attachment_failures(
     recovered = still_failing = missing = 0
     for (pst_source, folder_path, locator), count in by_mail.items():
         relative = (locator or "")[len(folder_path or "") + 1 :]
-        message_path = folder_dir = None
-        # staging first; #256 quarantine second
+        message_path = folder_dir = source = None
+        unproven = False
+        # staging first; #256 quarantine second. #17: a file at the locator only
+        # counts when it is the stored mail of that locator (a reused UID or a
+        # pruned name can leave another mail there); otherwise it is "missing".
         for root_dirs in (folder_dirs, quarantine_dirs):
             candidate_dir = root_dirs.get(folder_path or "")
-            if candidate_dir and relative and (candidate_dir / relative).is_file():
+            if not (
+                candidate_dir and relative and (candidate_dir / relative).is_file()
+            ):
+                continue
+            candidate_source = MaildirSource(
+                path=candidate_dir,
+                account_email=account_email,
+                account_name=account_name,
+                folder_name=folder_path or "",
+                requested_from=account_root,
+            )
+            if _matches_stored_dedup_key(
+                connection,
+                candidate_source,
+                candidate_dir / relative,
+                pst_source,
+                locator,
+            ):
                 folder_dir, message_path = candidate_dir, candidate_dir / relative
+                source = candidate_source
                 break
-        if message_path is None or folder_dir is None:
-            missing += count
+            unproven = True
+        if message_path is None or folder_dir is None or source is None:
+            # a file exists but is not provably this mail: still owed, not missing
+            if unproven:
+                still_failing += count
+            else:
+                missing += count
             continue
-        source = MaildirSource(
-            path=folder_dir,
-            account_email=account_email,
-            account_name=account_name,
-            folder_name=folder_path or "",
-            requested_from=account_root,
-        )
         try:
             summary = import_maildir_message(
                 connection=connection,
@@ -550,7 +570,122 @@ def retry_attachment_failures(
                     f"quarantine cleanup failed for {locator}: {exc}",
                     file=sys.stderr,
                 )
-    return AttachmentRetryResult(recovered, still_failing, missing)
+    d_recovered, d_failing, d_missing = _retry_outbound_draft_failures(
+        connection, attachment_root
+    )
+    return AttachmentRetryResult(
+        recovered + d_recovered, still_failing + d_failing, missing + d_missing
+    )
+
+
+def _retry_outbound_draft_failures(
+    connection: sqlite3.Connection, attachment_root: Path
+) -> tuple[int, int, int]:
+    """#18: repair ``outbound:<draft_id>`` ledger entries from the retained draft.
+
+    Reads the draft .eml only (never SMTP, never the send-once marker). The draft
+    must carry the Message-ID of the stored mail; otherwise it is not a provable
+    source and the entry stays open. Filling goes through ``persist_message``'s
+    existing-message path, i.e. the same name+size+ledger evidence as a Sent copy.
+    """
+    from email import message_from_bytes, policy
+
+    from .outbound import _draft_dir, _normalized_from_draft
+
+    db_file = connection.execute("PRAGMA database_list").fetchone()[2]
+    if not db_file:
+        return 0, 0, 0
+    entries = connection.execute(
+        """
+        SELECT DISTINCT logical_locator FROM ingest_failures
+        WHERE resolved_at IS NULL
+          AND error_stage IN ('attachment-store', 'attachment-decode')
+          AND pst_source = 'outbound-bes' AND source_input_mode = 'outbound'
+          AND attachment_name IS NOT NULL
+          AND logical_locator LIKE 'outbound:%'
+        """
+    ).fetchall()
+    recovered = still_failing = missing = 0
+    for (locator,) in entries:
+        draft_id = locator[len("outbound:") :]
+        open_sql = (
+            "SELECT COUNT(*) FROM (SELECT DISTINCT attachment_name, attachment_size"
+            " FROM ingest_failures WHERE resolved_at IS NULL"
+            " AND error_stage IN ('attachment-store', 'attachment-decode')"
+            " AND attachment_name IS NOT NULL AND pst_source = 'outbound-bes'"
+            " AND logical_locator = ?)"
+        )
+        count = connection.execute(open_sql, [locator]).fetchone()[0]
+        draft_path = _draft_dir(db_file) / f"{draft_id}.eml"
+        if (
+            not draft_id
+            or "/" in draft_id
+            or "\\" in draft_id
+            or not draft_path.is_file()
+        ):
+            missing += count
+            continue
+        stored = connection.execute(
+            "SELECT message_id FROM messages WHERE pst_source = 'outbound-bes'"
+            " AND logical_locator = ?",
+            [locator],
+        ).fetchall()
+        try:
+            msg = message_from_bytes(draft_path.read_bytes(), policy=policy.default)
+            header_id = str(msg.get("Message-ID", "")).strip()
+            if len(stored) != 1 or not header_id or header_id != stored[0][0]:
+                still_failing += count
+                continue
+            normalized, _ = _normalized_from_draft(
+                msg, draft_id, header_id, db_file, attachment_root=attachment_root
+            )
+            persist_message(connection, normalized)
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            print(
+                f"attachment retry failed for {locator}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        remaining = connection.execute(open_sql, [locator]).fetchone()[0]
+        recovered += count - remaining
+        still_failing += remaining
+    return recovered, still_failing, missing
+
+
+def _matches_stored_dedup_key(
+    connection: sqlite3.Connection,
+    source: MaildirSource,
+    path: Path,
+    pst_source: str,
+    locator: str | None,
+) -> bool:
+    """#17: is *path* the mail the DB stored under (pst_source, locator)?
+
+    Conservative: two stored mails sharing one locator (legacy reused UID) or a
+    file that does not parse to the stored dedup key cannot be told apart, so
+    it is not a usable repair source. No stored mail yet = nothing to confuse.
+    """
+    keys = stored_dedup_keys_at_locator(connection, pst_source, locator)
+    if not keys:
+        return True
+    if len(keys) > 1:
+        return False
+    parsed = _parse_maildir_message(
+        source=source, message_path=path, attachment_root=None
+    )
+    if parsed.message is None:
+        return False
+    try:
+        fresh = build_normalized_message(
+            parsed.message.raw_message,
+            source=source,
+            folder_path=parsed.message.folder_path,
+            logical_locator=parsed.message.logical_locator,
+        )
+    except Exception:
+        return False  # identity unprovable: fail closed
+    return fresh.dedup_key == keys[0]
 
 
 def _local_folder_dirs(account_root: Path) -> dict[str, Path]:

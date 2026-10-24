@@ -647,3 +647,235 @@ def test_same_message_id_dedup_first_one_wins_untouched(
         assert att_rows[0]["attachment_name"] == "offer.pdf"
     finally:
         connection.close()
+
+
+def test_post_submit_cas_failure_leaves_placeholder_ledger_and_healthy_copy_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#18: a CAS failure after SMTP accept keeps a placeholder row plus an open
+    ledger entry, so a healthy Sent copy later fills the exact hash/path/size.
+    The send stays sent, SMTP is called once, and replay is idempotent.
+    """
+    from mailattic.attachment_store import write_attachment
+    from mailattic.models import NormalizedAttachment
+    from mailattic.quarantine import unresolved_attachment_failures
+
+    db_path = initialize_database(tmp_path / "mailattic.db")
+    seed_msg_id = _seed_message(db_path)
+    smtp_factory = _patch_smtp(monkeypatch)
+    _patch_imap_client(monkeypatch)
+    _auto_authorize(monkeypatch)
+
+    payload = b"contract payload"
+    attach_file = tmp_path / "contract.pdf"
+    attach_file.write_bytes(payload)
+    draft_res = _draft_reply(
+        db_path=db_path,
+        message_id=seed_msg_id,
+        attachments=[attach_file],
+    )
+
+    def _failing_write_attachment(*args, **kwargs):
+        raise OSError("Simulated disk error during CAS storage write")
+
+    monkeypatch.setattr(
+        "mailattic.outbound.write_attachment", _failing_write_attachment
+    )
+    send_res = send_draft(
+        draft_id=draft_res.draft_id,
+        database_path=db_path,
+        smtp_config=_smtp_config(),
+        env=_MATCHING_ENV,
+        fingerprint=draft_res.fingerprint,
+    )
+    sent_msg_id = send_res["message_id"]
+    assert _read_marker_status(db_path, sent_msg_id) == "sent"
+    assert smtp_factory.sendmail.call_count == 1
+
+    connection = connect_database(db_path)
+    try:
+        row = connection.execute(
+            "SELECT id, logical_locator FROM messages WHERE message_id = ?",
+            [sent_msg_id],
+        ).fetchone()
+        stored_id = int(row["id"])
+        att = connection.execute(
+            "SELECT attachment_name, content_hash, storage_path FROM"
+            " message_attachments WHERE message_id = ?",
+            [stored_id],
+        ).fetchall()
+        assert [
+            (a["attachment_name"], a["content_hash"], a["storage_path"]) for a in att
+        ] == [("contract.pdf", None, None)]
+        open_failures = unresolved_attachment_failures(connection)
+        assert len(open_failures) == 1
+        assert open_failures[0]["attachment_name"] == "contract.pdf"
+        assert open_failures[0]["attachment_size"] == len(payload)
+
+        # Healthy Sent copy arrives (same Message-ID, real CAS write).
+        record = write_attachment(
+            payload=payload,
+            original_name="contract.pdf",
+            mime_type="application/pdf",
+            store_root=resolve_store_root(db_path),
+        )
+        healthy = NormalizedMessage(
+            subject="Re: Inquiry about product",
+            sender=MailboxParticipant(display_name="Sean", email=SMTP_USER),
+            to_recipients=(),
+            cc_recipients=(),
+            bcc_recipients=(),
+            sent_at=datetime.now(tz=UTC),
+            received_at=datetime.now(tz=UTC),
+            body_text="x",
+            attachments=(
+                NormalizedAttachment(
+                    attachment_name="contract.pdf",
+                    content_hash=record.content_hash,
+                    size_bytes=record.size_bytes,
+                    mime_type=record.mime_type,
+                    storage_path=record.storage_path,
+                ),
+            ),
+            message_id=sent_msg_id,
+            in_reply_to=None,
+            references=None,
+            pst_source="imap:sean3808@mailattic.test:Sent",
+            folder_path="Sent",
+            logical_locator="imap:12345",
+            source_input_mode="maildir",
+            source_requested_from="test",
+        )
+        first = persist_message(connection, healthy)
+        assert first.inserted is False
+        assert first.recovered_attachments == 1
+        filled = connection.execute(
+            "SELECT content_hash, storage_path, size_bytes FROM message_attachments"
+            " WHERE message_id = ?",
+            [stored_id],
+        ).fetchone()
+        assert filled["content_hash"] == record.content_hash
+        assert filled["storage_path"] == record.storage_path
+        assert filled["size_bytes"] == len(payload)
+        assert unresolved_attachment_failures(connection) == []
+        assert persist_message(connection, healthy).recovered_attachments == 0
+    finally:
+        connection.close()
+
+
+def _send_with_failing_cas(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Send a one-attachment reply whose post-submit CAS write fails (#18)."""
+    db_path = initialize_database(tmp_path / "mailattic.db")
+    seed_msg_id = _seed_message(db_path)
+    smtp = _patch_smtp(monkeypatch)
+    _patch_imap_client(monkeypatch)
+    _auto_authorize(monkeypatch)
+    payload = b"draft retry payload"
+    attach_file = tmp_path / "contract.pdf"
+    attach_file.write_bytes(payload)
+    draft_res = _draft_reply(
+        db_path=db_path, message_id=seed_msg_id, attachments=[attach_file]
+    )
+    with monkeypatch.context() as m:
+
+        def _fail(*args, **kwargs):
+            raise OSError("Simulated disk error during CAS storage write")
+
+        m.setattr("mailattic.outbound.write_attachment", _fail)
+        send_res = send_draft(
+            draft_id=draft_res.draft_id,
+            database_path=db_path,
+            smtp_config=_smtp_config(),
+            env=_MATCHING_ENV,
+            fingerprint=draft_res.fingerprint,
+        )
+    return db_path, draft_res.draft_id, send_res["message_id"], payload, smtp
+
+
+def _run_retry(db_path: Path, tmp_path: Path):
+    from mailattic.ingest import retry_attachment_failures
+
+    connection = connect_database(db_path)
+    try:
+        return retry_attachment_failures(
+            connection=connection,
+            maildir_root=tmp_path / "maildir",
+            account_name="acct",
+            account_email=SMTP_USER,
+            attachment_root=resolve_store_root(db_path),
+        )
+    finally:
+        connection.close()
+
+
+def test_attachment_retry_repairs_outbound_failure_from_retained_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#18: with no Sent copy at all, the standard retry reads the retained draft,
+    fills the placeholder with byte-equal CAS content, resolves the ledger, is
+    idempotent, and never touches SMTP or the send-once marker.
+    """
+    db_path, _draft_id, sent_msg_id, payload, smtp = _send_with_failing_cas(
+        tmp_path, monkeypatch
+    )
+    marker_before = _marker_path(db_path, sent_msg_id).read_bytes()
+
+    first = _run_retry(db_path, tmp_path)
+    assert (first.recovered, first.still_failing, first.source_missing) == (1, 0, 0)
+    connection = connect_database(db_path)
+    try:
+        row = connection.execute(
+            "SELECT a.content_hash, a.storage_path, a.size_bytes FROM"
+            " message_attachments a JOIN messages m ON m.id = a.message_id"
+            " WHERE m.message_id = ?",
+            [sent_msg_id],
+        ).fetchone()
+        assert row["size_bytes"] == len(payload)
+        assert (
+            read_attachment(row["storage_path"], resolve_store_root(db_path)) == payload
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM ingest_failures WHERE resolved_at IS NULL"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+    second = _run_retry(db_path, tmp_path)
+    assert (second.recovered, second.still_failing, second.source_missing) == (0, 0, 0)
+    assert smtp.sendmail.call_count == 1
+    assert _marker_path(db_path, sent_msg_id).read_bytes() == marker_before
+
+
+def test_attachment_retry_missing_draft_is_source_missing_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path, draft_id, sent_msg_id, _payload, _smtp = _send_with_failing_cas(
+        tmp_path, monkeypatch
+    )
+    (db_path.parent / "outbound" / "drafts" / f"{draft_id}.eml").unlink()
+
+    result = _run_retry(db_path, tmp_path)
+    assert (result.recovered, result.still_failing, result.source_missing) == (0, 0, 1)
+    connection = connect_database(db_path)
+    try:
+        row = connection.execute(
+            "SELECT a.content_hash FROM message_attachments a JOIN messages m"
+            " ON m.id = a.message_id WHERE m.message_id = ?",
+            [sent_msg_id],
+        ).fetchone()
+        assert row["content_hash"] is None
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM ingest_failures WHERE resolved_at IS NULL"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        connection.close()
+    assert not (resolve_store_root(db_path)).exists() or not any(
+        p.is_file() for p in resolve_store_root(db_path).rglob("*")
+    )
