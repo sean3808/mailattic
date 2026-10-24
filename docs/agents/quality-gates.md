@@ -35,7 +35,10 @@ isolated leaves below the ignored `.project-runtime/` root, removes any
 inherited `PYTEST_ADDOPTS` (pytest appends it to its own command line, so it
 would otherwise extend the exact argument vector below), serializes
 concurrent runs behind one cross-process lock (a second concurrent launch
-exits 17 without touching uv or pytest output), and rejects a runtime root
+exits 17 without touching uv or pytest output; the lock file under
+`.project-runtime\locks\` stays on disk when nobody holds it, so test for a
+held lock by launching and checking for exit 17, not by checking that the file
+exists), and rejects a runtime root
 whose volume cannot be established with exit 18 before uv or pytest ever
 starts. See `scripts\project-tool-environment.ps1` for the shared
 implementation.
