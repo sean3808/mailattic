@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .cjk_segmentation import _is_cjk, segment_cjk
 from .datetime_bounds import coerce_to_taipei_aware
-from .identity import compute_direction, extract_address, resolve_self_addresses
+from .identity import compute_direction, resolve_self_addresses
 from .storage import SYNC_STATE_KEY, connect_database
 
 # ---------------------------------------------------------------------------
@@ -1450,7 +1450,6 @@ def search_messages(
 
     query = "\n".join(query_parts)
     connection = connect_database(database_path, create=False, read_only=read_only)
-    register_sender_match_functions(connection)
     try:
         try:
             rows = connection.execute(query, parameters).fetchall()
@@ -1615,7 +1614,6 @@ def search_attachments(
     )
 
     connection = connect_database(database_path, create=False, read_only=read_only)
-    register_sender_match_functions(connection)
     try:
         if attachment_ext is not None:
             connection.create_function(
@@ -2026,30 +2024,6 @@ def _normalize_domain_filter(
         stripped = value.strip()
         return [stripped] if stripped else []
     return [v.strip() for v in value if v.strip()]
-
-
-def _sender_domain_match(sender: str | None, domain: str | None) -> int:
-    """True when the address in a (possibly packed ``Name<addr>``) sender ends
-    with ``@domain`` -- same address rule as ``compute_direction`` (#23)."""
-    if not sender or not domain:
-        return 0
-    suffix = "@" + domain.strip().lstrip("@").lower()
-    return 1 if extract_address(sender).endswith(suffix) else 0
-
-
-def _sender_address_match(sender: str | None, address: str | None) -> int:
-    if not sender or not address:
-        return 0
-    return 1 if extract_address(sender) == extract_address(address) else 0
-
-
-def register_sender_match_functions(connection: sqlite3.Connection) -> None:
-    connection.create_function(
-        "sender_domain_match", 2, _sender_domain_match, deterministic=True
-    )
-    connection.create_function(
-        "sender_address_match", 2, _sender_address_match, deterministic=True
-    )
 
 
 def sender_domain_sql(column: str) -> str:

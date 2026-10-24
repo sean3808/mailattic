@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .cjk_segmentation import segment_cjk
+from .identity import extract_address
 from .models import IngestFailure, NormalizedMessage
 from .schema import SCHEMA_SQL
 
@@ -38,6 +39,21 @@ def _recipient_domain_match(recipient_text: str | None, domain: str | None) -> i
         return 0
     pattern = "@" + re.escape(normalized_domain) + r"(?![\w.-])"
     return 1 if re.search(pattern, recipient_text, re.IGNORECASE) else 0
+
+
+def _sender_domain_match(sender: str | None, domain: str | None) -> int:
+    """True when the address in a (possibly packed ``Name<addr>``) sender ends
+    with ``@domain`` -- same address rule as ``compute_direction`` (#23)."""
+    if not sender or not domain:
+        return 0
+    suffix = "@" + domain.strip().lstrip("@").lower()
+    return 1 if extract_address(sender).endswith(suffix) else 0
+
+
+def _sender_address_match(sender: str | None, address: str | None) -> int:
+    if not sender or not address:
+        return 0
+    return 1 if extract_address(sender) == extract_address(address) else 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +103,14 @@ def connect_database(
     # match -- see design.md > "Failure modes".
     connection.create_function(
         "recipient_domain_match", 2, _recipient_domain_match, deterministic=True
+    )
+    # Same contract for sender selectors (sender_domain_sql in query.py and the
+    # contact selector in contact_history.py): see through packed Name<addr>.
+    connection.create_function(
+        "sender_domain_match", 2, _sender_domain_match, deterministic=True
+    )
+    connection.create_function(
+        "sender_address_match", 2, _sender_address_match, deterministic=True
     )
     return connection
 

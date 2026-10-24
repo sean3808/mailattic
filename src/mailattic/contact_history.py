@@ -16,7 +16,6 @@ from .datetime_bounds import (
 from .identity import compute_direction, extract_address, resolve_self_addresses
 from .query import (
     _to_like_pattern,
-    register_sender_match_functions,
     sender_domain_params,
     sender_domain_sql,
 )
@@ -70,7 +69,6 @@ def aggregate_contact_history(
     parsed_date_to = parse_date_bound(normalized_date_to, parameter_name="date_to")
 
     conn = connect_database(database_path, create=False, read_only=read_only)
-    register_sender_match_functions(conn)
     try:
         # Deferred BEGIN: the first SELECT pins one WAL read snapshot for the
         # whole aggregation (#25) without blocking a concurrent sync writer.

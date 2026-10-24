@@ -263,9 +263,6 @@ class _ReadOnlyProbeConnection:
                 self.write_error = exc
         return self._connection.execute(sql, parameters)
 
-    def create_function(self, *args: object, **kwargs: object) -> None:
-        self._connection.create_function(*args, **kwargs)  # type: ignore[arg-type]
-
     def close(self) -> None:
         self._connection.close()
 
