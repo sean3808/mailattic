@@ -431,6 +431,7 @@ def test_write_rfc822_to_maildir_creates_file_in_new(tmp_path: Path) -> None:
         account_name="acct",
         folder_name="INBOX",
         uid=7,
+        uidvalidity=1,
         rfc822=rfc822,
     )
     assert out.parent.name == "new"
@@ -444,6 +445,7 @@ def test_write_rfc822_to_maildir_no_tmp_leftover(tmp_path: Path) -> None:
         account_name="acct",
         folder_name="INBOX",
         uid=3,
+        uidvalidity=1,
         rfc822=b"data",
     )
     tmp_file = tmp_path / "maildir" / "acct" / "INBOX" / "tmp" / "uid-3.eml"
@@ -458,6 +460,7 @@ def test_write_rfc822_to_maildir_is_idempotent(tmp_path: Path) -> None:
         account_name="acct",
         folder_name="INBOX",
         uid=1,
+        uidvalidity=1,
         rfc822=b"v1",
     )
     write_rfc822_to_maildir(
@@ -465,6 +468,7 @@ def test_write_rfc822_to_maildir_is_idempotent(tmp_path: Path) -> None:
         account_name="acct",
         folder_name="INBOX",
         uid=1,
+        uidvalidity=1,
         rfc822=b"v1",
     )
     new_dir = maildir / "acct" / "INBOX" / "new"
@@ -483,13 +487,16 @@ def test_write_rfc822_to_maildir_keeps_old_raw_when_uid_is_reused(
         "folder_name": "INBOX",
         "uid": 1,
     }
-    write_rfc822_to_maildir(rfc822=b"old", **kwargs)
-    reused = write_rfc822_to_maildir(rfc822=b"new", **kwargs)
-    again = write_rfc822_to_maildir(rfc822=b"new", **kwargs)
+    write_rfc822_to_maildir(rfc822=b"old", uidvalidity=100, **kwargs)
+    reused = write_rfc822_to_maildir(rfc822=b"new", uidvalidity=200, **kwargs)
+    again = write_rfc822_to_maildir(rfc822=b"new", uidvalidity=200, **kwargs)
     new_dir = maildir / "acct" / "INBOX" / "new"
     assert (new_dir / "uid-1.eml").read_bytes() == b"old"
-    assert reused != new_dir / "uid-1.eml"
-    assert reused == again
+    assert reused == again == new_dir / "uid-1.v200.eml"
+    assert reused.read_bytes() == b"new"
+    # even the generation name is taken by other bytes: hash suffix fallback
+    third = write_rfc822_to_maildir(rfc822=b"third", uidvalidity=200, **kwargs)
+    assert third.name.startswith("uid-1.v200.") and third.name != reused.name
     assert reused.read_bytes() == b"new"
 
 

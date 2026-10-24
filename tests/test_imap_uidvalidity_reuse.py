@@ -17,6 +17,7 @@ import pytest
 
 from mailattic import attachment_store
 from mailattic.imap_native import NativeImapClient, sync_native
+from mailattic.imap_state import _held_uid
 from mailattic.storage import initialize_database
 from tests.test_imap_native import _TEST_ENV, _MockImapConn
 
@@ -121,6 +122,14 @@ def test_reused_uid_repairs_each_mail_independently(
     assert hashes[OLD] is not None
     assert hashes[NEW] is not None
     assert box.open_failures() == 0
+    with sqlite3.connect(box.db) as c:
+        c.row_factory = sqlite3.Row
+        locator = c.execute(
+            "SELECT logical_locator FROM messages WHERE message_id = ?", [NEW]
+        ).fetchone()[0]
+        # the generation is in the locator, and the UID still reads from it
+        assert locator == "INBOX/new/uid-1.v200.eml"
+        assert _held_uid(c, "user@example.com", "INBOX") == 1
 
 
 def test_legacy_shared_locator_settles_nothing_and_keeps_the_raw(
