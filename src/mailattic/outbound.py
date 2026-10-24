@@ -2109,11 +2109,13 @@ def _normalized_from_draft(
     draft_id: str,
     message_id: str,
     database_path: Path | str,
+    attachment_root: Path | None = None,
 ) -> tuple[NormalizedMessage, list[IngestFailure]]:
-    attachment_root = resolve_store_root(
-        Path(database_path),
-        env_override=os.environ.get("MAILATTIC_ATTACHMENT_ROOT"),
-    )
+    if attachment_root is None:
+        attachment_root = resolve_store_root(
+            Path(database_path),
+            env_override=os.environ.get("MAILATTIC_ATTACHMENT_ROOT"),
+        )
     failures: list[IngestFailure] = []
     attachments = _extract_draft_attachments(
         msg, attachment_root, draft_id, message_id, failures

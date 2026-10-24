@@ -762,3 +762,120 @@ def test_post_submit_cas_failure_leaves_placeholder_ledger_and_healthy_copy_reco
         assert persist_message(connection, healthy).recovered_attachments == 0
     finally:
         connection.close()
+
+
+def _send_with_failing_cas(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Send a one-attachment reply whose post-submit CAS write fails (#18)."""
+    db_path = initialize_database(tmp_path / "mailattic.db")
+    seed_msg_id = _seed_message(db_path)
+    smtp = _patch_smtp(monkeypatch)
+    _patch_imap_client(monkeypatch)
+    _auto_authorize(monkeypatch)
+    payload = b"draft retry payload"
+    attach_file = tmp_path / "contract.pdf"
+    attach_file.write_bytes(payload)
+    draft_res = _draft_reply(
+        db_path=db_path, message_id=seed_msg_id, attachments=[attach_file]
+    )
+    with monkeypatch.context() as m:
+
+        def _fail(*args, **kwargs):
+            raise OSError("Simulated disk error during CAS storage write")
+
+        m.setattr("mailattic.outbound.write_attachment", _fail)
+        send_res = send_draft(
+            draft_id=draft_res.draft_id,
+            database_path=db_path,
+            smtp_config=_smtp_config(),
+            env=_MATCHING_ENV,
+            fingerprint=draft_res.fingerprint,
+        )
+    return db_path, draft_res.draft_id, send_res["message_id"], payload, smtp
+
+
+def _run_retry(db_path: Path, tmp_path: Path):
+    from mailattic.ingest import retry_attachment_failures
+
+    connection = connect_database(db_path)
+    try:
+        return retry_attachment_failures(
+            connection=connection,
+            maildir_root=tmp_path / "maildir",
+            account_name="acct",
+            account_email=SMTP_USER,
+            attachment_root=resolve_store_root(db_path),
+        )
+    finally:
+        connection.close()
+
+
+def test_attachment_retry_repairs_outbound_failure_from_retained_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#18: with no Sent copy at all, the standard retry reads the retained draft,
+    fills the placeholder with byte-equal CAS content, resolves the ledger, is
+    idempotent, and never touches SMTP or the send-once marker.
+    """
+    db_path, _draft_id, sent_msg_id, payload, smtp = _send_with_failing_cas(
+        tmp_path, monkeypatch
+    )
+    marker_before = _marker_path(db_path, sent_msg_id).read_bytes()
+
+    first = _run_retry(db_path, tmp_path)
+    assert (first.recovered, first.still_failing, first.source_missing) == (1, 0, 0)
+    connection = connect_database(db_path)
+    try:
+        row = connection.execute(
+            "SELECT a.content_hash, a.storage_path, a.size_bytes FROM"
+            " message_attachments a JOIN messages m ON m.id = a.message_id"
+            " WHERE m.message_id = ?",
+            [sent_msg_id],
+        ).fetchone()
+        assert row["size_bytes"] == len(payload)
+        assert (
+            read_attachment(row["storage_path"], resolve_store_root(db_path)) == payload
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM ingest_failures WHERE resolved_at IS NULL"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+    second = _run_retry(db_path, tmp_path)
+    assert (second.recovered, second.still_failing, second.source_missing) == (0, 0, 0)
+    assert smtp.sendmail.call_count == 1
+    assert _marker_path(db_path, sent_msg_id).read_bytes() == marker_before
+
+
+def test_attachment_retry_missing_draft_is_source_missing_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path, draft_id, sent_msg_id, _payload, _smtp = _send_with_failing_cas(
+        tmp_path, monkeypatch
+    )
+    (db_path.parent / "outbound" / "drafts" / f"{draft_id}.eml").unlink()
+
+    result = _run_retry(db_path, tmp_path)
+    assert (result.recovered, result.still_failing, result.source_missing) == (0, 0, 1)
+    connection = connect_database(db_path)
+    try:
+        row = connection.execute(
+            "SELECT a.content_hash FROM message_attachments a JOIN messages m"
+            " ON m.id = a.message_id WHERE m.message_id = ?",
+            [sent_msg_id],
+        ).fetchone()
+        assert row["content_hash"] is None
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM ingest_failures WHERE resolved_at IS NULL"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        connection.close()
+    assert not (resolve_store_root(db_path)).exists() or not any(
+        p.is_file() for p in resolve_store_root(db_path).rglob("*")
+    )
