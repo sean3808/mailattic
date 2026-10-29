@@ -443,7 +443,8 @@ class OutlookComReader:
                 accessor = source_attachment.PropertyAccessor
                 try:
                     payload = _optional_property(accessor, PR_ATTACH_DATA_BIN)
-                    if not isinstance(payload, bytes | bytearray):
+                    # pywin32 hands PT_BINARY back as memoryview (#32).
+                    if not isinstance(payload, bytes | bytearray | memoryview):
                         raise TypeError("Attachment binary property is unavailable")
                     # Kept before the CAS write so a failed write still leaves the
                     # size that shared duplicate repair matches against.
