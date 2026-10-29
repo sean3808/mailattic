@@ -250,6 +250,7 @@ Cautions for extracting prices by hand:
 - An inline "we quote 250" with no unit or currency is easy to miss.
 - Amounts inside invoice numbers and bare numbers inside specs are not quotes.
 - Always attach the original snippet and its db_id to the report.
+- A doubled dot inside a value copied from the body (`example..com`, `user@example..com`, `1..5`) is usually dot-stuffing residue (the upstream mail server did not undo SMTP dot-stuffing, so a line starting with `.` was stored with an extra dot), not what the sender wrote: report the value with one dot and say the body shows two. Searching is unaffected (FTS splits on `.`, so `"example.com"` finds `example..com`); only copied values carry it.
 
 Report format:
 
@@ -392,6 +393,7 @@ Without this the user does not know which candidates you already visited, and th
 ## Caveats
 - HTML cleaning is regex-based and may leave a few inline styles
 - Quotes are extracted by hand from the original text (easy to miss currency-less wording; do not take invoice numbers for quotes)
+- (When it applies) values shown with a doubled dot in the body were reported with one dot (dot-stuffing residue)
 - DB cutoff is `SELECT MAX(sent_at) FROM messages`
 ```
 

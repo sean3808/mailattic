@@ -32,6 +32,12 @@
 - **Avoid**: IMAP 型, 線上版, 即時版
 - **Why**: Same as [[archive-backed]]; the pair keeps "freshness" and "acting on the server" recognisable as the other category's job rather than a gap in this one. Owner: Sean (2026-10-19); source: [#3](https://github.com/sean3808/mailattic/issues/3).
 
+### Dot-stuffing residue (點號殘留)
+
+- **Definition**: An extra leading `.` left in a stored message body because the upstream mail server did not undo SMTP dot-stuffing on receipt (RFC 5321 §4.5.2): a body line that starts with `.` is stored with one more. It shows up wherever a line break falls just before a dot, so domains, addresses and decimals can read `example..com`, `user@example..com`, `1..5`. The stored body is kept as received; the residue is a property of the source data, not a defect in how mailattic stores or searches it.
+- **Avoid**: 亂碼, 資料損毀 (overstates it: one byte per affected line, recoverable by eye), double dot bug (implies a mailattic bug), unstuffing (names a fix the platform deliberately does not apply)
+- **Why**: Two decisions hang on the term. Stored bodies are not rewritten, because they are evidence of the server fault and mail that reached the store without passing SMTP was never stuffed, so a blanket removal would corrupt it. Search needs no compensation, because keyword search splits on `.` and `example.com` already finds `example..com` (2026-10-29 production read-only probe: 312 of 312). What remains is a reading duty: a value copied out of a body may carry the residue. Owner: Sean (2026-10-29, `#10`); SoT: the copy-out caution in `skills/mailattic/references/capability-b-find.md`; source: [#10](https://github.com/sean3808/mailattic/issues/10).
+
 ---
 
 ## Mechanisms this platform invented (scope: mechanism)
