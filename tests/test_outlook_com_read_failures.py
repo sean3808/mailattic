@@ -260,14 +260,17 @@ def test_unreadable_attachment_bytes_keep_size_unknown(tmp_path: Path) -> None:
 
 def test_memoryview_attachment_bytes_are_stored(tmp_path: Path) -> None:
     # #32: pywin32 returns PT_BINARY properties as memoryview, not bytes.
-    from mailattic.outlook_pst import OutlookComReader as Reader
+    summary = _import_again(tmp_path, _pdf_item(data=memoryview(b"healthy PDF bytes")))
 
-    item = _pdf_item(data=memoryview(b"healthy PDF bytes"))
-    reader = Reader(attachment_root=tmp_path / "attachments")
-    extracted = reader._read_attachments(item.Attachments)
-    assert "_decode_error" not in extracted[0]
-    assert extracted[0]["size_bytes"] == len(b"healthy PDF bytes")
-    assert extracted[0]["content_hash"] and extracted[0]["storage_path"]
+    assert summary.imported_messages == 1
+    assert summary.failure_count == 0
+    rows, _ = _attachment_state(tmp_path)
+    assert len(rows) == 1
+    name, size, content_hash, storage_path = rows[0]
+    assert (name, size) == ("quote.pdf", len(b"healthy PDF bytes"))
+    assert content_hash and storage_path
+    with connect_database(tmp_path / "data.db", read_only=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM ingest_failures").fetchone()[0] == 0
 
 
 def test_zero_attachment_count_adds_no_failure(tmp_path: Path) -> None:
