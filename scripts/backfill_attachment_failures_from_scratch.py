@@ -21,12 +21,14 @@ unexpected error while planning stops the run before anything is written, and
 ``--confirm`` writes only when the plan has exactly ``--expect-fillable`` fills
 (137 on that copy). Any odd input either stops planning or moves the count.
 
-A fill writes the bytes into production's attachment store, then sets the
-placeholder row's hash / size / MIME type / path and marks the ledger row
-resolved in one transaction, rolled back and the run stopped unless each update
-hits exactly one row. Earlier fills stay; a re-run skips them. Scratch DBs are
-only read. Counts and ledger row ids are printed (ids are needed to abandon the
-rest by hand); no attachment names or content.
+With ``--confirm`` the production write lock is taken before planning and held
+to the commit, so nothing can change between the plan and the write, and all
+fills land in one transaction or none do. A fill writes the bytes into
+production's attachment store, sets the placeholder row's hash / size / MIME
+type / path and marks the ledger row resolved; the whole run rolls back unless
+each update hits exactly one row. Scratch DBs are only read. Counts and ledger
+row ids are printed (ids are needed to abandon the rest by hand); no attachment
+names or content.
 
 Usage:
     uv run python scripts/backfill_attachment_failures_from_scratch.py
@@ -80,7 +82,6 @@ class Scratch:
 @dataclass(frozen=True, slots=True)
 class Fill:
     failure_id: int
-    message_db_id: int
     attachment_id: int
     name: str
     payload: bytes
@@ -236,63 +237,40 @@ def _plan_one(
         return "scratch file missing or unreadable"
     if hashlib.sha256(payload).hexdigest() != expected_hash:
         return "scratch file does not match its hash"
-    return Fill(failure_id, db_id, attachment_id, stored_name, payload, mime_type)
+    return Fill(failure_id, attachment_id, stored_name, payload, mime_type)
 
 
 def apply_plan(
     production: sqlite3.Connection, fills: list[Fill], store_root: Path
 ) -> int:
-    filled = 0
+    """Write every fill inside the caller's open transaction; the caller commits."""
     for fill in fills:
         record = write_attachment(fill.payload, fill.name, fill.mime_type, store_root)
-        # Every condition the plan matched on is re-checked at write time.
-        try:
-            with production:
-                attachment_rows = production.execute(
-                    """
-                    UPDATE message_attachments
-                    SET content_hash = ?, size_bytes = ?, mime_type = ?,
-                        storage_path = ?
-                    WHERE id = ? AND message_id = ? AND attachment_name = ?
-                      AND content_hash IS NULL AND storage_path IS NULL
-                    """,
-                    [
-                        record.content_hash,
-                        record.size_bytes,
-                        record.mime_type,
-                        record.storage_path,
-                        fill.attachment_id,
-                        fill.message_db_id,
-                        fill.name,
-                    ],
-                ).rowcount
-                ledger_rows = production.execute(
-                    """
-                    UPDATE ingest_failures SET resolved_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND resolved_at IS NULL
-                      AND error_stage = 'attachment-decode'
-                      AND attachment_name IS NULL AND substr(created_at, 1, 10) = ?
-                      AND EXISTS (
-                        SELECT 1 FROM messages m WHERE m.id = ?
-                          AND m.pst_source = ingest_failures.pst_source
-                          AND m.logical_locator IS ingest_failures.logical_locator
-                      )
-                    """,
-                    [fill.failure_id, BATCH_DAY, fill.message_db_id],
-                ).rowcount
-                if (attachment_rows, ledger_rows) != (1, 1):
-                    raise _RowsChanged
-        except _RowsChanged:
+        attachment_rows = production.execute(
+            """
+            UPDATE message_attachments
+            SET content_hash = ?, size_bytes = ?, mime_type = ?, storage_path = ?
+            WHERE id = ? AND content_hash IS NULL AND storage_path IS NULL
+            """,
+            [
+                record.content_hash,
+                record.size_bytes,
+                record.mime_type,
+                record.storage_path,
+                fill.attachment_id,
+            ],
+        ).rowcount
+        ledger_rows = production.execute(
+            "UPDATE ingest_failures SET resolved_at = CURRENT_TIMESTAMP"
+            " WHERE id = ? AND resolved_at IS NULL",
+            [fill.failure_id],
+        ).rowcount
+        if (attachment_rows, ledger_rows) != (1, 1):
             raise ValueError(
-                f"ledger id {fill.failure_id} changed since planning; that fill"
-                f" was rolled back after {filled} fill(s)"
-            ) from None
-        filled += 1
-    return filled
-
-
-class _RowsChanged(Exception):
-    pass
+                f"ledger id {fill.failure_id}: update hit"
+                f" {attachment_rows}/{ledger_rows} rows; nothing was written"
+            )
+    return len(fills)
 
 
 def print_report(plan: Plan) -> None:
@@ -332,6 +310,8 @@ def run(
         try:
             if confirm:
                 production.execute("PRAGMA busy_timeout = 30000;")
+                # Held until the commit below; closing without it rolls back.
+                production.execute("BEGIN IMMEDIATE")
             plan = compute_plan(production, scratches)
             print_report(plan)
             if not confirm:
@@ -362,6 +342,7 @@ def run(
                 env_override=os.environ.get("MAILATTIC_ATTACHMENT_ROOT"),
             )
             filled = apply_plan(production, plan.fills, store_root)
+            production.commit()
             print(
                 f"[confirm] {filled} attachment(s) filled and ledger row(s) resolved."
             )

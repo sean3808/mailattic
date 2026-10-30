@@ -325,32 +325,55 @@ def test_unexpected_planning_error_stops_before_any_write(
     assert not (tmp_path / "backup.db").exists()
 
 
-@pytest.mark.parametrize(
-    "change",
-    [
-        "UPDATE ingest_failures SET resolved_at = 'elsewhere'",
-        "UPDATE message_attachments SET attachment_name = 'other.txt'",
-        "UPDATE ingest_failures SET created_at = '2026-06-01 09:00:00'",
-        "UPDATE ingest_failures SET logical_locator = 'Inbox/2'",
-    ],
-)
-def test_row_changed_after_planning_rolls_the_fill_back(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+def test_other_writers_are_locked_out_from_planning_to_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    production, scratch = _setup(tmp_path)
+    real_compute_plan = script_module.compute_plan
+    outcomes: list[str] = []
+
+    def plan_then_try_another_writer(con: sqlite3.Connection, scratches: object):
+        plan = real_compute_plan(con, scratches)
+        other = sqlite3.connect(production, timeout=0)
+        try:
+            other.execute("UPDATE message_attachments SET attachment_name = 'x'")
+            outcomes.append("written")
+        except sqlite3.OperationalError:
+            outcomes.append("locked")
+        finally:
+            other.close()
+        return plan
+
+    monkeypatch.setattr(script_module, "compute_plan", plan_then_try_another_writer)
+
+    assert _confirm(production, scratch, tmp_path, expect=1) == 0
+
+    assert outcomes == ["locked"]
+    assert _state(production)[0]["attachment_name"] == NAME
+
+
+def test_update_missing_its_row_rolls_back_the_whole_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     production, scratch = _setup(tmp_path)
     real_compute_plan = script_module.compute_plan
 
-    def plan_then_someone_resolves(con: sqlite3.Connection, scratches: object):
+    def plan_then_resolve_in_same_transaction(
+        con: sqlite3.Connection, scratches: object
+    ):
         plan = real_compute_plan(con, scratches)
-        con.execute(change)
-        con.commit()
+        con.execute("UPDATE ingest_failures SET resolved_at = 'elsewhere'")
         return plan
 
-    monkeypatch.setattr(script_module, "compute_plan", plan_then_someone_resolves)
+    monkeypatch.setattr(
+        script_module, "compute_plan", plan_then_resolve_in_same_transaction
+    )
 
     assert _confirm(production, scratch, tmp_path, expect=1) == 1
 
-    assert _state(production)[0]["storage_path"] is None
+    attachment, failure = _state(production)
+    assert attachment["storage_path"] is None
+    assert failure["resolved_at"] is None
 
 
 def test_database_given_as_scratch_is_refused(tmp_path: Path) -> None:
