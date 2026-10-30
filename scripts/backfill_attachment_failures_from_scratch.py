@@ -80,6 +80,7 @@ class Scratch:
 @dataclass(frozen=True, slots=True)
 class Fill:
     failure_id: int
+    message_db_id: int
     attachment_id: int
     name: str
     payload: bytes
@@ -235,7 +236,7 @@ def _plan_one(
         return "scratch file missing or unreadable"
     if hashlib.sha256(payload).hexdigest() != expected_hash:
         return "scratch file does not match its hash"
-    return Fill(failure_id, attachment_id, stored_name, payload, mime_type)
+    return Fill(failure_id, db_id, attachment_id, stored_name, payload, mime_type)
 
 
 def apply_plan(
@@ -244,6 +245,7 @@ def apply_plan(
     filled = 0
     for fill in fills:
         record = write_attachment(fill.payload, fill.name, fill.mime_type, store_root)
+        # Every condition the plan matched on is re-checked at write time.
         try:
             with production:
                 attachment_rows = production.execute(
@@ -251,7 +253,8 @@ def apply_plan(
                     UPDATE message_attachments
                     SET content_hash = ?, size_bytes = ?, mime_type = ?,
                         storage_path = ?
-                    WHERE id = ? AND content_hash IS NULL AND storage_path IS NULL
+                    WHERE id = ? AND message_id = ? AND attachment_name = ?
+                      AND content_hash IS NULL AND storage_path IS NULL
                     """,
                     [
                         record.content_hash,
@@ -259,12 +262,23 @@ def apply_plan(
                         record.mime_type,
                         record.storage_path,
                         fill.attachment_id,
+                        fill.message_db_id,
+                        fill.name,
                     ],
                 ).rowcount
                 ledger_rows = production.execute(
-                    "UPDATE ingest_failures SET resolved_at = CURRENT_TIMESTAMP"
-                    " WHERE id = ? AND resolved_at IS NULL",
-                    [fill.failure_id],
+                    """
+                    UPDATE ingest_failures SET resolved_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND resolved_at IS NULL
+                      AND error_stage = 'attachment-decode'
+                      AND attachment_name IS NULL AND substr(created_at, 1, 10) = ?
+                      AND EXISTS (
+                        SELECT 1 FROM messages m WHERE m.id = ?
+                          AND m.pst_source = ingest_failures.pst_source
+                          AND m.logical_locator IS ingest_failures.logical_locator
+                      )
+                    """,
+                    [fill.failure_id, BATCH_DAY, fill.message_db_id],
                 ).rowcount
                 if (attachment_rows, ledger_rows) != (1, 1):
                     raise _RowsChanged

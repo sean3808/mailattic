@@ -325,15 +325,24 @@ def test_unexpected_planning_error_stops_before_any_write(
     assert not (tmp_path / "backup.db").exists()
 
 
-def test_ledger_row_changed_after_planning_rolls_the_fill_back(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "change",
+    [
+        "UPDATE ingest_failures SET resolved_at = 'elsewhere'",
+        "UPDATE message_attachments SET attachment_name = 'other.txt'",
+        "UPDATE ingest_failures SET created_at = '2026-06-01 09:00:00'",
+        "UPDATE ingest_failures SET logical_locator = 'Inbox/2'",
+    ],
+)
+def test_row_changed_after_planning_rolls_the_fill_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
     production, scratch = _setup(tmp_path)
     real_compute_plan = script_module.compute_plan
 
     def plan_then_someone_resolves(con: sqlite3.Connection, scratches: object):
         plan = real_compute_plan(con, scratches)
-        con.execute("UPDATE ingest_failures SET resolved_at = 'elsewhere'")
+        con.execute(change)
         con.commit()
         return plan
 
