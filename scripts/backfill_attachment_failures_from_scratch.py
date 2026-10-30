@@ -10,9 +10,10 @@ where those attachments decoded. This script copies each one across.
 Per open legacy failure (name taken from the error message):
 production message by ``(pst_source, logical_locator)`` -> exactly one
 production attachment row with that name (case-insensitive), still empty ->
-scratch message by Message-ID, else dedup key -> scratch attachments with that
-name that carry stored content, all of one content hash -> scratch file bytes
-re-hashed against that hash. Anything else is skipped and reported by reason.
+scratch message by Message-ID, else dedup key -> exactly one scratch attachment
+with that name, carrying stored content -> scratch file bytes re-hashed against
+its hash. Anything else is skipped and reported by reason. Only failures
+recorded on the #30 batch day are candidates.
 
 A fill writes the bytes into production's attachment store, sets the
 placeholder row's hash / size / MIME type / path, and marks the ledger row
@@ -57,6 +58,8 @@ from mailattic.db_maintenance import backup_database  # noqa: E402
 from mailattic.storage import connect_database  # noqa: E402
 
 _NAME_IN_MESSAGE = re.compile(r":\s*(.+)$")
+# The import batch #30 covers (UTC day of created_at); nothing else is touched.
+BATCH_DAY = "2026-05-27"
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,9 +110,10 @@ def compute_plan(production: sqlite3.Connection, scratches: dict[str, Scratch]) 
         """
         SELECT id, pst_source, logical_locator, error_message FROM ingest_failures
         WHERE error_stage = 'attachment-decode' AND resolved_at IS NULL
-          AND attachment_name IS NULL
+          AND attachment_name IS NULL AND substr(created_at, 1, 10) = ?
         ORDER BY id
-        """
+        """,
+        [BATCH_DAY],
     ).fetchall()
     failures = [f for f in failures if pst_basename(f[1] or "") in scratches]
     # One pass over messages: there is no (pst_source, logical_locator) index and
@@ -191,21 +195,24 @@ def _plan_one(
     if len(scratch_ids) > 1:
         return "several scratch messages"
 
-    # content hash -> (storage path, MIME type) of the stored same-name attachments
-    contents = {
-        row[1]: (row[3], row[4])
+    same_name = [
+        row
         for row in scratch.connection.execute(
             "SELECT attachment_name, content_hash, size_bytes, storage_path, mime_type"
             " FROM message_attachments WHERE message_id = ?",
             [scratch_ids[0]],
         )
-        if (row[0] or "").casefold() == name and row[1] and row[2] and row[3]
-    }
-    if not contents:
-        return "no scratch attachment with content"
-    if len(contents) > 1:
-        return "scratch attachments differ"
-    ((expected_hash, (scratch_path, mime_type)),) = contents.items()
+        if (row[0] or "").casefold() == name
+    ]
+    # Like production, the name must be unique: with two same-name parts there
+    # is no proof which one the empty placeholder stood for.
+    if not same_name:
+        return "no scratch attachment row"
+    if len(same_name) > 1:
+        return "scratch attachment name not unique"
+    _name, expected_hash, size, scratch_path, mime_type = same_name[0]
+    if not (expected_hash and size and scratch_path):
+        return "scratch attachment has no content"
     try:
         payload = read_attachment(scratch_path, scratch.store_root)
     except AttachmentStoreError:
@@ -264,6 +271,9 @@ def run(
 ) -> int:
     if not database.exists():
         print(f"[error] Database not found: {database}", file=sys.stderr)
+        return 1
+    if any(database.resolve() == path.resolve() for path in scratch_paths):
+        print("[error] --database is also given as --scratch.", file=sys.stderr)
         return 1
     scratches: dict[str, Scratch] = {}
     try:
