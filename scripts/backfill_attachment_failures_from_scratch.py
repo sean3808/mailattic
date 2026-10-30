@@ -49,7 +49,6 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from mailattic.attachment_store import (  # noqa: E402
-    AttachmentStoreError,
     read_attachment,
     resolve_store_root,
     write_attachment,
@@ -215,8 +214,8 @@ def _plan_one(
         return "scratch attachment has no content"
     try:
         payload = read_attachment(scratch_path, scratch.store_root)
-    except AttachmentStoreError:
-        return "scratch file missing"
+    except OSError:  # includes AttachmentStoreError (file absent)
+        return "scratch file missing or unreadable"
     if hashlib.sha256(payload).hexdigest() != expected_hash:
         return "scratch file does not match its hash"
     return Fill(failure_id, attachment_id, stored_name, payload, mime_type)
@@ -279,6 +278,9 @@ def run(
     try:
         for path in scratch_paths:
             name, scratch = open_scratch(path)
+            if name in scratches:
+                scratch.connection.close()
+                raise ValueError(f"two --scratch DBs hold the same PST ({path})")
             scratches[name] = scratch
         production = connect_database(database, read_only=not confirm, create=False)
         try:

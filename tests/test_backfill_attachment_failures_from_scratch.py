@@ -18,6 +18,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import backfill_attachment_failures_from_scratch as script_module  # noqa: E402
 from backfill_attachment_failures_from_scratch import run  # noqa: E402
 
 from mailattic.attachment_store import read_attachment, write_attachment  # noqa: E402
@@ -236,6 +237,31 @@ def test_failure_outside_the_batch_day_is_not_a_candidate(
 
     assert "candidates: 0" in capsys.readouterr().out
     assert _state(production)[1]["resolved_at"] is None
+
+
+def test_two_scratch_dbs_of_the_same_pst_are_refused(tmp_path: Path) -> None:
+    production, scratch = _setup(tmp_path)
+    twin = tmp_path / "twin.db"
+    twin.write_bytes(scratch.read_bytes())
+
+    assert run(production, [scratch, twin], confirm=False) == 1
+
+
+def test_unreadable_scratch_file_skips_only_that_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    production, scratch = _setup(tmp_path)
+
+    def unreadable(*_args: object) -> bytes:
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(script_module, "read_attachment", unreadable)
+
+    assert run(production, [scratch], confirm=False) == 0
+
+    assert "skipped (scratch file missing or unreadable): 1" in capsys.readouterr().out
 
 
 def test_database_given_as_scratch_is_refused(tmp_path: Path) -> None:
