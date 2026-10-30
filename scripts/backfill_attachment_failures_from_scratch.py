@@ -12,24 +12,34 @@ production message by ``(pst_source, logical_locator)`` -> exactly one
 production attachment row with that name (case-insensitive), still empty ->
 scratch message by Message-ID, else dedup key -> exactly one scratch attachment
 with that name, carrying stored content -> scratch file bytes re-hashed against
-its hash. Anything else is skipped and reported by reason. Only failures
-recorded on the #30 batch day are candidates.
+its hash. A record that fails one of these known checks is skipped and reported
+by reason. Only failures recorded on the #30 batch day are candidates.
 
-A fill writes the bytes into production's attachment store, sets the
-placeholder row's hash / size / MIME type / path, and marks the ledger row
-resolved, one transaction per failure. Scratch DBs are only read. Counts and
-ledger row ids are printed; no attachment names or content.
+Fail-closed, not hardened (#30 route decision after the review cap): the input
+is a fixed set already run end to end on a copy of production. So any
+unexpected error while planning stops the run before anything is written, and
+``--confirm`` writes only when the plan has exactly ``--expect-fillable`` fills
+(137 on that copy). Any odd input either stops planning or moves the count.
+
+A fill writes the bytes into production's attachment store, then sets the
+placeholder row's hash / size / MIME type / path and marks the ledger row
+resolved in one transaction, rolled back and the run stopped unless each update
+hits exactly one row. Earlier fills stay; a re-run skips them. Scratch DBs are
+only read. Counts and ledger row ids are printed (ids are needed to abandon the
+rest by hand); no attachment names or content.
 
 Usage:
     uv run python scripts/backfill_attachment_failures_from_scratch.py
         --database <path> --scratch <scratch.db> [--scratch ...]
-        [--confirm [--backup-path <path>] [--attachment-root <dir>]]
+        [--confirm --expect-fillable <n> [--backup-path <path>]
+         [--attachment-root <dir>]]
 
 Each scratch DB must hold exactly one PST; failures are paired with the scratch
 DB whose PST has the same file name.
 
-Exit codes: 0 — report printed / fill done; 1 — database missing, a scratch DB
-holding other than one PST, or pre-write backup failed.
+Exit codes: 0 — report printed / fill done; 1 — bad arguments, planning
+stopped, fill count not as expected, pre-write backup failed, or a fill found
+its rows changed since planning.
 """
 
 from __future__ import annotations
@@ -128,13 +138,20 @@ def compute_plan(production: sqlite3.Connection, scratches: dict[str, Scratch]) 
             )
     plan.candidates = len(failures)
     for failure_id, pst_source, locator, error_message in failures:
-        result = _plan_one(
-            production,
-            scratches[pst_basename(pst_source)],
-            failure_id,
-            by_location.get((pst_source, locator), []),
-            error_message,
-        )
+        try:
+            result = _plan_one(
+                production,
+                scratches[pst_basename(pst_source)],
+                failure_id,
+                by_location.get((pst_source, locator), []),
+                error_message,
+            )
+        except Exception as exc:
+            # Type only: the message may carry a path or name.
+            raise ValueError(
+                f"planning stopped at ledger id {failure_id}"
+                f" ({type(exc).__name__}); nothing was written"
+            ) from None
         if isinstance(result, Fill):
             plan.fills.append(result)
         else:
@@ -151,9 +168,9 @@ def _plan_one(
 ) -> Fill | str:
     """The fill for one failure, or the reason it is skipped."""
     match = _NAME_IN_MESSAGE.search(error_message or "")
-    if match is None:
+    name = match.group(1).strip().casefold() if match else ""
+    if not name:
         return "no attachment name in error message"
-    name = match.group(1).strip().casefold()
 
     if not messages:
         return "no production message"
@@ -227,30 +244,41 @@ def apply_plan(
     filled = 0
     for fill in fills:
         record = write_attachment(fill.payload, fill.name, fill.mime_type, store_root)
-        with production:
-            updated = production.execute(
-                """
-                UPDATE message_attachments
-                SET content_hash = ?, size_bytes = ?, mime_type = ?, storage_path = ?
-                WHERE id = ? AND content_hash IS NULL AND storage_path IS NULL
-                """,
-                [
-                    record.content_hash,
-                    record.size_bytes,
-                    record.mime_type,
-                    record.storage_path,
-                    fill.attachment_id,
-                ],
-            ).rowcount
-            if updated != 1:
-                continue
-            production.execute(
-                "UPDATE ingest_failures SET resolved_at = CURRENT_TIMESTAMP"
-                " WHERE id = ? AND resolved_at IS NULL",
-                [fill.failure_id],
-            )
+        try:
+            with production:
+                attachment_rows = production.execute(
+                    """
+                    UPDATE message_attachments
+                    SET content_hash = ?, size_bytes = ?, mime_type = ?,
+                        storage_path = ?
+                    WHERE id = ? AND content_hash IS NULL AND storage_path IS NULL
+                    """,
+                    [
+                        record.content_hash,
+                        record.size_bytes,
+                        record.mime_type,
+                        record.storage_path,
+                        fill.attachment_id,
+                    ],
+                ).rowcount
+                ledger_rows = production.execute(
+                    "UPDATE ingest_failures SET resolved_at = CURRENT_TIMESTAMP"
+                    " WHERE id = ? AND resolved_at IS NULL",
+                    [fill.failure_id],
+                ).rowcount
+                if (attachment_rows, ledger_rows) != (1, 1):
+                    raise _RowsChanged
+        except _RowsChanged:
+            raise ValueError(
+                f"ledger id {fill.failure_id} changed since planning; that fill"
+                f" was rolled back after {filled} fill(s)"
+            ) from None
         filled += 1
     return filled
+
+
+class _RowsChanged(Exception):
+    pass
 
 
 def print_report(plan: Plan) -> None:
@@ -265,9 +293,13 @@ def run(
     scratch_paths: list[Path],
     *,
     confirm: bool,
+    expect_fillable: int | None = None,
     attachment_root: Path | None = None,
     backup_path: Path | None = None,
 ) -> int:
+    if confirm and expect_fillable is None:
+        print("[error] --confirm needs --expect-fillable.", file=sys.stderr)
+        return 1
     if not database.exists():
         print(f"[error] Database not found: {database}", file=sys.stderr)
         return 1
@@ -291,6 +323,13 @@ def run(
             if not confirm:
                 print("[dry-run] no rows changed.")
                 return 0
+            if len(plan.fills) != expect_fillable:
+                print(
+                    f"[abort] {len(plan.fills)} fillable, expected {expect_fillable};"
+                    " no changes were made.",
+                    file=sys.stderr,
+                )
+                return 1
             if not plan.fills:
                 print("[confirm] nothing to fill.")
                 return 0
@@ -328,6 +367,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--scratch", type=Path, action="append", required=True)
     parser.add_argument("--confirm", action="store_true", help="Back up, then write.")
+    parser.add_argument(
+        "--expect-fillable",
+        type=int,
+        default=None,
+        help="Required with --confirm: write only if the plan has exactly this many.",
+    )
     parser.add_argument("--backup-path", type=Path, default=None)
     parser.add_argument("--attachment-root", type=Path, default=None)
     args = parser.parse_args(argv)
@@ -335,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         args.database,
         args.scratch,
         confirm=args.confirm,
+        expect_fillable=args.expect_fillable,
         attachment_root=args.attachment_root,
         backup_path=args.backup_path,
     )
