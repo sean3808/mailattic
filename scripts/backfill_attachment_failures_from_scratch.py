@@ -123,18 +123,19 @@ def compute_plan(production: sqlite3.Connection, scratches: dict[str, Scratch]) 
             by_location.setdefault((source, locator), []).append(
                 (db_id, message_id, dedup_key)
             )
+    plan.candidates = len(failures)
     for failure_id, pst_source, locator, error_message in failures:
-        plan.candidates += 1
-        reason = _plan_one(
+        result = _plan_one(
             production,
             scratches[pst_basename(pst_source)],
             failure_id,
             by_location.get((pst_source, locator), []),
             error_message,
-            plan,
         )
-        if reason is not None:
-            plan.skip(reason, failure_id)
+        if isinstance(result, Fill):
+            plan.fills.append(result)
+        else:
+            plan.skip(result, failure_id)
     return plan
 
 
@@ -144,17 +145,17 @@ def _plan_one(
     failure_id: int,
     messages: list[tuple[int, str | None, str]],
     error_message: str | None,
-    plan: Plan,
-) -> str | None:
+) -> Fill | str:
+    """The fill for one failure, or the reason it is skipped."""
     match = _NAME_IN_MESSAGE.search(error_message or "")
     if match is None:
         return "no attachment name in error message"
     name = match.group(1).strip().casefold()
 
-    if len(messages) != 1:
-        return (
-            "no production message" if not messages else "several production messages"
-        )
+    if not messages:
+        return "no production message"
+    if len(messages) > 1:
+        return "several production messages"
     db_id, message_id, dedup_key = messages[0]
 
     rows = [
@@ -166,12 +167,10 @@ def _plan_one(
         )
         if (row[1] or "").casefold() == name
     ]
-    if len(rows) != 1:
-        return (
-            "production attachment name not unique"
-            if rows
-            else "no production attachment row"
-        )
+    if not rows:
+        return "no production attachment row"
+    if len(rows) > 1:
+        return "production attachment name not unique"
     attachment_id, stored_name, content_hash, storage_path = rows[0]
     if content_hash is not None or storage_path is not None:
         return "production attachment already has content"
@@ -192,34 +191,28 @@ def _plan_one(
     if len(scratch_ids) > 1:
         return "several scratch messages"
 
+    # content hash -> (storage path, MIME type) of the stored same-name attachments
     contents = {
-        (row[1], row[2], row[3])
+        row[1]: (row[3], row[4])
         for row in scratch.connection.execute(
             "SELECT attachment_name, content_hash, size_bytes, storage_path, mime_type"
             " FROM message_attachments WHERE message_id = ?",
             [scratch_ids[0]],
         )
-        if (row[0] or "").casefold() == name and row[1] and row[3] and row[2]
+        if (row[0] or "").casefold() == name and row[1] and row[2] and row[3]
     }
-    hashes = {content[0] for content in contents}
-    if not hashes:
+    if not contents:
         return "no scratch attachment with content"
-    if len(hashes) > 1:
+    if len(contents) > 1:
         return "scratch attachments differ"
-    expected_hash, _size, scratch_path = sorted(contents)[0]
+    ((expected_hash, (scratch_path, mime_type)),) = contents.items()
     try:
         payload = read_attachment(scratch_path, scratch.store_root)
     except AttachmentStoreError:
         return "scratch file missing"
     if hashlib.sha256(payload).hexdigest() != expected_hash:
         return "scratch file does not match its hash"
-    mime_type = scratch.connection.execute(
-        "SELECT mime_type FROM message_attachments"
-        " WHERE message_id = ? AND content_hash = ? LIMIT 1",
-        [scratch_ids[0], expected_hash],
-    ).fetchone()[0]
-    plan.fills.append(Fill(failure_id, attachment_id, stored_name, payload, mime_type))
-    return None
+    return Fill(failure_id, attachment_id, stored_name, payload, mime_type)
 
 
 def apply_plan(

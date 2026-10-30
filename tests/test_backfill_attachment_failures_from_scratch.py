@@ -73,8 +73,9 @@ def _seed(
                     source_input_mode="file",
                     source_requested_from=message.pst_source,
                     error_stage="attachment-decode",
-                    error_type="ValueError",
-                    error_message=f"Attachment decode failed: {failure_name}",
+                    error_type="AttachmentError",
+                    # The shape ingest.py writes for attachment failures.
+                    error_message=f"Attachment binary failure for: {failure_name}",
                 ),
             )
         con.commit()
