@@ -1,0 +1,339 @@
+"""backfill_attachment_failures_from_scratch.py — One-time fill of the legacy
+PST attachment failures from the #30 trial scratch DBs (issue #30, route A).
+
+The 2026-05-27 PST import (retired readpst route) left open ``attachment-decode``
+ledger rows with no ``attachment_name`` / ``attachment_size``, so the
+repair-on-reimport path (which matches on those two columns) can never fill
+them. The #30 trials re-imported the same PSTs through Outlook into scratch DBs,
+where those attachments decoded. This script copies each one across.
+
+Per open legacy failure (name taken from the error message):
+production message by ``(pst_source, logical_locator)`` -> exactly one
+production attachment row with that name (case-insensitive), still empty ->
+scratch message by Message-ID, else dedup key -> scratch attachments with that
+name that carry stored content, all of one content hash -> scratch file bytes
+re-hashed against that hash. Anything else is skipped and reported by reason.
+
+A fill writes the bytes into production's attachment store, sets the
+placeholder row's hash / size / MIME type / path, and marks the ledger row
+resolved, one transaction per failure. Scratch DBs are only read. Counts and
+ledger row ids are printed; no attachment names or content.
+
+Usage:
+    uv run python scripts/backfill_attachment_failures_from_scratch.py
+        --database <path> --scratch <scratch.db> [--scratch ...]
+        [--confirm [--backup-path <path>] [--attachment-root <dir>]]
+
+Each scratch DB must hold exactly one PST; failures are paired with the scratch
+DB whose PST has the same file name.
+
+Exit codes: 0 — report printed / fill done; 1 — database missing, a scratch DB
+holding other than one PST, or pre-write backup failed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import sqlite3
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path, PureWindowsPath
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from mailattic.attachment_store import (  # noqa: E402
+    AttachmentStoreError,
+    read_attachment,
+    resolve_store_root,
+    write_attachment,
+)
+from mailattic.db_maintenance import backup_database  # noqa: E402
+from mailattic.storage import connect_database  # noqa: E402
+
+_NAME_IN_MESSAGE = re.compile(r":\s*(.+)$")
+
+
+@dataclass(frozen=True, slots=True)
+class Scratch:
+    connection: sqlite3.Connection
+    store_root: Path
+
+
+@dataclass(frozen=True, slots=True)
+class Fill:
+    failure_id: int
+    attachment_id: int
+    name: str
+    payload: bytes
+    mime_type: str | None
+
+
+@dataclass(slots=True)
+class Plan:
+    candidates: int = 0
+    fills: list[Fill] = field(default_factory=list)
+    skipped: dict[str, list[int]] = field(default_factory=dict)
+
+    def skip(self, reason: str, failure_id: int) -> None:
+        self.skipped.setdefault(reason, []).append(failure_id)
+
+
+def pst_basename(pst_source: str) -> str:
+    # PureWindowsPath splits on both "/" (WSL import paths) and "\\".
+    return PureWindowsPath(pst_source).name.casefold()
+
+
+def open_scratch(path: Path) -> tuple[str, Scratch]:
+    connection = connect_database(path, read_only=True)
+    names = {
+        pst_basename(row[0])
+        for row in connection.execute("SELECT DISTINCT pst_source FROM messages")
+    }
+    if len(names) != 1:
+        connection.close()
+        raise ValueError(f"{path} holds {len(names)} PSTs, expected exactly one")
+    return names.pop(), Scratch(connection, resolve_store_root(path))
+
+
+def compute_plan(production: sqlite3.Connection, scratches: dict[str, Scratch]) -> Plan:
+    plan = Plan()
+    failures = production.execute(
+        """
+        SELECT id, pst_source, logical_locator, error_message FROM ingest_failures
+        WHERE error_stage = 'attachment-decode' AND resolved_at IS NULL
+          AND attachment_name IS NULL
+        ORDER BY id
+        """
+    ).fetchall()
+    failures = [f for f in failures if pst_basename(f[1] or "") in scratches]
+    # One pass over messages: there is no (pst_source, logical_locator) index and
+    # each full scan of a multi-GB table takes seconds.
+    sources = {f[1] for f in failures}
+    by_location: dict[tuple[str, str | None], list[tuple[int, str | None, str]]] = {}
+    for db_id, source, locator, message_id, dedup_key in production.execute(
+        "SELECT id, pst_source, logical_locator, message_id, dedup_key FROM messages"
+    ):
+        if source in sources:
+            by_location.setdefault((source, locator), []).append(
+                (db_id, message_id, dedup_key)
+            )
+    for failure_id, pst_source, locator, error_message in failures:
+        plan.candidates += 1
+        reason = _plan_one(
+            production,
+            scratches[pst_basename(pst_source)],
+            failure_id,
+            by_location.get((pst_source, locator), []),
+            error_message,
+            plan,
+        )
+        if reason is not None:
+            plan.skip(reason, failure_id)
+    return plan
+
+
+def _plan_one(
+    production: sqlite3.Connection,
+    scratch: Scratch,
+    failure_id: int,
+    messages: list[tuple[int, str | None, str]],
+    error_message: str | None,
+    plan: Plan,
+) -> str | None:
+    match = _NAME_IN_MESSAGE.search(error_message or "")
+    if match is None:
+        return "no attachment name in error message"
+    name = match.group(1).strip().casefold()
+
+    if len(messages) != 1:
+        return (
+            "no production message" if not messages else "several production messages"
+        )
+    db_id, message_id, dedup_key = messages[0]
+
+    rows = [
+        row
+        for row in production.execute(
+            "SELECT id, attachment_name, content_hash, storage_path"
+            " FROM message_attachments WHERE message_id = ?",
+            [db_id],
+        )
+        if (row[1] or "").casefold() == name
+    ]
+    if len(rows) != 1:
+        return (
+            "production attachment name not unique"
+            if rows
+            else "no production attachment row"
+        )
+    attachment_id, stored_name, content_hash, storage_path = rows[0]
+    if content_hash is not None or storage_path is not None:
+        return "production attachment already has content"
+
+    scratch_ids: list[int] = []
+    for column, value in (("message_id", message_id), ("dedup_key", dedup_key)):
+        if value:
+            scratch_ids = [
+                row[0]
+                for row in scratch.connection.execute(
+                    f"SELECT id FROM messages WHERE {column} = ?", [value]
+                )
+            ]
+            if scratch_ids:
+                break
+    if not scratch_ids:
+        return "message not in scratch DB"
+    if len(scratch_ids) > 1:
+        return "several scratch messages"
+
+    contents = {
+        (row[1], row[2], row[3])
+        for row in scratch.connection.execute(
+            "SELECT attachment_name, content_hash, size_bytes, storage_path, mime_type"
+            " FROM message_attachments WHERE message_id = ?",
+            [scratch_ids[0]],
+        )
+        if (row[0] or "").casefold() == name and row[1] and row[3] and row[2]
+    }
+    hashes = {content[0] for content in contents}
+    if not hashes:
+        return "no scratch attachment with content"
+    if len(hashes) > 1:
+        return "scratch attachments differ"
+    expected_hash, _size, scratch_path = sorted(contents)[0]
+    try:
+        payload = read_attachment(scratch_path, scratch.store_root)
+    except AttachmentStoreError:
+        return "scratch file missing"
+    if hashlib.sha256(payload).hexdigest() != expected_hash:
+        return "scratch file does not match its hash"
+    mime_type = scratch.connection.execute(
+        "SELECT mime_type FROM message_attachments"
+        " WHERE message_id = ? AND content_hash = ? LIMIT 1",
+        [scratch_ids[0], expected_hash],
+    ).fetchone()[0]
+    plan.fills.append(Fill(failure_id, attachment_id, stored_name, payload, mime_type))
+    return None
+
+
+def apply_plan(
+    production: sqlite3.Connection, fills: list[Fill], store_root: Path
+) -> int:
+    filled = 0
+    for fill in fills:
+        record = write_attachment(fill.payload, fill.name, fill.mime_type, store_root)
+        with production:
+            updated = production.execute(
+                """
+                UPDATE message_attachments
+                SET content_hash = ?, size_bytes = ?, mime_type = ?, storage_path = ?
+                WHERE id = ? AND content_hash IS NULL AND storage_path IS NULL
+                """,
+                [
+                    record.content_hash,
+                    record.size_bytes,
+                    record.mime_type,
+                    record.storage_path,
+                    fill.attachment_id,
+                ],
+            ).rowcount
+            if updated != 1:
+                continue
+            production.execute(
+                "UPDATE ingest_failures SET resolved_at = CURRENT_TIMESTAMP"
+                " WHERE id = ? AND resolved_at IS NULL",
+                [fill.failure_id],
+            )
+        filled += 1
+    return filled
+
+
+def print_report(plan: Plan) -> None:
+    print(f"candidates: {plan.candidates}")
+    print(f"fillable: {len(plan.fills)}")
+    for reason, ids in sorted(plan.skipped.items()):
+        print(f"skipped ({reason}): {len(ids)} — ledger ids {ids}")
+
+
+def run(
+    database: Path,
+    scratch_paths: list[Path],
+    *,
+    confirm: bool,
+    attachment_root: Path | None = None,
+    backup_path: Path | None = None,
+) -> int:
+    if not database.exists():
+        print(f"[error] Database not found: {database}", file=sys.stderr)
+        return 1
+    scratches: dict[str, Scratch] = {}
+    try:
+        for path in scratch_paths:
+            name, scratch = open_scratch(path)
+            scratches[name] = scratch
+        production = connect_database(database, read_only=not confirm, create=False)
+        try:
+            if confirm:
+                production.execute("PRAGMA busy_timeout = 30000;")
+            plan = compute_plan(production, scratches)
+            print_report(plan)
+            if not confirm:
+                print("[dry-run] no rows changed.")
+                return 0
+            if not plan.fills:
+                print("[confirm] nothing to fill.")
+                return 0
+            try:
+                snapshot = backup_database(database, backup_path)
+            except Exception as exc:
+                print(
+                    f"[abort] Pre-write backup failed ({exc!r}); no changes were made.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"[confirm] Backup snapshot created at {snapshot}")
+            store_root = resolve_store_root(
+                database,
+                cli_override=attachment_root,
+                env_override=os.environ.get("MAILATTIC_ATTACHMENT_ROOT"),
+            )
+            filled = apply_plan(production, plan.fills, store_root)
+            print(
+                f"[confirm] {filled} attachment(s) filled and ledger row(s) resolved."
+            )
+            return 0
+        finally:
+            production.close()
+    except ValueError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    finally:
+        for scratch in scratches.values():
+            scratch.connection.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--database", type=Path, required=True)
+    parser.add_argument("--scratch", type=Path, action="append", required=True)
+    parser.add_argument("--confirm", action="store_true", help="Back up, then write.")
+    parser.add_argument("--backup-path", type=Path, default=None)
+    parser.add_argument("--attachment-root", type=Path, default=None)
+    args = parser.parse_args(argv)
+    return run(
+        args.database,
+        args.scratch,
+        confirm=args.confirm,
+        attachment_root=args.attachment_root,
+        backup_path=args.backup_path,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
