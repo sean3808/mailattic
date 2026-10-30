@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from email import message_from_bytes, policy
 from email.header import decode_header, make_header
+from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
 
@@ -10,6 +12,7 @@ from mailattic.cli import build_parser
 from mailattic.identity import add_self_address
 from mailattic.models import PstSource, build_normalized_message
 from mailattic.outbound import (
+    _normalized_from_draft,
     build_thread_headers,
     generate_draft_message_id,
     reply_all_recipients,
@@ -193,6 +196,53 @@ def test_draft_reply_cli_writes_eml_with_thread_headers_and_bcc(tmp_path: Path) 
     assert "client@example.com" in parsed["To"]
     assert parsed["In-Reply-To"] == "<test-msg-123@mailattic.test>"
     assert parsed["Subject"] == "Re: Test subject"
+
+
+def test_draft_reply_eml_uses_crlf_line_endings(tmp_path: Path) -> None:
+    # #33: Outlook mis-decodes a quoted-printable soft break followed by a
+    # bare LF, dropping the next character; the long line forces soft breaks.
+    db_path = _seed_message(tmp_path)
+    body_file = tmp_path / "body.txt"
+    body_file.write_text("REACTIVE copper under share " * 10, encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "draft-reply",
+            "<test-msg-123@mailattic.test>",
+            "--body-from",
+            str(body_file),
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(_placeholder_env_file(tmp_path)),
+        ]
+    )
+
+    assert _handle_draft_reply(args) == 0
+
+    raw = next((tmp_path / "outbound" / "drafts").glob("*.eml")).read_bytes()
+    assert b"=\r\n" in raw
+    assert b"\n" not in raw.replace(b"\r\n", b"")
+
+
+def test_sent_record_body_from_crlf_draft_has_lf_line_endings(
+    tmp_path: Path,
+) -> None:
+    # #33: the stored sent copy is built from the CRLF draft file; its body
+    # must match the LF form every other ingest path stores.
+    msg = EmailMessage()
+    msg["From"] = "sean3808@mailattic.test"
+    msg.set_content("line one\nline two")
+    crlf = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
+
+    normalized, _ = _normalized_from_draft(
+        message_from_bytes(crlf, policy=policy.default),
+        "draft-1",
+        "<draft-1@mailattic.test>",
+        tmp_path / "mail.db",
+        attachment_root=tmp_path / "attachments",
+    )
+
+    assert normalized.body_text == "line one\nline two\n"
 
 
 def test_draft_reply_message_id_uses_sending_domain(tmp_path: Path) -> None:

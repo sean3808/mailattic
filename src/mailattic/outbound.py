@@ -1059,7 +1059,9 @@ def assemble_draft_reply(
     out_dir = Path(draft_dir) if draft_dir is not None else _draft_dir(database_path)
     out_dir.mkdir(parents=True, exist_ok=True)
     draft_path = out_dir / f"{draft_id}.eml"
-    draft_bytes = msg.as_bytes()
+    # CRLF like the wire copy: Outlook drops the character after a QP soft
+    # break that ends in a bare LF, so the reviewed preview would differ (#33).
+    draft_bytes = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
     draft_path.write_bytes(draft_bytes)
 
     return DraftReplyResult(
@@ -2137,7 +2139,8 @@ def _normalized_from_draft(
         bcc_recipients=_participants_from_headers(msg, "Bcc"),
         sent_at=sent_at,
         received_at=sent_at,
-        body_text=_extract_body_text(msg),
+        # Drafts are CRLF on disk (#33); store LF like every other ingest path.
+        body_text=_extract_body_text(msg).replace("\r\n", "\n"),
         attachments=attachments,
         message_id=message_id,
         in_reply_to=str(msg["In-Reply-To"]) if msg["In-Reply-To"] else None,
