@@ -69,7 +69,7 @@ def test_non_ascii_subject_is_encoded_on_the_wire(tmp_path: Path) -> None:
     code, drafts = _run(tmp_path, db_path, "--subject", "索取型錄")
 
     assert code == 0
-    header_section = drafts[0].read_bytes().split(b"\n\n", 1)[0]
+    header_section = drafts[0].read_bytes().split(b"\r\n\r\n", 1)[0]
     subject_line = next(
         line for line in header_section.splitlines() if line.startswith(b"Subject:")
     )
