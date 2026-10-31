@@ -27,7 +27,13 @@ from .quarantine import (
     mail_locator,
     quarantine_mail,
 )
-from .storage import connect_database, initialize_database, set_imap_progress
+from .storage import (
+    close_self_healed_failures,
+    connect_database,
+    initialize_database,
+    set_imap_progress,
+)
+from .storage import connect_database as _storage_connect_database
 from .storage import record_sync_run_end as _storage_record_sync_run_end
 from .storage import record_sync_run_start as _storage_record_sync_run_start
 
@@ -861,6 +867,26 @@ def sync_native(
     finally:
         if client is not None:
             client.close()
+
+    # Close open message-stage ingest failures whose retry has succeeded (#31).
+    # Must never affect watermarks or exit code (contract #5).
+    try:
+        sweep_connection = _storage_connect_database(database_path)
+        try:
+            closed_failures = close_self_healed_failures(sweep_connection)
+            if closed_failures:
+                logger.info(
+                    "self-heal sweep closed %d message-stage ingest failure(s)",
+                    closed_failures,
+                )
+        finally:
+            sweep_connection.close()
+    except Exception as exc:
+        logger.warning(
+            "self-healed failures sweep failed (swallowed): %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     # Run maildir retention prune after per-folder loop (D2, D4).
     # sync_native is only reached from the non-dry-run path in run_sync_imap;

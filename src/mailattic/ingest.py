@@ -27,6 +27,7 @@ from .outlook_pst import (
 from .parser import MaildirParser, ReadpstParser, _parse_maildir_message
 from .quarantine import release_quarantined_mail
 from .storage import (
+    close_self_healed_failures,
     connect_database,
     persist_message,
     record_ingest_failure,
@@ -256,6 +257,14 @@ def import_maildir_sources(
                 )
                 connection.commit()
                 summary.failure_count += 1
+        try:
+            close_self_healed_failures(connection)
+        except Exception as exc:
+            print(
+                "self-healed failures sweep failed (swallowed): "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
     finally:
         connection.close()
 
