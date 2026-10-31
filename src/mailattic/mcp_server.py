@@ -244,6 +244,7 @@ _KEYWORD_SYNTAX_HINT = (
     "Accepted syntax: uppercase AND / OR / NOT, parentheses, and double-quoted phrases."
 )
 _ISO_DATE_ONLY_EXPECTED = "a YYYY-MM-DD date (canonical, basic, or ISO week form)"
+_YYYY_MM_DD_DATE_EXPECTED = "YYYY-MM-DD"
 
 # ---------------------------------------------------------------------------
 # Over-budget refusals (spec: "An over-budget refusal offers a correction
@@ -2023,6 +2024,28 @@ def create_server(
             "contacts_limit",
             *_MAIL_CONTACT_HISTORY_CONTACTS_LIMIT_RANGE,
         )
+        if date_from is not None:
+            try:
+                parse_date_bound(date_from, parameter_name="date_from")
+            except ValueError as exc:
+                raise build_tool_error(
+                    ValueError,
+                    format_invalid_date_message(
+                        "{date_value}", "date_from", expected=_YYYY_MM_DD_DATE_EXPECTED
+                    ),
+                    date_value=date_from,
+                ) from exc
+        if date_to is not None:
+            try:
+                parse_date_bound(date_to, parameter_name="date_to")
+            except ValueError as exc:
+                raise build_tool_error(
+                    ValueError,
+                    format_invalid_date_message(
+                        "{date_value}", "date_to", expected=_YYYY_MM_DD_DATE_EXPECTED
+                    ),
+                    date_value=date_to,
+                ) from exc
         capped_date_from = cap_error_echo(date_from) if date_from is not None else None
         capped_date_to = cap_error_echo(date_to) if date_to is not None else None
         try:
@@ -2038,10 +2061,10 @@ def create_server(
                     attachments_limit=attachments_limit,
                 ),
             )
-        except ValueError:
+        except ValueError as exc:
             # Shared date/selector validation already carries its own bounded
             # fragment; do not cap the assembled correction at this boundary.
-            raise
+            raise build_tool_error(ValueError, "{detail}", detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise _missing_database_error(resolved_database_path) from exc
         except sqlite3.Error as exc:

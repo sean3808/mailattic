@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import functools
 import string
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.tools.base import Tool
 from mcp.types import CallToolResult
 
@@ -82,12 +85,26 @@ def _render_error_template(
     return template.format(**rendered_fragments)
 
 
+@functools.lru_cache(maxsize=32)
+def _as_tool_error_type[ExceptionT: Exception](
+    exception_type: type[ExceptionT],
+) -> Callable[[str], ExceptionT]:
+    if issubclass(exception_type, ToolError):
+        return exception_type
+    combined_name = f"Tool{exception_type.__name__}"
+    return cast(
+        Callable[[str], ExceptionT],
+        type(combined_name, (ToolError, exception_type), {}),
+    )
+
+
 def build_tool_error[ExceptionT: Exception](
     exception_type: type[ExceptionT], template: str, **fragments: object
 ) -> ExceptionT:
     """Build a bounded tool error from capped named fragments."""
 
-    return exception_type(_render_error_template(template, fragments))
+    target_type = _as_tool_error_type(exception_type)
+    return target_type(_render_error_template(template, fragments))
 
 
 def build_environment_error[ExceptionT: Exception](
@@ -102,7 +119,8 @@ def build_environment_error[ExceptionT: Exception](
         raise ValueError(
             "database_path is reserved for the resolved database path argument."
         )
-    return exception_type(
+    target_type = _as_tool_error_type(exception_type)
+    return target_type(
         _render_error_template(
             template,
             {"database_path": resolved_database_path, **fragments},

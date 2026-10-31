@@ -23,7 +23,7 @@ dependencies = [
     # whose result-conversion shape and validation-error format this repo has measured.
     # Excludes 1.x (different lowlevel handler-registration surface and a different
     # result-conversion contract) and any future 3.x, neither of which has been measured here.
-    "mcp>=2,<3",
+    "mcp>=2.2,<3",
     "pydantic>=2.11",
     "pywin32>=312 ; sys_platform == 'win32'",
 ]
