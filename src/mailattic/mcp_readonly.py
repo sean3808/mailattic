@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .contact_history import aggregate_contact_history
+from .mcp_delivery import as_tool_error_type
 from .query import (
     SearchFilters,
     get_attachments_by_ids,
@@ -37,9 +38,11 @@ class ReadOnlyMailReader:
     One method per read a registered read tool performs. Each method
     forwards to the corresponding query-layer function with the read-only
     setting supplied internally, and returns that function's result
-    unchanged. No method here catches an exception -- whatever the
-    underlying query-layer function raises propagates to the caller
-    unmodified, so the server's existing except ladders keep matching.
+    unchanged. Exceptions propagate unmodified, so the server's existing
+    except ladders keep matching -- with one exception: ``contact_history``
+    re-raises its ValueError as a ToolError+ValueError hybrid, because the
+    server re-raises that ValueError bare (its message is already bounded)
+    and mcp 2.2+ would otherwise hide the message from the client.
     """
 
     database_path: Path
@@ -76,15 +79,18 @@ class ReadOnlyMailReader:
         date_to: str | None,
         attachments_limit: int,
     ) -> dict[str, object]:
-        return aggregate_contact_history(
-            database_path=self.database_path,
-            contact=contact,
-            domain=domain,
-            date_from=date_from,
-            date_to=date_to,
-            attachments_limit=attachments_limit,
-            read_only=True,
-        )
+        try:
+            return aggregate_contact_history(
+                database_path=self.database_path,
+                contact=contact,
+                domain=domain,
+                date_from=date_from,
+                date_to=date_to,
+                attachments_limit=attachments_limit,
+                read_only=True,
+            )
+        except ValueError as exc:
+            raise as_tool_error_type(ValueError)(str(exc)) from exc
 
     def search_attachments(
         self,

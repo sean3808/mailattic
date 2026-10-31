@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import functools
 import string
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.tools.base import Tool
 from mcp.types import CallToolResult
 
@@ -82,12 +85,32 @@ def _render_error_template(
     return template.format(**rendered_fragments)
 
 
+@functools.lru_cache(maxsize=32)
+def as_tool_error_type[ExceptionT: Exception](
+    exception_type: type[ExceptionT],
+) -> Callable[[str], ExceptionT]:
+    """Return a ToolError subclass of ``exception_type`` (cached per type).
+
+    mcp 2.2+ forwards only ToolError messages to the client; any other
+    exception reaches it as a bare "Error executing tool <name>". The hybrid
+    keeps ``isinstance(exc, exception_type)`` true for the except ladders.
+    """
+    if issubclass(exception_type, ToolError):
+        return exception_type
+    return cast(
+        Callable[[str], ExceptionT],
+        type(f"Tool{exception_type.__name__}", (ToolError, exception_type), {}),
+    )
+
+
 def build_tool_error[ExceptionT: Exception](
     exception_type: type[ExceptionT], template: str, **fragments: object
 ) -> ExceptionT:
     """Build a bounded tool error from capped named fragments."""
 
-    return exception_type(_render_error_template(template, fragments))
+    return as_tool_error_type(exception_type)(
+        _render_error_template(template, fragments)
+    )
 
 
 def build_environment_error[ExceptionT: Exception](
@@ -102,7 +125,7 @@ def build_environment_error[ExceptionT: Exception](
         raise ValueError(
             "database_path is reserved for the resolved database path argument."
         )
-    return exception_type(
+    return as_tool_error_type(exception_type)(
         _render_error_template(
             template,
             {"database_path": resolved_database_path, **fragments},
