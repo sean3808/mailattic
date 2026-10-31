@@ -126,6 +126,12 @@
 - **Avoid**: raw archive, 原始信封存, 備份區, 垃圾桶, 待處理匣
 - **Why**: The seven-day scratch window is by design (D-20260703-1), but for a message whose attachment write failed, the original file is the only local source from which the attachments can be recovered, and expiring it at seven days would seal the failure shut. Quarantine is the sole exception to that rule, and its admission condition is narrow enough not to breed a "this is a backup" dependency: its only exits are backfill or manual abandonment, the system never abandons on its own and sets no expiry. A message whose failure was resolved by another path is not auto-cleared and still counts in doctor's `quarantined_mail` number. It sits in the business runtime data directory, not in `.project-runtime`, because the latter's test is "deleting the whole thing loses no durable state", and quarantine is the opposite. Owner: Sean (settled in #239, 2026-10-09); SoT: `src/mailattic/quarantine.py`; source: #239, #256.
 
+### Self-healed failure (自癒)
+
+- **Definition**: A message-stage ingest failure whose own source, at the same source location, has since had that message stored by a later retry. It is the third way a failure record closes, alongside backfill and manual abandonment; like backfill (which covers attachment failures) the system applies it by itself, and it is the only automatic close for message-stage failures.
+- **Avoid**: auto-abandon, 自動放棄, 自動結案（不分原因）, resolved by any route
+- **Why**: Contract #5 retries a failed UID until it is stored, but nothing closed the record afterwards, so every healed failure stayed open forever and `bes db doctor` could never reach zero. It is not abandonment: abandonment concedes the data is lost, self-healing proves it is present, so "the system never abandons on its own" still holds. Strict on purpose: the same message arriving through another route (matched by Message-ID) does not heal the record, because another route's copy cannot prove this source's copy lost nothing, and many failure records carry no Message-ID at all. Owner: Sean (settled in #31 grilling, 2026-10-30); source: #31.
+
 ---
 
 ## Maintenance principles

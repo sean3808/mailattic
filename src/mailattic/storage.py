@@ -474,6 +474,44 @@ def _backfill_empty_attachments(
     return filled
 
 
+def close_self_healed_failures(connection: sqlite3.Connection) -> int:
+    """Close open message-stage ingest failures whose retry has succeeded (#31).
+
+    An open ingest_failures row closes as self-healed when ALL hold:
+    1. It is a message-stage failure: error_stage does not start with 'attachment-'.
+    2. resolved_at IS NULL (already backfilled or abandoned rows are not touched).
+    3. A row in messages exists with the same pst_source and same logical_locator
+       (and same folder_path when present on ingest_failures) -- strict: matching
+       only by Message-ID or stored under another source/locator does not heal it.
+    4. That message was stored after (or at the same second as) the failure was
+       recorded (unixepoch(m.created_at) >= unixepoch(ingest_failures.created_at)).
+
+    Closing sets resolved_at to CURRENT_TIMESTAMP and leaves abandon_reason NULL
+    (self-heal is not abandonment). It is idempotent. Callers run it after
+    ``initialize_database``, which guarantees the ``resolved_at`` column.
+    """
+    cursor = connection.execute(
+        """
+        UPDATE ingest_failures
+        SET resolved_at = CURRENT_TIMESTAMP
+        WHERE resolved_at IS NULL
+          AND error_stage NOT LIKE 'attachment-%'
+          AND EXISTS (
+              SELECT 1 FROM messages AS m
+              WHERE m.pst_source = ingest_failures.pst_source
+                AND m.logical_locator = ingest_failures.logical_locator
+                AND (
+                    ingest_failures.folder_path IS NULL
+                    OR m.folder_path = ingest_failures.folder_path
+                )
+                AND unixepoch(m.created_at) >= unixepoch(ingest_failures.created_at)
+          )
+        """
+    )
+    connection.commit()
+    return cursor.rowcount
+
+
 def record_sync_run_start(
     connection: sqlite3.Connection, *, started_at: datetime
 ) -> None:
