@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .contact_history import aggregate_contact_history
+from .mcp_delivery import _as_tool_error_type
 from .query import (
     SearchFilters,
     get_attachments_by_ids,
@@ -76,15 +77,18 @@ class ReadOnlyMailReader:
         date_to: str | None,
         attachments_limit: int,
     ) -> dict[str, object]:
-        return aggregate_contact_history(
-            database_path=self.database_path,
-            contact=contact,
-            domain=domain,
-            date_from=date_from,
-            date_to=date_to,
-            attachments_limit=attachments_limit,
-            read_only=True,
-        )
+        try:
+            return aggregate_contact_history(
+                database_path=self.database_path,
+                contact=contact,
+                domain=domain,
+                date_from=date_from,
+                date_to=date_to,
+                attachments_limit=attachments_limit,
+                read_only=True,
+            )
+        except ValueError as exc:
+            raise _as_tool_error_type(ValueError)(str(exc)) from exc
 
     def search_attachments(
         self,
