@@ -63,6 +63,8 @@ guard（`scripts/guard-release-tag.py`，掛 pre-push）是**唯讀 fail-closed 
 - **發行完成包含 skill**：同一個乾淨 main commit 的 BES、`skills/mailattic/` 操作說明與附帶工具一起交付。release 呼叫 `deploy-skill-to-ssot.py --verify-required`，只部署 Git tracked 檔案，再核對內容；目標沿用 `MAILATTIC_SKILL_SSOT` 或部署腳本內建 SSOT 路徑。ignored/untracked 產物不複製，SSOT 清單外檔案不動，也不 commit/push SSOT repo。
 - **SSOT 階段失敗即停止**：複製失敗、來源檢查而跳過、同步後內容仍不同，都不得新增成功 evidence/tag/push。此時 BES 已安裝，不會自動回復；修正錯誤後以原 `-Tag` 和 `-Remote` 重跑 release。已一致的 skill 可安全重驗。
 - **普通 `git push` 只是遠端備份，不代表 CLI 發行。** 因為要求乾淨 main，**文件／程式碼改動要先 commit 完再發行**，tag 才會指向含該改動的 commit。
+- **「乾淨」包含未追蹤檔**（`git status --porcelain --untracked-files=all` 必須為空；被 git 忽略的檔不算）。開發目錄有別的 session 留下的改動時，可改從日常 checkout（同一個 `origin`、已 `git pull --ff-only` 到同一個 main）發行。發行最後一步是 `git push --atomic <remote> main <tag>`：跑的期間不要從別處推 main，否則 atomic push 被拒，要照錯誤訊息的指令重推。
+- **本機測試數可能比乾淨 checkout 多**：開發目錄有被 git 忽略的 `tests/test_recipient_rebuild_*.py`（本機用、不進版控），launcher 一樣會收進去。比對兩邊的 passed 數字前先扣掉這幾支。
 - pre-commit framework 會接管 `.git/hooks/pre-push`，guard 以 `pre-push.legacy` 形式被串接執行。
 - **main commit hook 是即時同步，不能取代 release 核對**：Spectra `archive` 觸發已退役，現行 hook 在 main commit 後同步 skill（[D-20260820-4](decisions/D-20260820-4-skill-ssot-deploy-trigger-main-commit.md)），但不發布全域 CLI。正式 release 自己確認 SSOT 一致；不走 GitHub Actions / self-hosted runner，也不依 tag 修改 `pyproject.toml` package version。
 
