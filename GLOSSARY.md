@@ -128,7 +128,7 @@
 
 ### Self-healed failure (自癒)
 
-- **Definition**: A message-stage ingest failure whose own source, at the same source location, has since had that message stored by a later retry. It is the third way a failure record closes, alongside backfill and manual abandonment, and the only one the system applies by itself.
+- **Definition**: A message-stage ingest failure whose own source, at the same source location, has since had that message stored by a later retry. It is the third way a failure record closes, alongside backfill and manual abandonment; like backfill (which covers attachment failures) the system applies it by itself, and it is the only automatic close for message-stage failures.
 - **Avoid**: auto-abandon, 自動放棄, 自動結案（不分原因）, resolved by any route
 - **Why**: Contract #5 retries a failed UID until it is stored, but nothing closed the record afterwards, so every healed failure stayed open forever and `bes db doctor` could never reach zero. It is not abandonment: abandonment concedes the data is lost, self-healing proves it is present, so "the system never abandons on its own" still holds. Strict on purpose: the same message arriving through another route (matched by Message-ID) does not heal the record, because another route's copy cannot prove this source's copy lost nothing, and many failure records carry no Message-ID at all. Owner: Sean (settled in #31 grilling, 2026-10-30); source: #31.
 
