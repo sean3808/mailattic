@@ -881,7 +881,7 @@ def sync_native(
                 )
         finally:
             sweep_connection.close()
-    except (sqlite3.Error, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 -- bookkeeping must never fail the sync
         logger.warning(
             "self-healed failures sweep failed (swallowed): %s: %s",
             type(exc).__name__,

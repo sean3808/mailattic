@@ -479,7 +479,6 @@ def close_self_healed_failures(connection: sqlite3.Connection) -> int:
 
     An open ingest_failures row closes as self-healed when ALL hold:
     1. It is a message-stage failure: error_stage does not start with 'attachment-'.
-
     2. resolved_at IS NULL (already backfilled or abandoned rows are not touched).
     3. A row in messages exists with the same pst_source and same logical_locator
        (and same folder_path when present on ingest_failures) -- strict: matching
@@ -488,22 +487,15 @@ def close_self_healed_failures(connection: sqlite3.Connection) -> int:
        recorded (unixepoch(m.created_at) >= unixepoch(ingest_failures.created_at)).
 
     Closing sets resolved_at to CURRENT_TIMESTAMP and leaves abandon_reason NULL
-    (self-heal is not abandonment). It is idempotent.
+    (self-heal is not abandonment). It is idempotent. Callers run it after
+    ``initialize_database``, which guarantees the ``resolved_at`` column.
     """
-    columns = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(ingest_failures)").fetchall()
-    }
-    if "resolved_at" not in columns:
-        return 0
-
     cursor = connection.execute(
         """
         UPDATE ingest_failures
         SET resolved_at = CURRENT_TIMESTAMP
         WHERE resolved_at IS NULL
           AND error_stage NOT LIKE 'attachment-%'
-          AND logical_locator IS NOT NULL
           AND EXISTS (
               SELECT 1 FROM messages AS m
               WHERE m.pst_source = ingest_failures.pst_source
@@ -512,17 +504,12 @@ def close_self_healed_failures(connection: sqlite3.Connection) -> int:
                     ingest_failures.folder_path IS NULL
                     OR m.folder_path = ingest_failures.folder_path
                 )
-                AND (
-                    ingest_failures.created_at IS NULL
-                    OR m.created_at IS NULL
-                    OR unixepoch(m.created_at) >= unixepoch(ingest_failures.created_at)
-                )
+                AND unixepoch(m.created_at) >= unixepoch(ingest_failures.created_at)
           )
         """
     )
-    if cursor.rowcount:
-        connection.commit()
-    return int(cursor.rowcount)
+    connection.commit()
+    return cursor.rowcount
 
 
 def record_sync_run_start(

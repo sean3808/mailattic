@@ -9,20 +9,14 @@ import mailattic.imap_native as imap_native_mod
 from mailattic.imap_native import NativeImapClient, sync_native
 from mailattic.imap_state import ImapSyncState
 from mailattic.ingest import import_maildir_sources
-from mailattic.storage import close_self_healed_failures, initialize_database
-from tests.test_imap_native import _TEST_ENV, _make_eml, _MockImapConn
-
-
-def _create_test_db(tmp_path: Path) -> Path:
-    db_path = tmp_path / "test.db"
-    initialize_database(db_path)
-    return db_path
+from mailattic.storage import close_self_healed_failures
+from tests.test_imap_native import _TEST_ENV, _make_db, _make_eml, _MockImapConn
 
 
 def test_self_heal_closes_message_stage_failure_same_source_locator(
     tmp_path: Path,
 ) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         con.execute(
             """
@@ -65,7 +59,7 @@ def test_self_heal_closes_message_stage_failure_same_source_locator(
 def test_self_heal_leaves_open_when_only_message_id_matches_under_other_source(
     tmp_path: Path,
 ) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         con.execute(
             """
@@ -105,7 +99,7 @@ def test_self_heal_leaves_open_when_only_message_id_matches_under_other_source(
 def test_self_heal_leaves_open_when_only_message_id_matches_under_other_locator(
     tmp_path: Path,
 ) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         con.execute(
             """
@@ -144,7 +138,7 @@ def test_self_heal_leaves_open_when_only_message_id_matches_under_other_locator(
 
 
 def test_self_heal_leaves_open_when_nothing_stored(tmp_path: Path) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         con.execute(
             """
@@ -170,7 +164,7 @@ def test_self_heal_leaves_open_when_nothing_stored(tmp_path: Path) -> None:
 
 
 def test_self_heal_never_touches_attachment_stage_rows(tmp_path: Path) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         con.execute(
             """
@@ -211,7 +205,7 @@ def test_self_heal_never_touches_attachment_stage_rows(tmp_path: Path) -> None:
 def test_self_heal_never_touches_already_resolved_or_abandoned_rows(
     tmp_path: Path,
 ) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         con.execute(
             """
@@ -256,7 +250,7 @@ def test_self_heal_never_touches_already_resolved_or_abandoned_rows(
 def test_self_heal_leaves_open_when_message_stored_before_failure(
     tmp_path: Path,
 ) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         # Message created at 09:00:00
         con.execute(
@@ -292,7 +286,7 @@ def test_self_heal_leaves_open_when_message_stored_before_failure(
 
 
 def test_self_heal_folder_path_mismatch_leaves_open(tmp_path: Path) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         con.execute(
             """
@@ -327,7 +321,7 @@ def test_self_heal_folder_path_mismatch_leaves_open(tmp_path: Path) -> None:
 
 
 def test_self_heal_idempotent_on_repeated_runs(tmp_path: Path) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         con.execute(
             """
@@ -371,7 +365,7 @@ def test_self_heal_idempotent_on_repeated_runs(tmp_path: Path) -> None:
 
 
 def test_sync_invokes_sweep_and_heals_open_failures(tmp_path: Path) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     state_path = tmp_path / ".imap_watermarks.json"
     list_data = [b'(\\HasNoChildren) "/" INBOX']
     fetch_map = {101: _make_eml(101)}
@@ -424,7 +418,7 @@ def test_sync_invokes_sweep_and_heals_open_failures(tmp_path: Path) -> None:
 def test_sync_sweep_error_does_not_change_watermark_or_exit_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     state_path = tmp_path / ".imap_watermarks.json"
     list_data = [b'(\\HasNoChildren) "/" INBOX']
     fetch_map = {101: _make_eml(101)}
@@ -463,7 +457,7 @@ def test_sync_sweep_error_does_not_change_watermark_or_exit_code(
 def test_sync_sweep_never_closes_unpersisted_message_on_sync_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     state_path = tmp_path / ".imap_watermarks.json"
     list_data = [b'(\\HasNoChildren) "/" INBOX']
     fetch_map = {101: _make_eml(101)}
@@ -504,7 +498,7 @@ def test_sync_sweep_never_closes_unpersisted_message_on_sync_failure(
 def test_maildir_sources_invokes_sweep_and_heals_open_failures(
     tmp_path: Path,
 ) -> None:
-    db_path = _create_test_db(tmp_path)
+    db_path = _make_db(tmp_path)
     with sqlite3.connect(db_path) as con:
         con.execute(
             """
