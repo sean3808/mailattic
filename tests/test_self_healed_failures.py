@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import mailattic.storage as storage_mod
+import mailattic.imap_native as imap_native_mod
 from mailattic.imap_native import NativeImapClient, sync_native
 from mailattic.imap_state import ImapSyncState
 from mailattic.ingest import import_maildir_sources
@@ -436,10 +436,14 @@ def test_sync_sweep_error_does_not_change_watermark_or_exit_code(
         fetch_map=fetch_map,
     )
 
+    calls: list[int] = []
+
     def _exploding_sweep(connection: sqlite3.Connection) -> int:
+        calls.append(1)
         raise sqlite3.OperationalError("simulated database disk I/O error during sweep")
 
-    monkeypatch.setattr(storage_mod, "close_self_healed_failures", _exploding_sweep)
+    # Patch where sync_native looks the name up, not where it is defined.
+    monkeypatch.setattr(imap_native_mod, "close_self_healed_failures", _exploding_sweep)
 
     result = sync_native(
         env=_TEST_ENV,
@@ -450,6 +454,7 @@ def test_sync_sweep_error_does_not_change_watermark_or_exit_code(
         client_factory=lambda env: NativeImapClient(env, _connection=mock_conn),
     )
 
+    assert calls == [1]
     assert result.exit_code == 0
     assert result.inserted_messages == 1
     assert ImapSyncState(state_path).get_watermark("INBOX", "/", 1) == 101
