@@ -478,8 +478,8 @@ def close_self_healed_failures(connection: sqlite3.Connection) -> int:
     """Close open message-stage ingest failures whose retry has succeeded (#31).
 
     An open ingest_failures row closes as self-healed when ALL hold:
-    1. It is a message-stage failure: error_stage is NOT in
-       ('attachment-store', 'attachment-decode').
+    1. It is a message-stage failure: error_stage does not start with 'attachment-'.
+
     2. resolved_at IS NULL (already backfilled or abandoned rows are not touched).
     3. A row in messages exists with the same pst_source and same logical_locator
        (and same folder_path when present on ingest_failures) -- strict: matching
@@ -502,7 +502,7 @@ def close_self_healed_failures(connection: sqlite3.Connection) -> int:
         UPDATE ingest_failures
         SET resolved_at = CURRENT_TIMESTAMP
         WHERE resolved_at IS NULL
-          AND error_stage NOT IN ('attachment-store', 'attachment-decode')
+          AND error_stage NOT LIKE 'attachment-%'
           AND logical_locator IS NOT NULL
           AND EXISTS (
               SELECT 1 FROM messages AS m

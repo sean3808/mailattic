@@ -259,7 +259,7 @@ def import_maildir_sources(
                 summary.failure_count += 1
         try:
             close_self_healed_failures(connection)
-        except Exception as exc:
+        except (sqlite3.Error, OSError) as exc:
             print(
                 "self-healed failures sweep failed (swallowed): "
                 f"{type(exc).__name__}: {exc}",

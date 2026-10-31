@@ -8,6 +8,7 @@ import pytest
 import mailattic.storage as storage_mod
 from mailattic.imap_native import NativeImapClient, sync_native
 from mailattic.imap_state import ImapSyncState
+from mailattic.ingest import import_maildir_sources
 from mailattic.storage import close_self_healed_failures, initialize_database
 from tests.test_imap_native import _TEST_ENV, _make_eml, _MockImapConn
 
@@ -180,7 +181,9 @@ def test_self_heal_never_touches_attachment_stage_rows(tmp_path: Path) -> None:
             (1, 'imap:test@example.com:INBOX', 'INBOX', 'loc1',
              'attachment-store', 'err', 'msg', '2026-06-24 10:00:00'),
             (2, 'imap:test@example.com:INBOX', 'INBOX', 'loc1',
-             'attachment-decode', 'err', 'msg', '2026-06-24 10:00:00')
+             'attachment-decode', 'err', 'msg', '2026-06-24 10:00:00'),
+            (3, 'imap:test@example.com:INBOX', 'INBOX', 'loc1',
+             'attachment-collection-read', 'err', 'msg', '2026-06-24 10:00:00')
             """
         )
         con.execute(
@@ -202,7 +205,7 @@ def test_self_heal_never_touches_attachment_stage_rows(tmp_path: Path) -> None:
         rows = con.execute(
             "SELECT id, resolved_at FROM ingest_failures ORDER BY id"
         ).fetchall()
-        assert rows == [(1, None), (2, None)]
+        assert rows == [(1, None), (2, None), (3, None)]
 
 
 def test_self_heal_never_touches_already_resolved_or_abandoned_rows(
@@ -491,3 +494,45 @@ def test_sync_sweep_never_closes_unpersisted_message_on_sync_failure(
         assert len(failure_rows) >= 1
         for _stage, resolved_at in failure_rows:
             assert resolved_at is None
+
+
+def test_maildir_sources_invokes_sweep_and_heals_open_failures(
+    tmp_path: Path,
+) -> None:
+    db_path = _create_test_db(tmp_path)
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            """
+            INSERT INTO ingest_failures (
+                pst_source, folder_path, logical_locator, error_stage,
+                error_type, error_message, created_at
+            ) VALUES (
+                'imap:user@example.com:INBOX', 'INBOX',
+                'INBOX/new/uid-101.eml', 'persist-message',
+                'OperationalError', 'err', '2026-06-24 10:00:00'
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO messages (
+                subject, sender_name, sender_email, pst_source, folder_path,
+                logical_locator, dedup_key, created_at
+            ) VALUES (
+                'Test', 'Sender', 'sender@example.com',
+                'imap:user@example.com:INBOX', 'INBOX',
+                'INBOX/new/uid-101.eml', 'msg-101', '2026-06-24 10:05:00'
+            )
+            """
+        )
+        con.commit()
+
+    import_maildir_sources(database_path=db_path, sources=[])
+
+    with sqlite3.connect(db_path) as con:
+        row = con.execute(
+            "SELECT resolved_at, abandon_reason FROM ingest_failures WHERE id = 1"
+        ).fetchone()
+        assert row is not None
+        assert row[0] is not None
+        assert row[1] is None

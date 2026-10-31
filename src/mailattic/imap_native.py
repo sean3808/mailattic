@@ -881,7 +881,7 @@ def sync_native(
                 )
         finally:
             sweep_connection.close()
-    except Exception as exc:
+    except (sqlite3.Error, OSError) as exc:
         logger.warning(
             "self-healed failures sweep failed (swallowed): %s: %s",
             type(exc).__name__,
