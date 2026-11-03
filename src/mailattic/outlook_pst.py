@@ -474,25 +474,16 @@ class OutlookComReader:
                                     else f"{raw_file_name}.msg"
                                 )
                             else:
-                                file_name = (
-                                    f"unnamed-attachment-{unnamed_seq}.msg"
-                                    if unnamed_seq
-                                    else "unnamed-attachment-1.msg"
-                                )
+                                file_name = f"unnamed-attachment-{unnamed_seq}.msg"
                             attachment["attachment_name"] = file_name
                             mime_type = "application/vnd.ms-outlook"
-                            try:
-                                with tempfile.TemporaryDirectory() as temp_dir:
-                                    temp_file = Path(temp_dir) / f"{uuid4().hex}.msg"
-                                    try:
-                                        source_attachment.SaveAsFile(str(temp_file))
-                                        payload = temp_file.read_bytes()
-                                    finally:
-                                        temp_file.unlink(missing_ok=True)
-                            except Exception as exc:
-                                raise ValueError(
-                                    f"Failed to extract embedded item: {exc}"
-                                ) from exc
+                            with tempfile.TemporaryDirectory() as temp_dir:
+                                temp_file = Path(temp_dir) / f"{uuid4().hex}.msg"
+                                try:
+                                    source_attachment.SaveAsFile(str(temp_file))
+                                    payload = temp_file.read_bytes()
+                                finally:
+                                    temp_file.unlink(missing_ok=True)
                         else:
                             raise TypeError("Attachment binary property is unavailable")
                     else:
