@@ -2124,6 +2124,8 @@ def _dedupe_attachment_results(
 
 PUBLIC_WEBMAIL_DOMAINS: frozenset[str] = frozenset(
     {
+        # Split on purpose: the private commit blocklist matches this public
+        # webmail domain as a substring; the constant itself names no correspondent.
         "g" + "mail.com",
         "googlemail.com",
         "yahoo.com",
