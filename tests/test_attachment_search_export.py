@@ -1171,111 +1171,74 @@ def test_attachments_cli_message_filter_exports_exact_message_attachment(
         connection.executescript(SCHEMA_SQL)
 
         sender = "vendor@shopa.example"
-        date1 = "2026-11-03T10:00:00+08:00"
-        date2 = "2026-11-03T14:30:00+08:00"
-
-        c1 = connection.execute(
-            """
-            INSERT INTO messages (
-                subject, sender_name, sender_email, sent_at, received_at,
-                body_text, message_id, pst_source, folder_path,
-                logical_locator, dedup_key, recipient_search_text,
-                attachment_search_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
+        messages_data = [
+            (
                 "Message 1",
-                "Vendor",
-                sender,
-                date1,
-                date1,
-                "Body 1",
-                "<msg1@shopa.example>",
-                "fixture.pst",
-                "Inbox",
-                "Inbox/msg1",
-                "dedup-msg1",
-                "",
-                "",
-            ],
-        )
-        msg1_id = int(c1.lastrowid)
-
-        c2 = connection.execute(
-            """
-            INSERT INTO messages (
-                subject, sender_name, sender_email, sent_at, received_at,
-                body_text, message_id, pst_source, folder_path,
-                logical_locator, dedup_key, recipient_search_text,
-                attachment_search_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
+                "2026-11-03T10:00:00+08:00",
+                b"PNG-image012-message-1-unique-content",
+            ),
+            (
                 "Message 2",
-                "Vendor",
-                sender,
-                date2,
-                date2,
-                "Body 2",
-                "<msg2@shopa.example>",
-                "fixture.pst",
-                "Inbox",
-                "Inbox/msg2",
-                "dedup-msg2",
-                "",
-                "",
-            ],
-        )
-        msg2_id = int(c2.lastrowid)
+                "2026-11-03T14:30:00+08:00",
+                b"PNG-image012-message-2-different-content",
+            ),
+        ]
+        msg_ids: list[int] = []
+        records = []
+        for index, (subject, sent_at, payload) in enumerate(messages_data, start=1):
+            cursor = connection.execute(
+                """
+                INSERT INTO messages (
+                    subject, sender_name, sender_email, sent_at, received_at,
+                    body_text, message_id, pst_source, folder_path,
+                    logical_locator, dedup_key, recipient_search_text,
+                    attachment_search_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    subject,
+                    "Vendor",
+                    sender,
+                    sent_at,
+                    sent_at,
+                    f"Body {index}",
+                    f"<msg{index}@shopa.example>",
+                    "fixture.pst",
+                    "Inbox",
+                    f"Inbox/msg{index}",
+                    f"dedup-msg{index}",
+                    "",
+                    "",
+                ],
+            )
+            mid = int(cursor.lastrowid)
+            msg_ids.append(mid)
 
-        payload1 = b"PNG-image012-message-1-unique-content"
-        payload2 = b"PNG-image012-message-2-different-content"
-
-        rec1 = write_attachment(
-            payload=payload1,
-            original_name="image012.png",
-            mime_type="image/png",
-            store_root=attachment_root,
-        )
-        rec2 = write_attachment(
-            payload=payload2,
-            original_name="image012.png",
-            mime_type="image/png",
-            store_root=attachment_root,
-        )
-
-        connection.execute(
-            """
-            INSERT INTO message_attachments (
-                message_id, attachment_name, content_hash, size_bytes,
-                mime_type, storage_path
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            [
-                msg1_id,
-                "image012.png",
-                rec1.content_hash,
-                len(payload1),
-                "image/png",
-                rec1.storage_path,
-            ],
-        )
-        connection.execute(
-            """
-            INSERT INTO message_attachments (
-                message_id, attachment_name, content_hash, size_bytes,
-                mime_type, storage_path
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            [
-                msg2_id,
-                "image012.png",
-                rec2.content_hash,
-                len(payload2),
-                "image/png",
-                rec2.storage_path,
-            ],
-        )
+            rec = write_attachment(
+                payload=payload,
+                original_name="image012.png",
+                mime_type="image/png",
+                store_root=attachment_root,
+            )
+            records.append(rec)
+            connection.execute(
+                """
+                INSERT INTO message_attachments (
+                    message_id, attachment_name, content_hash, size_bytes,
+                    mime_type, storage_path
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    mid,
+                    "image012.png",
+                    rec.content_hash,
+                    len(payload),
+                    "image/png",
+                    rec.storage_path,
+                ],
+            )
+        msg1_id, msg2_id = msg_ids
+        rec1, rec2 = records
         connection.commit()
     finally:
         connection.close()
