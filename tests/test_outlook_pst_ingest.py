@@ -130,6 +130,67 @@ def test_import_pst_sources_keeps_named_message_failure_nonfatal(
     assert failure == ("read-recipient-table", "entry-broken")
 
 
+@pytest.mark.parametrize("field", ["subject", "body_text", "sender_name"])
+def test_outlook_text_field_with_lone_surrogate_still_stores_the_mail(
+    tmp_path: Path, field: str
+) -> None:
+    # #42: Outlook returned a lone surrogate in Subject (PST 2/3) or Body
+    # (PST 1); SQLite could not encode it and the whole message was lost at
+    # persist-message. The bad code unit becomes U+FFFD; the rest is kept.
+    pst_path = tmp_path / "archive.pst"
+    source = PstSource(pst_path, "file", pst_path)
+    database_path = initialize_database(tmp_path / "evidence.db")
+    poisoned = "before \udc8f after"
+    raw = {
+        "subject": "Plain subject",
+        "sender": {"name": "Sean", "email": "sean@example.com"},
+        "body_text": "Plain body",
+    }
+    if field == "sender_name":
+        raw["sender"] = {"name": poisoned, "email": "sean@example.com"}
+    else:
+        raw[field] = poisoned
+    reader = FakeOutlookReader(
+        [
+            RawOutlookMessage(
+                raw_message=raw,
+                folder_path="Inbox",
+                logical_locator="entry-surrogate",
+                display_recipients={"to": "", "cc": "", "bcc": ""},
+                recipients=(),
+            )
+        ]
+    )
+
+    summary = import_pst_sources(
+        database_path=database_path,
+        sources=[source],
+        reader=reader,
+        summary_root=tmp_path / "recipient-extraction",
+    )
+
+    connection = sqlite3.connect(database_path)
+    try:
+        stored = connection.execute(
+            "SELECT subject, body_text, sender_name FROM messages"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert summary.failure_count == 0
+    assert summary.imported_messages == 1
+    expected = {
+        "subject": "Plain subject",
+        "body_text": "Plain body",
+        "sender_name": "Sean",
+        field: "before � after",
+    }
+    assert stored == (
+        expected["subject"],
+        expected["body_text"],
+        expected["sender_name"],
+    )
+
+
 def test_import_pst_sources_backend_argument_selects_parser_without_reader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 def build_participant_search_text(display_name: str | None, email: str | None) -> str:
@@ -385,7 +388,10 @@ def _normalize_body_text(raw_value: object) -> str:
 def _coerce_text(raw_value: object) -> str:
     if raw_value is None:
         return ""
-    return str(raw_value).strip()
+    text = str(raw_value).strip()
+    # A lone surrogate (Outlook COM returns them in Subject/Body, #42) cannot
+    # be encoded by SQLite and would lose the whole message at persist time.
+    return _LONE_SURROGATE.sub("�", text) if _LONE_SURROGATE.search(text) else text
 
 
 def _coerce_optional_text(raw_value: object) -> str | None:
