@@ -67,7 +67,6 @@ from .models import (
 from .mutf7 import encode_mutf7
 from .parser import subject_from_raw_headers
 from .query import (
-    PUBLIC_WEBMAIL_DOMAINS,
     RecipientFamiliarity,
     check_recipient_familiarity,
     get_message,
@@ -78,9 +77,6 @@ from .query import (
 from .storage import connect_database, persist_message, record_ingest_failure
 
 __all__ = [
-    "PUBLIC_WEBMAIL_DOMAINS",
-    "RecipientFamiliarity",
-    "check_recipient_familiarity",
     "reply_all_recipients",
     "build_thread_headers",
     "build_quoted_reply_bodies",
@@ -894,7 +890,7 @@ class DraftReplyResult:
     fingerprint: str
     body_text: str = ""
     attachment_sources: tuple[tuple[str, str, int], ...] = ()
-    recipient_checks: tuple[tuple[str, str], ...] = ()
+    recipient_checks: tuple[RecipientFamiliarity, ...] = ()
 
 
 def _validate_custom_subject(subject: str) -> None:
@@ -1082,7 +1078,7 @@ def assemble_draft_reply(
         familiarity = check_recipient_familiarity(
             database_path, explicit_recipient_addresses, read_only=read_only
         )
-        recipient_checks = tuple((item.address, item.mark) for item in familiarity)
+        recipient_checks = tuple(familiarity)
     else:
         recipient_checks = ()
 
@@ -1500,6 +1496,47 @@ def _format_recipient_summary(
     return ", ".join(parts)
 
 
+def _extract_explicit_recipients_for_send(
+    msg: EmailMessage,
+    database_path: Path | str,
+    recipients_by_header: Mapping[str, list[tuple[str | None, str]]],
+) -> list[str]:
+    """Return explicit recipient addresses on draft.
+
+    Excludes self and anchor-derived recipients.
+    """
+    own_addr = extract_address(str(msg.get("From", "")))
+    self_addrs = {own_addr}
+    with contextlib.suppress(FileNotFoundError, sqlite3.Error):
+        self_addrs.update(
+            extract_address(a)
+            for a in _declared_self_addresses(database_path, read_only=True)
+        )
+
+    derived_addresses: set[str] = set()
+    in_reply_to = str(msg.get("In-Reply-To", "")).strip()
+    if in_reply_to:
+        with contextlib.suppress(KeyError, FileNotFoundError, sqlite3.Error):
+            original = _get_message_by_rfc822_message_id(
+                database_path, in_reply_to, read_only=True
+            )
+            derived = reply_all_recipients(original, self_addrs)
+            derived_addresses = {
+                extract_address(addr)
+                for bucket in ("to", "cc")
+                for _, addr in derived[bucket]
+            }
+
+    explicit_addresses: list[str] = []
+    for bucket in ("To", "Cc", "Bcc"):
+        for _, addr in recipients_by_header.get(bucket, []):
+            clean = extract_address(addr)
+            if clean and clean not in self_addrs and clean not in derived_addresses:
+                explicit_addresses.append(addr)
+
+    return list(dict.fromkeys(explicit_addresses))
+
+
 def _prepare_draft_for_send(
     draft_id: str,
     database_path: Path | str,
@@ -1571,53 +1608,17 @@ def _prepare_draft_for_send(
 
         db_path_obj = Path(database_path)
         if db_path_obj.exists():
-            try:
-                own_addr = extract_address(str(msg.get("From", "")))
-                self_addrs = {own_addr}
-                with contextlib.suppress(Exception):
-                    self_addrs.update(
-                        extract_address(a)
-                        for a in _declared_self_addresses(database_path, read_only=True)
-                    )
-
-                derived_addresses: set[str] = set()
-                in_reply_to = str(msg.get("In-Reply-To", "")).strip()
-                if in_reply_to:
-                    try:
-                        original = _get_message_by_rfc822_message_id(
-                            database_path, in_reply_to, read_only=True
-                        )
-                        derived = reply_all_recipients(original, self_addrs)
-                        derived_addresses = {
-                            extract_address(addr)
-                            for bucket in ("to", "cc")
-                            for _, addr in derived[bucket]
-                        }
-                    except (KeyError, FileNotFoundError, sqlite3.Error):
-                        derived_addresses = set()
-
-                explicit_addresses: list[str] = []
-                for bucket in ("To", "Cc", "Bcc"):
-                    for _, addr in recipients_by_header[bucket]:
-                        clean = extract_address(addr)
-                        if (
-                            clean
-                            and clean not in self_addrs
-                            and clean not in derived_addresses
-                        ):
-                            explicit_addresses.append(addr)
-
-                explicit_addresses = list(dict.fromkeys(explicit_addresses))
-                if explicit_addresses:
-                    familiarity = check_recipient_familiarity(
-                        database_path, explicit_addresses, read_only=True
-                    )
-                    summary_line += "  Recipient check:\n"
-                    for item in familiarity:
-                        addr_str = _sanitize_for_terminal(item.address)
-                        summary_line += f"    - {addr_str}: {item.mark}\n"
-            except Exception:
-                pass
+            explicit_addresses = _extract_explicit_recipients_for_send(
+                msg, database_path, recipients_by_header
+            )
+            if explicit_addresses:
+                familiarity = check_recipient_familiarity(
+                    database_path, explicit_addresses, read_only=True
+                )
+                summary_line += "  Recipient check:\n"
+                for item in familiarity:
+                    addr_str = _sanitize_for_terminal(item.address)
+                    summary_line += f"    - {addr_str}: {item.mark}\n"
     except Exception as exc:  # noqa: BLE001 -- message_id is already known here
         raise _PrepFailure(
             message_id,

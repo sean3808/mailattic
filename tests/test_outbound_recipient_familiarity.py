@@ -8,14 +8,16 @@ import pytest
 from mailattic.cli import build_parser
 from mailattic.models import PstSource, build_normalized_message
 from mailattic.outbound import (
-    PUBLIC_WEBMAIL_DOMAINS,
-    check_recipient_familiarity,
     draft_fingerprint,
 )
 from mailattic.outbound_commands import (
     _handle_draft_reply,
     _handle_send_batch,
     _handle_send_draft,
+)
+from mailattic.query import (
+    PUBLIC_WEBMAIL_DOMAINS,
+    check_recipient_familiarity,
 )
 from mailattic.storage import (
     connect_database,
@@ -551,3 +553,23 @@ def test_send_batch_shows_recomputed_marks_per_draft(
     batch_stdout = capsys.readouterr().out
     assert "Recipient check:" in batch_stdout
     assert "batch_contact@testbiz.com: seen" in batch_stdout
+
+
+def test_check_recipient_familiarity_quoted_local_part_at_domain(
+    tmp_path: Path,
+) -> None:
+    db_path = initialize_database(tmp_path / "scratch.db")
+    _seed_custom_message(
+        db_path,
+        message_id="<msg-seed-quoted@mailattic.test>",
+        sender_email="colleague@knowncorp.test",
+    )
+
+    addresses_to_check = [
+        '"user@corp"@knowncorp.test',
+    ]
+    results = check_recipient_familiarity(db_path, addresses_to_check)
+    assert len(results) == 1
+    assert results[0].seen is False
+    assert results[0].domain_seen is True
+    assert results[0].mark == "never seen (domain seen)"

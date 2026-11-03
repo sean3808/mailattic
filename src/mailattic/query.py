@@ -2205,7 +2205,7 @@ def check_recipient_familiarity(
             seen_set = {row[0] for row in cursor.fetchall() if row[0]}
 
         domains_to_check = {
-            clean.partition("@")[2].strip()
+            clean.rpartition("@")[2].strip()
             for clean in unique_clean
             if clean not in seen_set
         }
@@ -2232,7 +2232,7 @@ def check_recipient_familiarity(
         results: list[RecipientFamiliarity] = []
         for addr, clean in zip(addresses, clean_addresses, strict=False):
             seen = clean in seen_set
-            domain = clean.partition("@")[2].strip() if clean else ""
+            domain = clean.rpartition("@")[2].strip() if clean else ""
             domain_seen = (
                 seen_domains.get(domain, False) if (not seen and domain) else False
             )
@@ -2244,11 +2244,6 @@ def check_recipient_familiarity(
                 )
             )
         return results
-    except sqlite3.OperationalError:
-        return [
-            RecipientFamiliarity(address=addr, seen=False, domain_seen=False)
-            for addr in addresses
-        ]
     finally:
         if owns_connection:
             connection.close()

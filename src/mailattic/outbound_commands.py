@@ -279,8 +279,8 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
     print(f"fingerprint: {result.fingerprint}")
     if result.recipient_checks:
         print("Recipient check:")
-        for addr, mark in result.recipient_checks:
-            print(f"  - {safe(addr)}: {mark}")
+        for item in result.recipient_checks:
+            print(f"  - {safe(item.address)}: {item.mark}")
     return 0
 
 
