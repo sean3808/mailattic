@@ -1272,7 +1272,7 @@ def test_attachments_cli_message_filter_exports_exact_message_attachment(
     # Python API direct test
     results_msg1 = search_attachments(
         database_path=database_path,
-        filters=SearchFilters(message_id=msg1_id),
+        filters=SearchFilters(message_db_id=msg1_id),
     )
     assert len(results_msg1) == 1
     assert results_msg1[0]["content_hash"] == rec1.content_hash
@@ -1280,7 +1280,7 @@ def test_attachments_cli_message_filter_exports_exact_message_attachment(
 
     results_msg2 = search_attachments(
         database_path=database_path,
-        filters=SearchFilters(message_id=msg2_id),
+        filters=SearchFilters(message_db_id=msg2_id),
     )
     assert len(results_msg2) == 1
     assert results_msg2[0]["content_hash"] == rec2.content_hash

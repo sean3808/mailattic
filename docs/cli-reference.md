@@ -134,7 +134,7 @@ Windows-native IMAP sync 從這次指定的 `--env-file` 讀取 `IMAP_SECURITY`�
 from mailattic.query import search_messages, SearchFilters, get_message
 ```
 
-- `SearchFilters(keyword, sender, recipient, sender_domain, recipient_domain, participants_domain, sent_from, sent_to, attachment_name, attachment_ext, message_id)` — 全 optional
+- `SearchFilters(keyword, sender, recipient, sender_domain, recipient_domain, participants_domain, sent_from, sent_to, attachment_name, attachment_ext, message_db_id)` — 全 optional
 - `search_messages(filters, full_body=False)` — 預設 lightweight summary；`full_body=True` 加上 `rendered_body_text` / `dedup_key` / thread 欄位 / `to` / `cc` / `bcc`
 - `get_message(message_id_or_db_id)` — 完整 body / recipients / attachments
 
