@@ -11,6 +11,7 @@ from mailattic.outbound import (
     draft_fingerprint,
 )
 from mailattic.outbound_commands import (
+    _handle_draft_new,
     _handle_draft_reply,
     _handle_send_batch,
     _handle_send_draft,
@@ -481,6 +482,96 @@ def test_plain_reply_all_draft_send_review_has_no_recipient_check(
 
     send_stdout = capsys.readouterr().out
     assert "Recipient check:" not in send_stdout
+
+
+def test_explicit_own_address_marked_at_draft_and_send_but_bcc_self_never(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # #46: every caller-given address is marked at draft time and again at the
+    # send review; only the automatic BCC-self is never listed (even when the
+    # caller also passes it as --bcc, it is the same single Bcc entry).
+    db_path = initialize_database(tmp_path / "evidence.db")
+    _seed_custom_message(
+        db_path,
+        message_id="<seed-msg@mailattic.test>",
+        sender_email="client@example.com",
+        to_emails=[SMTP_USER],
+    )
+    body_file = tmp_path / "body.txt"
+    body_file.write_text("Note to self", encoding="utf-8")
+
+    args_draft = build_parser().parse_args(
+        [
+            "draft-new",
+            "--to",
+            SMTP_USER,
+            "--bcc",
+            SMTP_USER,
+            "--subject",
+            "Memo",
+            "--body-from",
+            str(body_file),
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(_placeholder_env_file(tmp_path)),
+        ]
+    )
+    assert _handle_draft_new(args_draft) == 0
+    draft_stdout = capsys.readouterr().out
+    assert draft_stdout.count(f"{SMTP_USER}: seen") == 1
+
+    draft_path = next((tmp_path / "outbound" / "drafts").glob("*.eml"))
+    fingerprint = draft_fingerprint(draft_path.read_bytes())
+
+    monkeypatch.setattr(
+        "mailattic.outbound._smtp_submit", MagicMock(return_value=({}, None))
+    )
+    monkeypatch.setattr("mailattic.outbound._append_sent_copy", MagicMock())
+    args_send = build_parser().parse_args(
+        [
+            "send-draft",
+            draft_path.stem,
+            "--fingerprint",
+            fingerprint,
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(_placeholder_env_file(tmp_path)),
+        ]
+    )
+    assert _handle_send_draft(args_send) == 0
+    send_stdout = capsys.readouterr().out
+    assert send_stdout.count(f"{SMTP_USER}: seen") == 1
+
+
+def test_explicit_bcc_own_address_is_bcc_self_and_not_marked_at_draft(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db_path = initialize_database(tmp_path / "evidence.db")
+    body_file = tmp_path / "body.txt"
+    body_file.write_text("Hi", encoding="utf-8")
+    args_draft = build_parser().parse_args(
+        [
+            "draft-new",
+            "--to",
+            "partner@example.com",
+            "--bcc",
+            SMTP_USER.upper(),
+            "--subject",
+            "Hello",
+            "--body-from",
+            str(body_file),
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(_placeholder_env_file(tmp_path)),
+        ]
+    )
+    assert _handle_draft_new(args_draft) == 0
+    stdout = capsys.readouterr().out
+    assert "partner@example.com: never seen" in stdout
+    assert f"{SMTP_USER.upper()}:" not in stdout
 
 
 def test_send_batch_shows_recomputed_marks_per_draft(

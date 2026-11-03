@@ -1005,13 +1005,20 @@ def _check_explicit_recipients_familiarity(
     to: Sequence[str] | None = None,
     cc: Sequence[str] | None = None,
     bcc: Sequence[str] | None = None,
+    own_address: str,
     read_only: bool = False,
 ) -> tuple[RecipientFamiliarity, ...]:
-    """Extract explicit addresses from options and check familiarity against DB."""
+    """Extract explicit addresses from options and check familiarity against DB.
+
+    ``--bcc <own address>`` is the automatic BCC-self entry and is never
+    listed, matching the send-time review.
+    """
+    own = extract_address(own_address)
     explicit_recipient_addresses: list[str] = [
         addr
         for values, flag in ((to, "--to"), (cc, "--cc"), (bcc, "--bcc"))
         for _disp, addr in _parse_recipient_options(values, flag)
+        if not (flag == "--bcc" and extract_address(addr) == own)
     ]
     explicit_recipient_addresses = list(dict.fromkeys(explicit_recipient_addresses))
     if explicit_recipient_addresses:
@@ -1154,6 +1161,7 @@ def assemble_draft_reply(
         to=to,
         cc=cc,
         bcc=bcc,
+        own_address=own_address,
         read_only=read_only,
     )
 
@@ -1278,6 +1286,7 @@ def assemble_draft_new(
         to=to,
         cc=cc,
         bcc=bcc,
+        own_address=own_address,
         read_only=read_only,
     )
 
@@ -1702,7 +1711,8 @@ def _extract_explicit_recipients_for_send(
 ) -> list[str]:
     """Return explicit recipient addresses on draft.
 
-    Excludes self and anchor-derived recipients.
+    Excludes anchor-derived recipients and the automatic BCC-self (the From
+    address in Bcc); an own address given as To/Cc is still explicit (#46).
     """
     own_addr = extract_address(str(msg.get("From", "")))
     self_addrs = {own_addr}
@@ -1730,7 +1740,9 @@ def _extract_explicit_recipients_for_send(
     for bucket in ("To", "Cc", "Bcc"):
         for _, addr in recipients_by_header.get(bucket, []):
             clean = extract_address(addr)
-            if clean and clean not in self_addrs and clean not in derived_addresses:
+            if bucket == "Bcc" and clean == own_addr:
+                continue
+            if clean and clean not in derived_addresses:
                 explicit_addresses.append(addr)
 
     return list(dict.fromkeys(explicit_addresses))
