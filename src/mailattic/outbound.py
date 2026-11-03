@@ -652,6 +652,24 @@ def _is_archive_copy(message: Mapping[str, object] | sqlite3.Row) -> bool:
     return source_input_mode == "archive" or pst_source.startswith("archive:")
 
 
+def _append_bcc_self_and_explicit(
+    result_bcc: list[tuple[str | None, str]],
+    parsed_bcc: Sequence[tuple[str | None, str]],
+    *,
+    own_address: str,
+    seen: set[str],
+) -> None:
+    """Preserve automatic Bcc-self and append deduplicated explicit BCC recipients."""
+    result_bcc.append((None, own_address))
+    bcc_seen = {own_address.casefold()}
+    for recipient in parsed_bcc:
+        normalized = recipient[1].casefold()
+        if normalized in seen or normalized in bcc_seen:
+            continue
+        bcc_seen.add(normalized)
+        result_bcc.append(recipient)
+
+
 def _resolve_draft_recipients(
     original: dict[str, object],
     *,
@@ -713,14 +731,12 @@ def _resolve_draft_recipients(
 
     # Preserve the existing automatic Bcc-self safety copy independently of
     # caller-controlled To/Cc selection.
-    result["bcc"].append((None, own_address))
-    bcc_seen = {own_address.casefold()}
-    for recipient in parsed_explicit["bcc"]:
-        normalized = recipient[1].casefold()
-        if normalized in seen or normalized in bcc_seen:
-            continue
-        bcc_seen.add(normalized)
-        result["bcc"].append(recipient)
+    _append_bcc_self_and_explicit(
+        result["bcc"],
+        parsed_explicit["bcc"],
+        own_address=own_address,
+        seen=seen,
+    )
 
     return result
 
@@ -922,6 +938,86 @@ def _validate_custom_subject(subject: str) -> None:
         )
 
 
+def _attach_files(
+    msg: EmailMessage,
+    attachments: Sequence[str | Path] | None,
+    *,
+    error_cls: type[DraftError] = DraftReplyError,
+) -> list[tuple[Path, bytes]]:
+    """Validate, read, and attach files to an EmailMessage."""
+    attachment_payloads: list[tuple[Path, bytes]] = []
+    for path_item in attachments or []:
+        path = Path(path_item)
+        try:
+            if not path.is_file():
+                raise error_cls(f"Attachment path is not a file: {path}")
+            data = path.read_bytes()
+        except OSError as exc:
+            raise error_cls(f"Could not read attachment file {path}: {exc}") from exc
+        attachment_payloads.append((path, data))
+
+    for path, data in attachment_payloads:
+        maintype, subtype = resolve_attachment_mime_type(path.name)
+        if (maintype, subtype) == ("message", "rfc822"):
+            nested = _round_trippable_nested_message(data)
+            if nested is not None:
+                msg.add_attachment(nested, filename=path.name)
+                continue
+            # Not provably preserved as a nested message (raw 8-bit headers,
+            # parse defects): keep the original bytes as a binary attachment.
+            maintype, subtype = "application", "octet-stream"
+        msg.add_attachment(
+            data,
+            maintype=maintype,
+            subtype=subtype,
+            filename=path.name,
+        )
+    return attachment_payloads
+
+
+def _write_draft_eml(
+    database_path: str | Path,
+    draft_id: str,
+    msg: EmailMessage,
+    *,
+    draft_dir: str | Path | None = None,
+) -> tuple[Path, bytes]:
+    """Write draft to <draft_dir>/<draft_id>.eml with CRLF line endings.
+
+    Outlook drops the character after a QP soft break that ends in a bare LF,
+    so the reviewed preview would differ (#33).
+    """
+    out_dir = Path(draft_dir) if draft_dir is not None else _draft_dir(database_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    draft_path = out_dir / f"{draft_id}.eml"
+    draft_bytes = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
+    draft_path.write_bytes(draft_bytes)
+    return draft_path, draft_bytes
+
+
+def _check_explicit_recipients_familiarity(
+    database_path: str | Path,
+    *,
+    to: Sequence[str] | None = None,
+    cc: Sequence[str] | None = None,
+    bcc: Sequence[str] | None = None,
+    read_only: bool = False,
+) -> tuple[RecipientFamiliarity, ...]:
+    """Extract explicit addresses from options and check familiarity against DB."""
+    explicit_recipient_addresses: list[str] = [
+        addr
+        for values, flag in ((to, "--to"), (cc, "--cc"), (bcc, "--bcc"))
+        for _disp, addr in _parse_recipient_options(values, flag)
+    ]
+    explicit_recipient_addresses = list(dict.fromkeys(explicit_recipient_addresses))
+    if explicit_recipient_addresses:
+        familiarity = check_recipient_familiarity(
+            database_path, explicit_recipient_addresses, read_only=read_only
+        )
+        return tuple(familiarity)
+    return ()
+
+
 def assemble_draft_reply(
     database_path: str | Path,
     message_id: str,
@@ -1045,57 +1141,17 @@ def assemble_draft_reply(
     msg.set_content(plain_body, charset="utf-8")
     msg.add_alternative(html_body, subtype="html", charset="utf-8")
 
-    attachment_payloads: list[tuple[Path, bytes]] = []
-    for path_item in attachments or []:
-        path = Path(path_item)
-        try:
-            if not path.is_file():
-                raise DraftReplyError(f"Attachment path is not a file: {path}")
-            data = path.read_bytes()
-        except OSError as exc:
-            raise DraftReplyError(
-                f"Could not read attachment file {path}: {exc}"
-            ) from exc
-        attachment_payloads.append((path, data))
-
-    for path, data in attachment_payloads:
-        maintype, subtype = resolve_attachment_mime_type(path.name)
-        if (maintype, subtype) == ("message", "rfc822"):
-            nested = _round_trippable_nested_message(data)
-            if nested is not None:
-                msg.add_attachment(nested, filename=path.name)
-                continue
-            # Not provably preserved as a nested message (raw 8-bit headers,
-            # parse defects): keep the original bytes as a binary attachment.
-            maintype, subtype = "application", "octet-stream"
-        msg.add_attachment(
-            data,
-            maintype=maintype,
-            subtype=subtype,
-            filename=path.name,
-        )
-
-    out_dir = Path(draft_dir) if draft_dir is not None else _draft_dir(database_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    draft_path = out_dir / f"{draft_id}.eml"
-    # CRLF like the wire copy: Outlook drops the character after a QP soft
-    # break that ends in a bare LF, so the reviewed preview would differ (#33).
-    draft_bytes = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
-    draft_path.write_bytes(draft_bytes)
-
-    explicit_recipient_addresses: list[str] = [
-        addr
-        for values, flag in ((to, "--to"), (cc, "--cc"), (bcc, "--bcc"))
-        for _disp, addr in _parse_recipient_options(values, flag)
-    ]
-    explicit_recipient_addresses = list(dict.fromkeys(explicit_recipient_addresses))
-    if explicit_recipient_addresses:
-        familiarity = check_recipient_familiarity(
-            database_path, explicit_recipient_addresses, read_only=read_only
-        )
-        recipient_checks = tuple(familiarity)
-    else:
-        recipient_checks = ()
+    attachment_payloads = _attach_files(msg, attachments, error_cls=DraftReplyError)
+    draft_path, draft_bytes = _write_draft_eml(
+        database_path, draft_id, msg, draft_dir=draft_dir
+    )
+    recipient_checks = _check_explicit_recipients_familiarity(
+        database_path,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        read_only=read_only,
+    )
 
     return DraftReplyResult(
         draft_id=draft_id,
@@ -1187,14 +1243,12 @@ def assemble_draft_new(
         raise DraftNewError("draft-new: at least one To recipient is required")
 
     # Automatic BCC-self
-    result_recipients["bcc"].append((None, own_address))
-    bcc_seen = {own_address.casefold()}
-    for recipient in parsed_bcc:
-        normalized = recipient[1].casefold()
-        if normalized in seen or normalized in bcc_seen:
-            continue
-        bcc_seen.add(normalized)
-        result_recipients["bcc"].append(recipient)
+    _append_bcc_self_and_explicit(
+        result_recipients["bcc"],
+        parsed_bcc,
+        own_address=own_address,
+        seen=seen,
+    )
 
     draft_message_id = generate_draft_message_id(own_address)
     draft_id = str(uuid.uuid4())
@@ -1221,53 +1275,17 @@ def assemble_draft_new(
     msg.set_content(plain_body, charset="utf-8")
     msg.add_alternative(html_body, subtype="html", charset="utf-8")
 
-    attachment_payloads: list[tuple[Path, bytes]] = []
-    for path_item in attachments or []:
-        path = Path(path_item)
-        try:
-            if not path.is_file():
-                raise DraftNewError(f"Attachment path is not a file: {path}")
-            data = path.read_bytes()
-        except OSError as exc:
-            raise DraftNewError(
-                f"Could not read attachment file {path}: {exc}"
-            ) from exc
-        attachment_payloads.append((path, data))
-
-    for path, data in attachment_payloads:
-        maintype, subtype = resolve_attachment_mime_type(path.name)
-        if (maintype, subtype) == ("message", "rfc822"):
-            nested = _round_trippable_nested_message(data)
-            if nested is not None:
-                msg.add_attachment(nested, filename=path.name)
-                continue
-            maintype, subtype = "application", "octet-stream"
-        msg.add_attachment(
-            data,
-            maintype=maintype,
-            subtype=subtype,
-            filename=path.name,
-        )
-
-    out_dir = Path(draft_dir) if draft_dir is not None else _draft_dir(database_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    draft_path = out_dir / f"{draft_id}.eml"
-    draft_bytes = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
-    draft_path.write_bytes(draft_bytes)
-
-    explicit_recipient_addresses: list[str] = [
-        addr
-        for values, flag in ((to, "--to"), (cc, "--cc"), (bcc, "--bcc"))
-        for _disp, addr in _parse_recipient_options(values, flag)
-    ]
-    explicit_recipient_addresses = list(dict.fromkeys(explicit_recipient_addresses))
-    if explicit_recipient_addresses:
-        familiarity = check_recipient_familiarity(
-            database_path, explicit_recipient_addresses, read_only=read_only
-        )
-        recipient_checks = tuple(familiarity)
-    else:
-        recipient_checks = ()
+    attachment_payloads = _attach_files(msg, attachments, error_cls=DraftNewError)
+    draft_path, draft_bytes = _write_draft_eml(
+        database_path, draft_id, msg, draft_dir=draft_dir
+    )
+    recipient_checks = _check_explicit_recipients_familiarity(
+        database_path,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        read_only=read_only,
+    )
 
     return DraftNewResult(
         draft_id=draft_id,
