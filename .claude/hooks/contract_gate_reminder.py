@@ -24,6 +24,7 @@ ANCHOR_TESTS = {
     "test_imap_sync_ingest_accounting.py",
     "test_rebuild.py",
     "test_mcp_send.py",
+    "test_outbound_send_new_thread.py",
 }
 CANONICAL_DOC = "AGENTS.md"  # `## 行為契約` 段所在的檔
 MSG = (

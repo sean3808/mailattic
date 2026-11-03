@@ -88,6 +88,8 @@ __all__ = [
     "assemble_draft_reply",
     "DraftReplyError",
     "DraftReplyResult",
+    "DraftNewResult",
+    "assemble_draft_new",
     "draft_fingerprint",
     "send_draft",
     "send_batch",
@@ -893,6 +895,9 @@ class DraftReplyResult:
     recipient_checks: tuple[RecipientFamiliarity, ...] = ()
 
 
+DraftNewResult = DraftReplyResult
+
+
 def _validate_custom_subject(subject: str) -> None:
     if not subject.strip():
         raise DraftReplyError(
@@ -1083,6 +1088,178 @@ def assemble_draft_reply(
         recipient_checks = ()
 
     return DraftReplyResult(
+        draft_id=draft_id,
+        draft_path=draft_path,
+        message_id=draft_message_id,
+        from_address=str(msg["From"]),
+        subject=str(msg["Subject"]),
+        to=str(msg["To"]),
+        cc=str(msg.get("Cc", "")),
+        bcc=str(msg["Bcc"]),
+        attachments=tuple((path.name, len(data)) for path, data in attachment_payloads),
+        fingerprint=draft_fingerprint(draft_bytes),
+        body_text=plain_body,
+        attachment_sources=tuple(
+            (str(path.resolve()), path.name, len(data))
+            for path, data in attachment_payloads
+        ),
+        recipient_checks=recipient_checks,
+    )
+
+
+def assemble_draft_new(
+    database_path: str | Path,
+    *,
+    own_address: str,
+    to: Sequence[str] | None = None,
+    subject: str,
+    draft_dir: str | Path | None = None,
+    body_text: str | None = None,
+    body_from: str | Path | None = None,
+    cc: Sequence[str] | None = None,
+    bcc: Sequence[str] | None = None,
+    attachments: Sequence[str | Path] | None = None,
+    read_only: bool = False,
+    font_style: str = "",
+) -> DraftNewResult:
+    """Build a new-thread draft and write ``<draft_dir>/<draft_id>.eml``.
+
+    Anchored to no existing message: has a freshly generated Message-ID, and no
+    In-Reply-To or References headers.
+    Required: at least one To recipient and a non-blank subject.
+    The body comes from ``body_text`` or, if that is None, the file ``body_from``.
+    From follows ``own_address`` (derived from SMTP account or the single declared
+    self address).
+    BCC-self is added automatically as for reply drafts.
+    ``font_style`` styles the HTML body.
+    Expected refusals raise ``DraftReplyError`` or ``ValueError``.
+    """
+    if subject is None or not subject.strip():
+        raise DraftReplyError("--subject must not be empty or whitespace-only.")
+    if any(unicodedata.category(char) in {"Cc", "Zl", "Zp"} for char in subject):
+        raise DraftReplyError(
+            "--subject must be a single line without control characters."
+        )
+
+    if body_text is None:
+        if body_from is None:
+            raise ValueError("Either body_text or body_from is required")
+        try:
+            body_text = Path(body_from).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise DraftReplyError(f"Could not read draft body file: {exc}") from exc
+
+    parsed_to = _parse_recipient_options(to, "--to")
+    if not parsed_to:
+        raise DraftReplyError("draft-new: at least one To recipient is required")
+    parsed_cc = _parse_recipient_options(cc, "--cc")
+    parsed_bcc = _parse_recipient_options(bcc, "--bcc")
+
+    result_recipients: dict[str, list[tuple[str | None, str]]] = {
+        "to": [],
+        "cc": [],
+        "bcc": [],
+    }
+    seen: set[str] = set()
+
+    def add(bucket: str, recipient: tuple[str | None, str]) -> None:
+        normalized = recipient[1].casefold()
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        result_recipients[bucket].append(recipient)
+
+    for bucket, parsed in (("to", parsed_to), ("cc", parsed_cc)):
+        for recipient in parsed:
+            add(bucket, recipient)
+
+    if not result_recipients["to"]:
+        raise DraftReplyError("draft-new: at least one To recipient is required")
+
+    # Automatic BCC-self
+    result_recipients["bcc"].append((None, own_address))
+    bcc_seen = {own_address.casefold()}
+    for recipient in parsed_bcc:
+        normalized = recipient[1].casefold()
+        if normalized in seen or normalized in bcc_seen:
+            continue
+        bcc_seen.add(normalized)
+        result_recipients["bcc"].append(recipient)
+
+    draft_message_id = generate_draft_message_id(own_address)
+    draft_id = str(uuid.uuid4())
+
+    msg = EmailMessage()
+    msg["From"] = own_address
+    msg["To"] = _format_address_header(result_recipients["to"])
+    if result_recipients["cc"]:
+        msg["Cc"] = _format_address_header(result_recipients["cc"])
+    msg["Bcc"] = _format_address_header(result_recipients["bcc"])
+    msg["Message-ID"] = draft_message_id
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+
+    plain_body = body_text
+
+    def _esc(s: str) -> str:
+        return html.escape(s).replace("\n", "<br>")
+
+    html_body = _esc(plain_body)
+    if font_style:
+        html_body = f'<div style="{font_style}">\n{html_body}\n</div>'
+
+    msg.set_content(plain_body, charset="utf-8")
+    msg.add_alternative(html_body, subtype="html", charset="utf-8")
+
+    attachment_payloads: list[tuple[Path, bytes]] = []
+    for path_item in attachments or []:
+        path = Path(path_item)
+        try:
+            if not path.is_file():
+                raise DraftReplyError(f"Attachment path is not a file: {path}")
+            data = path.read_bytes()
+        except OSError as exc:
+            raise DraftReplyError(
+                f"Could not read attachment file {path}: {exc}"
+            ) from exc
+        attachment_payloads.append((path, data))
+
+    for path, data in attachment_payloads:
+        maintype, subtype = resolve_attachment_mime_type(path.name)
+        if (maintype, subtype) == ("message", "rfc822"):
+            nested = _round_trippable_nested_message(data)
+            if nested is not None:
+                msg.add_attachment(nested, filename=path.name)
+                continue
+            maintype, subtype = "application", "octet-stream"
+        msg.add_attachment(
+            data,
+            maintype=maintype,
+            subtype=subtype,
+            filename=path.name,
+        )
+
+    out_dir = Path(draft_dir) if draft_dir is not None else _draft_dir(database_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    draft_path = out_dir / f"{draft_id}.eml"
+    draft_bytes = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
+    draft_path.write_bytes(draft_bytes)
+
+    explicit_recipient_addresses: list[str] = [
+        addr
+        for values, flag in ((to, "--to"), (cc, "--cc"), (bcc, "--bcc"))
+        for _disp, addr in _parse_recipient_options(values, flag)
+    ]
+    explicit_recipient_addresses = list(dict.fromkeys(explicit_recipient_addresses))
+    if explicit_recipient_addresses:
+        familiarity = check_recipient_familiarity(
+            database_path, explicit_recipient_addresses, read_only=read_only
+        )
+        recipient_checks = tuple(familiarity)
+    else:
+        recipient_checks = ()
+
+    return DraftNewResult(
         draft_id=draft_id,
         draft_path=draft_path,
         message_id=draft_message_id,
