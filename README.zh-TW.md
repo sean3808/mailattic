@@ -41,7 +41,7 @@ setx MAILATTIC_DB C:\path\to\mailattic.db
 |---|---|---|
 | CLI `bes` | 同一台機器上的 coding agent 與腳本 | `search`、`show`、`thread`、`attachments`、`contact-history`、`sync-imap`、`draft-reply`、`send-draft` 等。查詢類子命令可以輸出 JSON；各子命令的輸出選項見 [`docs/cli-reference.md`](docs/cli-reference.md) |
 | Python API | 同一個程序內的呼叫端 | `search_messages`、`SearchFilters`、`get_message` |
-| MCP server `bes-mcp` | 跑不了主機 CLI 的沙箱助理 | 六個讀取工具，加上附件匯出、擬回覆、寄出 |
+| MCP server `bes-mcp` | 跑不了主機 CLI 的沙箱助理 | 六個讀取工具，加上附件匯出、擬回覆、擬新信、寄出 |
 
 三個介面走同一份查詢程式，日期篩選和關鍵字在哪個介面的意思都一樣。
 

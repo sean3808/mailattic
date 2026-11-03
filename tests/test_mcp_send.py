@@ -852,3 +852,280 @@ def test_mcp_draft_reply_cleans_absent_cc_bcc(
     assert data["bcc"] == SMTP_USER
     assert data["bcc"] != "None"
     assert data["fingerprint"]
+
+
+# ---------------------------------------------------------------------------
+# Contract #7 Anchor: New-thread drafts
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_send_new_thread_draft_fingerprint_mismatch_refused_without_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract #7 Anchor:
+    When mail_send is called for an MCP new-thread draft with a mismatched
+    fingerprint, the send is refused, no send-once marker is written, and
+    no SMTP submission occurs. The error message must NOT leak the current
+    fingerprint.
+    """
+    db_path = initialize_database(tmp_path / "test.db")
+    env_file = _create_env_file(tmp_path / "smtp.env")
+    monkeypatch.setenv(ENV_VAR_SMTP_ENV_FILE, str(env_file))
+
+    server = create_server(database_path=db_path)
+
+    # 1. Draft new thread
+    draft_res = _call_tool(
+        server,
+        "mail_draft_new",
+        {
+            "to": ["Client <client@example.com>"],
+            "subject": "New Topic Subject",
+            "body_text": "Draft new thread body text",
+        },
+    )
+    assert not draft_res.is_error
+    draft_data = draft_res.structured_content
+    assert draft_data is not None
+    draft_id = draft_data["draft_id"]
+    real_fp = draft_data["fingerprint"]
+    mcp_draft_file = tmp_path / "outbound" / "mcp-drafts" / f"{draft_id}.eml"
+    assert mcp_draft_file.is_file()
+
+    # Tamper with fingerprint
+    fake_fp = "0" * 64
+    mock_smtp = _patch_smtp(monkeypatch)
+
+    send_res = _call_tool(
+        server,
+        "mail_send",
+        {"draft_id": draft_id, "fingerprint": fake_fp},
+    )
+    assert send_res.is_error
+    error_msg = send_res.content[0].text
+    assert "fingerprint mismatch" in error_msg
+    # Must NOT echo the actual fingerprint to prevent bypassing review
+    assert real_fp not in error_msg
+
+    # Verify no marker written and no SMTP submission
+    message_id_header = draft_data["message_id"]
+    marker_file = _marker_path(db_path, message_id_header)
+    assert not marker_file.exists()
+    mock_smtp.sendmail.assert_not_called()
+
+
+def test_mcp_send_new_thread_draft_success_with_matching_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contract #7 Anchor:
+    An MCP new-thread draft with a matching fingerprint sends via mail_send
+    (SMTP faked), marker updated to sent, and persisted in DB with
+    pst_source='outbound-bes'.
+    """
+    db_path = initialize_database(tmp_path / "test.db")
+    env_file = _create_env_file(tmp_path / "smtp.env")
+    monkeypatch.setenv(ENV_VAR_SMTP_ENV_FILE, str(env_file))
+
+    server = create_server(database_path=db_path)
+    draft_res = _call_tool(
+        server,
+        "mail_draft_new",
+        {
+            "to": ["Partner <partner@example.com>"],
+            "subject": "Kickoff Meeting",
+            "body_text": "Approved new thread content",
+        },
+    )
+    assert not draft_res.is_error
+    draft_id = draft_res.structured_content["draft_id"]
+    fp = draft_res.structured_content["fingerprint"]
+    outbound_msg_id = draft_res.structured_content["message_id"]
+
+    mock_smtp = _patch_smtp(monkeypatch)
+
+    send_res = _call_tool(
+        server,
+        "mail_send",
+        {"draft_id": draft_id, "fingerprint": fp},
+    )
+    assert not send_res.is_error
+    send_data = send_res.structured_content
+    assert send_data["status"] == "sent"
+    assert send_data["message_id"] == outbound_msg_id
+    assert send_data["draft_id"] == draft_id
+
+    mock_smtp.sendmail.assert_called_once()
+
+    # Marker updated to sent
+    marker_file = _marker_path(db_path, outbound_msg_id)
+    assert marker_file.is_file()
+    marker = json.loads(marker_file.read_text(encoding="utf-8"))
+    assert marker["status"] == "sent"
+
+    # Message persisted in DB with pst_source='outbound-bes'
+    conn = connect_database(db_path)
+    try:
+        row = conn.execute(
+            "SELECT pst_source, body_text FROM messages WHERE message_id=?",
+            [outbound_msg_id],
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "outbound-bes"
+        assert "Approved new thread content" in row[1]
+    finally:
+        conn.close()
+
+
+def test_mcp_send_refuses_cli_draft_new_drafts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mail_send reads ONLY from the MCP-dedicated drafts directory.
+    A new-thread draft created in the CLI drafts directory (outbound/drafts/)
+    is refused, even when supplied with its valid fingerprint.
+    """
+    db_path = initialize_database(tmp_path / "test.db")
+    env_file = _create_env_file(tmp_path / "smtp.env")
+    monkeypatch.setenv(ENV_VAR_SMTP_ENV_FILE, str(env_file))
+
+    # Create a draft in CLI drafts folder using assemble_draft_new
+    cli_drafts_dir = tmp_path / "outbound" / "drafts"
+    cli_res = outbound_module.assemble_draft_new(
+        database_path=db_path,
+        own_address=SMTP_USER,
+        to=["client@example.com"],
+        subject="CLI Draft New",
+        body_text="CLI new thread draft body",
+        draft_dir=cli_drafts_dir,
+    )
+    cli_draft_id = cli_res.draft_id
+    cli_fp = cli_res.fingerprint
+    cli_msg_id = cli_res.message_id
+
+    server = create_server(database_path=db_path)
+    mock_smtp = _patch_smtp(monkeypatch)
+
+    send_res = _call_tool(
+        server,
+        "mail_send",
+        {"draft_id": cli_draft_id, "fingerprint": cli_fp},
+    )
+    assert send_res.is_error
+    err_text = send_res.content[0].text
+    assert (
+        "not found in MCP drafts folder" in err_text or "not found" in err_text.lower()
+    )
+
+    # No marker, no SMTP
+    assert not _marker_path(db_path, cli_msg_id).exists()
+    mock_smtp.sendmail.assert_not_called()
+
+
+def test_mcp_draft_new_output_contains_familiarity_marks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mail_draft_new output carries the #47 recipient familiarity marks
+    in recipient_checks so CoWork can name never-seen recipients before
+    asking to send.
+    """
+    db_path = initialize_database(tmp_path / "test.db")
+    # Seed an existing message: sender is external@example.com,
+    # to is sean3808@mailattic.test
+    _seed_message(db_path)
+    env_file = _create_env_file(tmp_path / "smtp.env")
+    monkeypatch.setenv(ENV_VAR_SMTP_ENV_FILE, str(env_file))
+
+    server = create_server(database_path=db_path)
+    res = _call_tool(
+        server,
+        "mail_draft_new",
+        {
+            "to": [
+                "external@example.com",
+                "new_user@example.com",
+                "stranger@unknown-world.org",
+            ],
+            "subject": "Familiarity Check",
+            "body_text": "Hello all",
+        },
+    )
+    assert not res.is_error
+    data = res.structured_content
+    assert data is not None
+    checks = data.get("recipient_checks")
+    assert isinstance(checks, list)
+
+    marks_by_addr = {item["address"]: item["mark"] for item in checks}
+    assert marks_by_addr["external@example.com"] == "seen"
+    assert marks_by_addr["new_user@example.com"] == "never seen (domain seen)"
+    assert marks_by_addr["stranger@unknown-world.org"] == "never seen"
+    # BCC-self is never listed in recipient_checks
+    assert SMTP_USER not in marks_by_addr
+
+
+def test_mcp_draft_new_ladder_reduces_large_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a mail_draft_new body is massive, the ladder shrinks body_text
+    to fit within MCP_RESPONSE_BUDGET_CHARS, reporting response_truncated=True
+    and withholding the fingerprint (fingerprint=None).
+    """
+    db_path = initialize_database(tmp_path / "test.db")
+    env_file = _create_env_file(tmp_path / "smtp.env")
+    monkeypatch.setenv(ENV_VAR_SMTP_ENV_FILE, str(env_file))
+
+    massive_body = "B" * 130_000
+    server = create_server(database_path=db_path)
+    res = _call_tool(
+        server,
+        "mail_draft_new",
+        {
+            "to": ["user@example.com"],
+            "subject": "Massive Body Test",
+            "body_text": massive_body,
+        },
+    )
+    assert not res.is_error
+    data = res.structured_content
+    assert data is not None
+    assert data["response_truncated"] is True
+    assert len(data["body_text"]) < len(massive_body)
+    assert len(res.content[0].text) <= 120_000
+    assert "... [" in data["body_text"]
+    assert "truncated" in data["body_text"]
+    # Withhold fingerprint when body is truncated
+    assert data["fingerprint"] is None
+
+
+def test_mcp_draft_new_refusals_reach_caller_with_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expected refusals from mail_draft_new return clear tool errors."""
+    db_path = initialize_database(tmp_path / "test.db")
+    env_file = _create_env_file(tmp_path / "smtp.env")
+    monkeypatch.setenv(ENV_VAR_SMTP_ENV_FILE, str(env_file))
+
+    server = create_server(database_path=db_path)
+
+    # Empty subject
+    res1 = _call_tool(
+        server,
+        "mail_draft_new",
+        {"to": ["user@example.com"], "subject": "   ", "body_text": "body"},
+    )
+    assert res1.is_error
+    assert "subject must not be empty" in res1.content[0].text.lower()
+
+    # Empty to
+    res2 = _call_tool(
+        server,
+        "mail_draft_new",
+        {"to": [], "subject": "Subject", "body_text": "body"},
+    )
+    assert res2.is_error
+    assert "at least one to recipient is required" in res2.content[0].text.lower()

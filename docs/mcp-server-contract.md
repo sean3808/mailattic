@@ -6,7 +6,7 @@
 
 讀取工具六個：`mail_search`（找）／`mail_show`（開單封）／`mail_thread`（看整串）／`mail_contact_history`（歷年往來摘要；封數含 `inbound_count` / `outbound_count` / `unknown_count`，三者相加等於 `total_messages`）／`mail_attachments`（附件 metadata，永不回傳檔案內容）／`mail_sync_status`（同步新鮮度，零參數）。
 
-寫入工具三個：
+寫入工具四個：
 - `mail_attachment_export`（issue `#28`，D-20260730-1 第 4 步 write tier）—— 把 CAS 已存的附件複製到呼叫端指定的 **host 絕對路徑**，回傳每筆落地後的絕對路徑，不回檔案內容。
   - 輸入：`attachment_ids`（`mail_attachments` 的 `attachment_id`，或 `mail_show`／`mail_thread` 的 `attachments[].id`），每次 1～50 筆，重複的 id 只回一筆；`dest_dir` 必須是絕對路徑、至多 200 字元，不存在就建立。相對路徑、超量直接拒絕，不寫任何檔。
   - 路徑由呼叫端決定（#167 定案模型 A）：CoWork 知道自己連進了哪些資料夾，傳一個自己讀得回來的 host 路徑；傳錯當場就看得到。
@@ -17,6 +17,9 @@
 - `mail_draft_reply`（issue `#189`，D-20260924-1）—— 對指定信件建立回信草稿（預設存於 `outbound/mcp-drafts/`），輸出 `draft_id`、完整 envelope、主旨、`fingerprint`（`.eml` bytes SHA-256）與呈審內文。草稿的 From 是 `MAILATTIC_SMTP_ENV_FILE` 寄件設定的帳號；讀不到設定時退回 `self_addresses` 表裡唯一的那一筆，零筆或多筆就拒絕擬稿（[D-20261013-1](decisions/D-20261013-1-mcp-draft-from-follows-smtp-account.md)）。
   - 輸入：`message_id`、`body_text`，選填 `to`、`cc`、`bcc`、`exclude`、`replace_recipients`、`attachments`。不提供 CLI 的 `--allow-archive-anchor`：那是「呼叫者已人工核對收件人」的聲明，CoWork 被信件內容誘導時不該能代為聲明。
   - 輸出包含：`draft_id`、`fingerprint`、`message_id`、`from`、`subject`、`to`、`cc`、`bcc`、`body_text`、`attachments`（含來源 host 路徑與大小），並帶 `response_truncated`：當 `body_text` 龐大時啟動降級階梯縮減內文（保留前後摘要），其餘 metadata 不截斷。**內文一旦被截斷，`fingerprint` 回 `null`**：使用者沒看到全文，就沒有「看過的草稿」可寄；草稿仍留在資料夾，但無法經 `mail_send` 寄出。
+- `mail_draft_new`（issue `#49`，放寬契約 #7）—— 建立新信草稿（預設存於 `outbound/mcp-drafts/`），輸出 `draft_id`、完整 envelope、主旨、`fingerprint`（`.eml` bytes SHA-256）、呈審內文與收件人熟稔度標記（#47）。草稿的 From 是 `MAILATTIC_SMTP_ENV_FILE` 寄件設定的帳號；讀不到設定時退回 `self_addresses` 表裡唯一的那一筆，零筆或多筆就拒絕擬稿。
+  - 輸入：`to`（至少一筆）、`subject`（非空白）、`body_text`，選填 `cc`、`bcc`、`attachments`。無 In-Reply-To 與 References，自動帶入 BCC-self。
+  - 輸出包含：`draft_id`、`fingerprint`、`message_id`、`from`、`subject`、`to`、`cc`、`bcc`、`body_text`、`attachments`（含來源 host 路徑與大小）、`recipient_checks`（每筆帶 `address`、`seen`、`domain_seen`、`mark`），並帶 `response_truncated`。與 `mail_draft_reply` 相同：內文一旦被截斷，`fingerprint` 回 `null`；使用者沒看到完整草稿就無法經 `mail_send` 寄出。
 - `mail_send`（issue `#189`，D-20260924-1，契約 #7）—— 帶草稿指紋執行對話層授權寄出。
   - 輸入：`draft_id`、`fingerprint`。
   - 嚴格比對指紋：指紋不符立即拒寄且不寫 send-once marker。
