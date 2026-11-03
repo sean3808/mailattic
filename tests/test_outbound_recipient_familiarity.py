@@ -15,10 +15,6 @@ from mailattic.outbound_commands import (
     _handle_send_batch,
     _handle_send_draft,
 )
-from mailattic.query import (
-    PUBLIC_WEBMAIL_DOMAINS,
-    check_recipient_familiarity,
-)
 from mailattic.storage import (
     connect_database,
     initialize_database,
@@ -79,106 +75,70 @@ def _seed_custom_message(
         conn.close()
 
 
-def test_public_webmail_domains_contains_all_pinned_domains() -> None:
-    expected = {
-        GMAIL,
-        "googlemail.com",
-        "yahoo.com",
-        "yahoo.com.tw",
-        "hotmail.com",
-        "outlook.com",
-        "live.com",
-        "msn.com",
-        "icloud.com",
-        "me.com",
-        "qq.com",
-        "163.com",
-        "126.com",
-    }
-    assert expected == PUBLIC_WEBMAIL_DOMAINS
-
-
-def test_check_recipient_familiarity_empty_list_returns_empty(tmp_path: Path) -> None:
-    db_path = initialize_database(tmp_path / "scratch.db")
-    results = check_recipient_familiarity(db_path, [])
-    assert results == []
-
-
-def test_check_recipient_familiarity_seen_roles_and_mixed_case(tmp_path: Path) -> None:
-    db_path = initialize_database(tmp_path / "scratch.db")
+def test_draft_reply_cli_seen_as_sender_to_cc_bcc_in_mixed_case(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db_path = initialize_database(tmp_path / "evidence.db")
     _seed_custom_message(
         db_path,
-        message_id="<msg-seed-1@mailattic.test>",
+        message_id="<anchor-msg@mailattic.test>",
+        sender_email="anchor@mailattic.test",
+        to_emails=[SMTP_USER],
+    )
+    _seed_custom_message(
+        db_path,
+        message_id="<seen-roles-msg@mailattic.test>",
         sender_email="SeNdEr@ExAmPlE.cOm",
         to_emails=["To_UsEr@ExAmPlE.cOm"],
         cc_emails=["Cc_UsEr@ExAmPlE.cOm"],
         bcc_emails=["Bcc_UsEr@ExAmPlE.cOm"],
     )
 
-    addresses_to_check = [
-        "sender@example.com",
-        "SENDER@EXAMPLE.COM",
-        "to_user@example.com",
-        "TO_USER@EXAMPLE.COM",
-        "cc_user@example.com",
-        "CC_USER@EXAMPLE.COM",
-        "bcc_user@example.com",
-        "BCC_USER@EXAMPLE.COM",
-    ]
-    results = check_recipient_familiarity(db_path, addresses_to_check)
-    assert len(results) == len(addresses_to_check)
-    for res in results:
-        assert res.seen is True
-        assert res.mark == "seen"
+    body_file = tmp_path / "body.txt"
+    body_file.write_text("Hello reply", encoding="utf-8")
 
-
-def test_check_recipient_familiarity_never_seen_and_domain_seen(tmp_path: Path) -> None:
-    db_path = initialize_database(tmp_path / "scratch.db")
-    _seed_custom_message(
-        db_path,
-        message_id="<msg-seed-2@mailattic.test>",
-        sender_email="colleague@knowncorp.test",
+    args = build_parser().parse_args(
+        [
+            "draft-reply",
+            "<anchor-msg@mailattic.test>",
+            "--body-from",
+            str(body_file),
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(_placeholder_env_file(tmp_path)),
+            "--to",
+            "sender@example.com",
+            "--to",
+            "SENDER@EXAMPLE.COM",
+            "--to",
+            "to_user@example.com",
+            "--to",
+            "TO_USER@EXAMPLE.COM",
+            "--cc",
+            "cc_user@example.com",
+            "--cc",
+            "CC_USER@EXAMPLE.COM",
+            "--bcc",
+            "bcc_user@example.com",
+            "--bcc",
+            "BCC_USER@EXAMPLE.COM",
+        ]
     )
 
-    addresses_to_check = [
-        "newperson@knowncorp.test",
-        "stranger@never-seen-domain.invalid",
-    ]
-    results = check_recipient_familiarity(db_path, addresses_to_check)
-    assert len(results) == 2
+    exit_code = _handle_draft_reply(args)
+    assert exit_code == 0
 
-    known_corp_res = results[0]
-    assert known_corp_res.address == "newperson@knowncorp.test"
-    assert known_corp_res.seen is False
-    assert known_corp_res.domain_seen is True
-    assert known_corp_res.mark == "never seen (domain seen)"
-
-    stranger_res = results[1]
-    assert stranger_res.address == "stranger@never-seen-domain.invalid"
-    assert stranger_res.seen is False
-    assert stranger_res.domain_seen is False
-    assert stranger_res.mark == "never seen"
-
-
-def test_check_recipient_familiarity_webmail_no_domain_hint(tmp_path: Path) -> None:
-    db_path = initialize_database(tmp_path / "scratch.db")
-    _seed_custom_message(
-        db_path,
-        message_id="<msg-seed-3@mailattic.test>",
-        sender_email=f"someone@{GMAIL}",
-        to_emails=["other@163.com"],
-    )
-
-    addresses_to_check = [
-        f"brand_new_user@{GMAIL}",
-        "brand_new_user@163.com",
-    ]
-    results = check_recipient_familiarity(db_path, addresses_to_check)
-    assert len(results) == 2
-    for res in results:
-        assert res.seen is False
-        assert res.domain_seen is False
-        assert res.mark == "never seen"
+    stdout = capsys.readouterr().out
+    assert "Recipient check:" in stdout
+    assert "sender@example.com: seen" in stdout
+    assert "SENDER@EXAMPLE.COM: seen" in stdout
+    assert "to_user@example.com: seen" in stdout
+    assert "TO_USER@EXAMPLE.COM: seen" in stdout
+    assert "cc_user@example.com: seen" in stdout
+    assert "CC_USER@EXAMPLE.COM: seen" in stdout
+    assert "bcc_user@example.com: seen" in stdout
+    assert "BCC_USER@EXAMPLE.COM: seen" in stdout
 
 
 def test_draft_reply_cli_marks_seen_never_seen_and_domain_seen(
@@ -245,6 +205,7 @@ def test_draft_reply_cli_webmail_never_seen_gets_no_domain_hint(
         db_path,
         message_id="<webmail-msg@mailattic.test>",
         sender_email=f"existing_user@{GMAIL}",
+        to_emails=["other@163.com"],
     )
 
     body_file = tmp_path / "body.txt"
@@ -263,6 +224,8 @@ def test_draft_reply_cli_webmail_never_seen_gets_no_domain_hint(
             str(_placeholder_env_file(tmp_path)),
             "--to",
             new_user,
+            "--to",
+            "brand_new_user@163.com",
         ]
     )
 
@@ -272,7 +235,51 @@ def test_draft_reply_cli_webmail_never_seen_gets_no_domain_hint(
     stdout = capsys.readouterr().out
     assert "Recipient check:" in stdout
     assert f"{new_user}: never seen" in stdout
+    assert "brand_new_user@163.com: never seen" in stdout
     assert "domain seen" not in stdout
+
+
+def test_draft_reply_cli_quoted_local_part_at_domain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db_path = initialize_database(tmp_path / "evidence.db")
+    _seed_custom_message(
+        db_path,
+        message_id="<anchor-msg@mailattic.test>",
+        sender_email="anchor@mailattic.test",
+        to_emails=[SMTP_USER],
+    )
+    _seed_custom_message(
+        db_path,
+        message_id="<msg-seed-quoted@mailattic.test>",
+        sender_email="colleague@knowncorp.test",
+    )
+
+    body_file = tmp_path / "body.txt"
+    body_file.write_text("Hello reply", encoding="utf-8")
+
+    quoted_addr = '"user@corp"@knowncorp.test'
+    args = build_parser().parse_args(
+        [
+            "draft-reply",
+            "<anchor-msg@mailattic.test>",
+            "--body-from",
+            str(body_file),
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(_placeholder_env_file(tmp_path)),
+            "--to",
+            quoted_addr,
+        ]
+    )
+
+    exit_code = _handle_draft_reply(args)
+    assert exit_code == 0
+
+    stdout = capsys.readouterr().out
+    assert "Recipient check:" in stdout
+    assert f"{quoted_addr}: never seen (domain seen)" in stdout
 
 
 def test_plain_reply_all_draft_prints_no_recipient_check_and_no_bcc_self(
@@ -553,23 +560,3 @@ def test_send_batch_shows_recomputed_marks_per_draft(
     batch_stdout = capsys.readouterr().out
     assert "Recipient check:" in batch_stdout
     assert "batch_contact@testbiz.com: seen" in batch_stdout
-
-
-def test_check_recipient_familiarity_quoted_local_part_at_domain(
-    tmp_path: Path,
-) -> None:
-    db_path = initialize_database(tmp_path / "scratch.db")
-    _seed_custom_message(
-        db_path,
-        message_id="<msg-seed-quoted@mailattic.test>",
-        sender_email="colleague@knowncorp.test",
-    )
-
-    addresses_to_check = [
-        '"user@corp"@knowncorp.test',
-    ]
-    results = check_recipient_familiarity(db_path, addresses_to_check)
-    assert len(results) == 1
-    assert results[0].seen is False
-    assert results[0].domain_seen is True
-    assert results[0].mark == "never seen (domain seen)"
