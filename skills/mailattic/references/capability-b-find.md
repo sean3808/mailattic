@@ -305,6 +305,7 @@ bes attachments \
 
 Semantics and failure modes:
 
+- `--message <db_id>` isolates attachments belonging to a single stored message (`messages.id`). ANDs with every other filter and with `--copy-to`. An unknown `db_id` returns an empty result, exit 0, and copies nothing.
 - `exportable=false` only means the DB has no `storage_path` pointer; it does **not** mean the payload is certainly readable. When `storage_path` is non-empty but the CAS file is missing / corrupt / path-escaping, export lists it as `failed`.
 - Metadata-only attachments (common from archive-scrape) still appear in the listing; with `--copy-to` each is reported row by row as `skipped-non-exportable`, **never silently dropped**.
 - `--dedupe content-hash` merges only **non-null** `content_hash`; null-hash rows are all kept. Winner = latest `sent_at`, then highest `message_db_id`, then lowest `attachment_id`; every source mail carrying the same file stays in `carrying_messages`.
@@ -325,7 +326,7 @@ An inline image means what the text beside it says, so locate it by its **positi
 
 1. Run `bes show <db_id> --format text --new-only`. Every inline image appears in the body as a marker `[cid:<name>@<suffix>]` at the place the sender put it; a marker in the new content is an image this mail added.
 2. Match `<name>` (e.g. `image012.png`) against `attachment_name` in the mail's attachment list (`bes search --json` hit or `bes show <db_id> --format json`).
-3. Export it with `bes attachments --name-contains <name>` narrowed by the same sender domain and the same day, run once with `--json` first: keep only the row whose `message_db_id` equals this mail's db_id. Outlook numbers inline images from `image001` in every mail, so several mails from one sender on one day carry the same name. Then add `--copy-to <scratch dir>`.
+3. Export it with `bes attachments --message <db_id> --name-contains <name> --copy-to <scratch dir>`. Outlook numbers inline images from `image001` in every mail, so several mails from one sender on one day carry the same name; `--message` isolates this mail's attachment without manual JSON matching.
 4. View the exported file (the Read tool shows images).
 
 A marker whose `<name>` matches no attachment name: report the marker and the attachment list to the user and let them pick.

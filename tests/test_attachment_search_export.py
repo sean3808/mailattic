@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -1154,3 +1155,253 @@ def _seed_attachment_fixture(
 
 
 _UNSET = object()
+
+
+def test_attachments_cli_message_filter_exports_exact_message_attachment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database_path = tmp_path / "same_name.db"
+    attachment_root = tmp_path / "attachments"
+    export_dir = tmp_path / "exported"
+
+    connection = sqlite3.connect(str(database_path))
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON;")
+        connection.executescript(SCHEMA_SQL)
+
+        sender = "vendor@shopa.example"
+        date1 = "2026-11-03T10:00:00+08:00"
+        date2 = "2026-11-03T14:30:00+08:00"
+
+        c1 = connection.execute(
+            """
+            INSERT INTO messages (
+                subject, sender_name, sender_email, sent_at, received_at,
+                body_text, message_id, pst_source, folder_path,
+                logical_locator, dedup_key, recipient_search_text,
+                attachment_search_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                "Message 1",
+                "Vendor",
+                sender,
+                date1,
+                date1,
+                "Body 1",
+                "<msg1@shopa.example>",
+                "fixture.pst",
+                "Inbox",
+                "Inbox/msg1",
+                "dedup-msg1",
+                "",
+                "",
+            ],
+        )
+        msg1_id = int(c1.lastrowid)
+
+        c2 = connection.execute(
+            """
+            INSERT INTO messages (
+                subject, sender_name, sender_email, sent_at, received_at,
+                body_text, message_id, pst_source, folder_path,
+                logical_locator, dedup_key, recipient_search_text,
+                attachment_search_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                "Message 2",
+                "Vendor",
+                sender,
+                date2,
+                date2,
+                "Body 2",
+                "<msg2@shopa.example>",
+                "fixture.pst",
+                "Inbox",
+                "Inbox/msg2",
+                "dedup-msg2",
+                "",
+                "",
+            ],
+        )
+        msg2_id = int(c2.lastrowid)
+
+        payload1 = b"PNG-image012-message-1-unique-content"
+        payload2 = b"PNG-image012-message-2-different-content"
+
+        rec1 = write_attachment(
+            payload=payload1,
+            original_name="image012.png",
+            mime_type="image/png",
+            store_root=attachment_root,
+        )
+        rec2 = write_attachment(
+            payload=payload2,
+            original_name="image012.png",
+            mime_type="image/png",
+            store_root=attachment_root,
+        )
+
+        connection.execute(
+            """
+            INSERT INTO message_attachments (
+                message_id, attachment_name, content_hash, size_bytes,
+                mime_type, storage_path
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                msg1_id,
+                "image012.png",
+                rec1.content_hash,
+                len(payload1),
+                "image/png",
+                rec1.storage_path,
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO message_attachments (
+                message_id, attachment_name, content_hash, size_bytes,
+                mime_type, storage_path
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                msg2_id,
+                "image012.png",
+                rec2.content_hash,
+                len(payload2),
+                "image/png",
+                rec2.storage_path,
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    exit_code = main(
+        [
+            "attachments",
+            "--database",
+            str(database_path),
+            "--attachment-root",
+            str(attachment_root),
+            "--message",
+            str(msg1_id),
+            "--name-contains",
+            "image012",
+            "--copy-to",
+            str(export_dir),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "copied: 1" in captured.out
+    assert "failed: 0" in captured.out
+
+    exported_files = list(export_dir.iterdir())
+    assert len(exported_files) == 1
+    assert (
+        hashlib.sha256(exported_files[0].read_bytes()).hexdigest() == rec1.content_hash
+    )
+
+    # Python API direct test
+    results_msg1 = search_attachments(
+        database_path=database_path,
+        filters=SearchFilters(message_id=msg1_id),
+    )
+    assert len(results_msg1) == 1
+    assert results_msg1[0]["content_hash"] == rec1.content_hash
+    assert results_msg1[0]["message_db_id"] == msg1_id
+
+    results_msg2 = search_attachments(
+        database_path=database_path,
+        filters=SearchFilters(message_id=msg2_id),
+    )
+    assert len(results_msg2) == 1
+    assert results_msg2[0]["content_hash"] == rec2.content_hash
+    assert results_msg2[0]["message_db_id"] == msg2_id
+
+    # Combining with --ext mismatch yields empty
+    exit_code_mismatch = main(
+        [
+            "attachments",
+            "--database",
+            str(database_path),
+            "--message",
+            str(msg1_id),
+            "--ext",
+            "pdf",
+            "--json",
+        ]
+    )
+    captured_mismatch = capsys.readouterr()
+    assert exit_code_mismatch == 0
+    assert json.loads(captured_mismatch.out) == []
+
+
+def test_attachments_cli_unknown_message_filter_returns_empty_and_copies_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database_path = tmp_path / "unknown_msg.db"
+    attachment_root = tmp_path / "attachments"
+    export_dir = tmp_path / "exported_empty"
+
+    connection = sqlite3.connect(str(database_path))
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON;")
+        connection.executescript(SCHEMA_SQL)
+        connection.commit()
+    finally:
+        connection.close()
+
+    # 1. With --copy-to: exit 0, copied: 0, target dir empty
+    exit_code = main(
+        [
+            "attachments",
+            "--database",
+            str(database_path),
+            "--attachment-root",
+            str(attachment_root),
+            "--message",
+            "999999",
+            "--copy-to",
+            str(export_dir),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "copied: 0" in captured.out
+    assert "failed: 0" in captured.out
+    assert list(export_dir.iterdir()) == []
+
+    # 2. Without --copy-to: table output prints "No attachments found.", exit 0
+    exit_code = main(
+        [
+            "attachments",
+            "--database",
+            str(database_path),
+            "--message",
+            "999999",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "No attachments found." in captured.out
+
+    # 3. With --json: returns empty array JSON, exit 0
+    exit_code = main(
+        [
+            "attachments",
+            "--database",
+            str(database_path),
+            "--message",
+            "999999",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out) == []

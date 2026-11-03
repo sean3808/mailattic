@@ -13,7 +13,7 @@
 | `init-db` | 建 schema（首次部署或新 DB） | `--database <path>` |
 | `import` | 透過已啟動 Outlook profile 的 recipient table，從已掛載 PST 匯入郵件到 DB；或用 `--maildir` 從本機 maildir 匯入（不需 Outlook / readpst） | `--file <file>`（可重複）/ `--directory <dir>`（可重複）/ `--maildir <account-root>` / `--account-email <addr>` / `--database <path>` / `--attachment-root <path>` / `--json` |
 | `search` | FTS5 + 結構化欄位混合查詢；`--full-body --json` 時升級成 ingestion-grade 輸出 | `--keyword` / `--sender` / `--recipient` / `--sender-domain` / `--recipient-domain` / `--participants-domain` / `--from-date` / `--to-date` / `--attachment-name` / `--limit N` / `--json` / `--full-body` |
-| `attachments` | 附件優先查詢／匯出：一列一附件，支援檔名/副檔名/domain/date filter；加 `--copy-to` 走 CAS 匯出 | `--name-contains` / `--ext` / `--participants-domain` / `--sender-domain` / `--recipient-domain` / `--from-date` / `--to-date` / `--dedupe content-hash` / `--copy-to <dir>` / `--overwrite` / `--skip-existing` / `--json` / `--attachment-root` |
+| `attachments` | 附件優先查詢／匯出：一列一附件，支援檔名/副檔名/domain/date filter；加 `--copy-to` 走 CAS 匯出 | `--message <db_id>` / `--name-contains` / `--ext` / `--participants-domain` / `--sender-domain` / `--recipient-domain` / `--from-date` / `--to-date` / `--dedupe content-hash` / `--copy-to <dir>` / `--overwrite` / `--skip-existing` / `--json` / `--attachment-root` |
 | `show` | 取單封信完整內容（subject / body / recipients / attachments）；`--format text --new-only` 僅保留新內容（去除引用歷史；支援置頂回覆、下方回覆與夾敘回覆）；保守 fallback：無法識別邊界時回傳全文不截斷 | `<message_id>` / `--format raw\|json\|text` / `--json` (alias) / `--new-only`（僅 `--format text` 有效；搭配 `raw`/`json` exit 非 0） |
 | `thread` | 重建同 thread 全部信件按時序排（走 in_reply_to + references_header）；`--format text --new-only` 每封只保留新內容；保守 fallback 同上 | `<message_id_or_db_id>` / `--format raw\|json\|text` / `--new-only` |
 | `sync-imap` | 從 IMAP server 增量同步（mbsync container 走 `run_sync.py`，這支是 CLI fallback） | `--account <name>` / `--database <path>` / `--pre-task`（caller 任務前主動同步，含 15 分鐘最小間隔閘門：距上次同步 < 15min 則 skip，避免連續任務 burst sync；上次若失敗，skip 輸出會帶 `last sync failed`；之後有 run 沒記到完成帶 `last sync did not complete`；狀態讀不到帶 `last sync status unknown`）/ `--json`（僅搭配 `--pre-task`：以 JSON 輸出結果；未帶 `--pre-task` 時 exit 2） |
@@ -107,6 +107,7 @@ Windows-native IMAP sync 從這次指定的 `--env-file` 讀取 `IMAP_SECURITY`�
 
 ## `attachments` contract
 
+- `--message <db_id>` 只回傳該封信（`messages.id`）夾帶的附件；與既有所有 filter 及 `--copy-to` 為 AND 關係；若 `db_id` 不存在則回傳空結果、exit 0、不匯出任何檔案（filter 語意，非 lookup）
 - 一列一附件；輸出同時帶 `attachment_id`、`message_db_id`、穩定引用用的 `rfc_message_id` / `dedup_key`、`exportable`、`carrying_messages`
 - 以附件形式轉寄的信（`message/rfc822`）整封算一列附件、可匯出（沒有檔名時以附信主旨加 `.eml` 命名）；其內文不併入外層信的本文與檢索，其內夾帶的附件不另列。退信通知（`multipart/report`）夾帶的原信則維持併入外層本文與檢索、不另立為附件，此為刻意設計以方便依原信內容檢索退信
 - `--copy-to` 只會複製 `storage_path` 非空的列；metadata-only attachment 會逐列回報 `skipped-non-exportable`，不是靜默忽略
@@ -133,7 +134,7 @@ Windows-native IMAP sync 從這次指定的 `--env-file` 讀取 `IMAP_SECURITY`�
 from mailattic.query import search_messages, SearchFilters, get_message
 ```
 
-- `SearchFilters(keyword, sender, recipient, sender_domain, recipient_domain, participants_domain, sent_from, sent_to, attachment_name)` — 全 optional
+- `SearchFilters(keyword, sender, recipient, sender_domain, recipient_domain, participants_domain, sent_from, sent_to, attachment_name, attachment_ext, message_id)` — 全 optional
 - `search_messages(filters, full_body=False)` — 預設 lightweight summary；`full_body=True` 加上 `rendered_body_text` / `dedup_key` / thread 欄位 / `to` / `cc` / `bcc`
 - `get_message(message_id_or_db_id)` — 完整 body / recipients / attachments
 

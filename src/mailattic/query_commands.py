@@ -155,6 +155,14 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
     )
     add_database_argument(attachments_parser)
     attachments_parser.add_argument(
+        "--message",
+        dest="message_id",
+        type=int,
+        default=None,
+        metavar="DB_ID",
+        help="Restrict results to attachments of this stored message identifier.",
+    )
+    attachments_parser.add_argument(
         "--name-contains",
         dest="name_contains",
         default=None,
@@ -426,6 +434,7 @@ def _handle_attachments(args: argparse.Namespace) -> int:
             sent_to=_parse_optional_datetime(args.sent_to, end_of_day=True),
             attachment_name=args.name_contains,
             attachment_ext=args.ext,
+            message_id=args.message_id,
         )
         results = search_attachments(
             database_path=args.database,

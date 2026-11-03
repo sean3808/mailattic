@@ -1350,6 +1350,7 @@ class SearchFilters:
     sent_to: datetime | None = None
     attachment_name: str | None = None
     attachment_ext: str | None = None
+    message_id: int | None = None
 
 
 def search_messages(
@@ -1585,6 +1586,10 @@ def search_attachments(
         parameters=parameters,
         attachment_name_sql="COALESCE(ma.attachment_name, '')",
     )
+
+    if filters.message_id is not None:
+        conditions.append("m.id = ?")
+        parameters.append(filters.message_id)
 
     attachment_ext = _normalize_attachment_ext(filters.attachment_ext)
     if attachment_ext is not None:
