@@ -21,10 +21,14 @@ from .imap_runtime import load_env_file
 from .outbound import (
     DEFAULT_SMTP_ENV_FILE,
     ENV_VAR_SMTP_ENV_FILE,
+    DraftError,
+    DraftNewResult,
     DraftReplyError,
+    DraftReplyResult,
     SendRefused,
     SmtpConfig,
     _sanitize_for_terminal,
+    assemble_draft_new,
     assemble_draft_reply,
     list_drafts,
     load_smtp_config,
@@ -56,7 +60,7 @@ def _missing_smtp_env_file_error(resolved_path: Path) -> str:
 
 
 def register_outbound_commands(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
-    """Register draft-reply, send-draft, send-batch and list-drafts."""
+    """Register draft-reply, draft-new, send-draft, send-batch and list-drafts."""
     draft_reply_parser = subparsers.add_parser(
         "draft-reply",
         help="Generate an RFC5322 reply-all draft for a stored message.",
@@ -137,6 +141,61 @@ def register_outbound_commands(subparsers: argparse._SubParsersAction) -> None: 
     )
     draft_reply_parser.set_defaults(handler=_handle_draft_reply)
 
+    draft_new_parser = subparsers.add_parser(
+        "draft-new",
+        help="Generate a new-thread draft anchored to no existing message.",
+    )
+    draft_new_parser.add_argument(
+        "--to",
+        action="append",
+        required=True,
+        metavar="ADDR",
+        help="Add an explicit To recipient. Repeat to add multiple recipients.",
+    )
+    draft_new_parser.add_argument(
+        "--cc",
+        action="append",
+        default=None,
+        metavar="ADDR",
+        help="Add an explicit Cc recipient. Repeat to add multiple recipients.",
+    )
+    draft_new_parser.add_argument(
+        "--bcc",
+        action="append",
+        default=None,
+        metavar="ADDR",
+        help="Add an explicit Bcc recipient. Repeat to add multiple recipients.",
+    )
+    draft_new_parser.add_argument(
+        "--subject",
+        required=True,
+        type=str,
+        metavar="TEXT",
+        help="Subject line for the new thread (required, non-blank).",
+    )
+    draft_new_parser.add_argument(
+        "--body-from",
+        required=True,
+        type=Path,
+        help="Path to a UTF-8 text file containing the mail body.",
+    )
+    draft_new_parser.add_argument(
+        "--attach",
+        action="append",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to a local file attachment. Repeat to attach multiple files.",
+    )
+    add_database_argument(draft_new_parser)
+    draft_new_parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help=_SMTP_ENV_FILE_HELP,
+    )
+    draft_new_parser.set_defaults(handler=_handle_draft_new)
+
     send_draft_parser = subparsers.add_parser(
         "send-draft",
         help=(
@@ -210,12 +269,37 @@ def register_outbound_commands(subparsers: argparse._SubParsersAction) -> None: 
     list_drafts_parser.set_defaults(handler=_handle_list_drafts)
 
 
-def _handle_draft_reply(args: argparse.Namespace) -> int:
+def _print_draft_summary(result: DraftReplyResult | DraftNewResult) -> int:
+    # This stdout is what the user reviews before a fingerprint send, so
+    # data-influenced text must not carry terminal control sequences.
+    safe = _sanitize_for_terminal
+    print(f"draft_id: {result.draft_id}")
+    print(f"From: {safe(result.from_address)}")
+    print(f"Subject: {safe(result.subject)}")
+    print(f"To: {safe(result.to)}")
+    print(f"Cc: {safe(result.cc)}")
+    print(f"Bcc: {safe(result.bcc)}")
+    print(f"Message-ID: {result.message_id}")
+    if result.attachments:
+        print(f"Attachments: {len(result.attachments)}")
+        for name, size in result.attachments:
+            print(f"  - {safe(name)} ({size} bytes)")
+    else:
+        print("Attachments: none")
+    print(f"fingerprint: {result.fingerprint}")
+    if result.recipient_checks:
+        print("Recipient check:")
+        for item in result.recipient_checks:
+            print(f"  - {safe(item.address)}: {item.mark}")
+    return 0
+
+
+def _load_draft_sender(args: argparse.Namespace) -> tuple[str, dict[str, str]] | int:
+    """Return (own_address, env) for a new draft, or an exit code on refusal."""
     resolved_env_file = resolve_smtp_env_file(args.env_file)
-    env: dict[str, str] = {}
     try:
         env = load_env_file(resolved_env_file)
-        own_address = load_smtp_config(env).user
+        return load_smtp_config(env).user, env
     except FileNotFoundError:
         # #199: a missing file must not fall back to a sender the user never chose.
         print(_missing_smtp_env_file_error(resolved_env_file), file=sys.stderr)
@@ -224,12 +308,18 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
         # Unreadable or incomplete settings; anything else is a bug and
         # must not be relabelled as "set SMTP_USER". Fonts, like the MCP
         # path, apply only from settings that load (#13).
-        env = {}
         try:
-            own_address = own_address_without_smtp_settings(args.database)
+            return own_address_without_smtp_settings(args.database), {}
         except DraftReplyError as refusal:
             print(refusal, file=sys.stderr)
             return 2
+
+
+def _handle_draft_reply(args: argparse.Namespace) -> int:
+    sender = _load_draft_sender(args)
+    if isinstance(sender, int):
+        return sender
+    own_address, env = sender
 
     def warn_archive_anchor() -> None:
         print(
@@ -260,24 +350,32 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
         print(exc, file=sys.stderr)
         return 2
 
-    # This stdout is what the user reviews before a fingerprint send, so
-    # data-influenced text must not carry terminal control sequences.
-    safe = _sanitize_for_terminal
-    print(f"draft_id: {result.draft_id}")
-    print(f"From: {safe(result.from_address)}")
-    print(f"Subject: {safe(result.subject)}")
-    print(f"To: {safe(result.to)}")
-    print(f"Cc: {safe(result.cc)}")
-    print(f"Bcc: {safe(result.bcc)}")
-    print(f"Message-ID: {result.message_id}")
-    if result.attachments:
-        print(f"Attachments: {len(result.attachments)}")
-        for name, size in result.attachments:
-            print(f"  - {safe(name)} ({size} bytes)")
-    else:
-        print("Attachments: none")
-    print(f"fingerprint: {result.fingerprint}")
-    return 0
+    return _print_draft_summary(result)
+
+
+def _handle_draft_new(args: argparse.Namespace) -> int:
+    sender = _load_draft_sender(args)
+    if isinstance(sender, int):
+        return sender
+    own_address, env = sender
+
+    try:
+        result = assemble_draft_new(
+            database_path=args.database,
+            own_address=own_address,
+            to=args.to,
+            subject=args.subject,
+            body_from=args.body_from,
+            cc=args.cc,
+            bcc=args.bcc,
+            attachments=args.attach,
+            font_style=reply_font_style(env),
+        )
+    except (DraftError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
+    return _print_draft_summary(result)
 
 
 def _handle_list_drafts(args: argparse.Namespace) -> int:

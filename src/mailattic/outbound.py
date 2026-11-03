@@ -18,6 +18,7 @@ Design constraints (see openspec/changes/add-outbound-send-capability/design.md)
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
 import html
@@ -54,7 +55,7 @@ from typing import Any
 
 from .attachment_store import resolve_store_root, write_attachment
 from .datetime_bounds import TAIPEI
-from .identity import list_self_addresses
+from .identity import extract_address, list_self_addresses
 from .imap_native import NativeImapClient
 from .imap_runtime import load_env_file
 from .models import (
@@ -66,6 +67,8 @@ from .models import (
 from .mutf7 import encode_mutf7
 from .parser import subject_from_raw_headers
 from .query import (
+    RecipientFamiliarity,
+    check_recipient_familiarity,
     get_message,
     normalize_message_id,
     render_text,
@@ -83,8 +86,12 @@ __all__ = [
     "DEFAULT_SMTP_ENV_FILE",
     "ENV_VAR_SMTP_ENV_FILE",
     "assemble_draft_reply",
+    "DraftError",
     "DraftReplyError",
+    "DraftNewError",
     "DraftReplyResult",
+    "DraftNewResult",
+    "assemble_draft_new",
     "draft_fingerprint",
     "send_draft",
     "send_batch",
@@ -526,6 +533,11 @@ def _format_recipient_header(entries_raw: object) -> str:
     )
 
 
+def _esc(s: str) -> str:
+    """Escape plain text for an HTML body, keeping line breaks as <br>."""
+    return html.escape(s).replace("\n", "<br>")
+
+
 def build_quoted_reply_bodies(
     original: dict[str, object],
     reply_text: str,
@@ -591,9 +603,6 @@ def build_quoted_reply_bodies(
     )
 
     # HTML body: escaped reply + quoted block div with <hr> separator and <b> labels
-    def _esc(s: str) -> str:
-        return html.escape(s).replace("\n", "<br>")
-
     cc_row = f"<b>Cc:</b> {_esc(cc_val)}<br>\n" if cc_val else ""
     html_body = (
         _esc(reply_text)
@@ -643,6 +652,24 @@ def _is_archive_copy(message: Mapping[str, object] | sqlite3.Row) -> bool:
     source_input_mode = str(message["source_input_mode"] or "").casefold()
     pst_source = str(message["pst_source"] or "").casefold()
     return source_input_mode == "archive" or pst_source.startswith("archive:")
+
+
+def _append_bcc_self_and_explicit(
+    result_bcc: list[tuple[str | None, str]],
+    parsed_bcc: Sequence[tuple[str | None, str]],
+    *,
+    own_address: str,
+    seen: set[str],
+) -> None:
+    """Preserve automatic Bcc-self and append deduplicated explicit BCC recipients."""
+    result_bcc.append((None, own_address))
+    bcc_seen = {own_address.casefold()}
+    for recipient in parsed_bcc:
+        normalized = recipient[1].casefold()
+        if normalized in seen or normalized in bcc_seen:
+            continue
+        bcc_seen.add(normalized)
+        result_bcc.append(recipient)
 
 
 def _resolve_draft_recipients(
@@ -706,14 +733,12 @@ def _resolve_draft_recipients(
 
     # Preserve the existing automatic Bcc-self safety copy independently of
     # caller-controlled To/Cc selection.
-    result["bcc"].append((None, own_address))
-    bcc_seen = {own_address.casefold()}
-    for recipient in parsed_explicit["bcc"]:
-        normalized = recipient[1].casefold()
-        if normalized in seen or normalized in bcc_seen:
-            continue
-        bcc_seen.add(normalized)
-        result["bcc"].append(recipient)
+    _append_bcc_self_and_explicit(
+        result["bcc"],
+        parsed_explicit["bcc"],
+        own_address=own_address,
+        seen=seen,
+    )
 
     return result
 
@@ -783,7 +808,15 @@ ARCHIVE_ANCHOR_REFUSAL = (
 )
 
 
-class DraftReplyError(Exception):
+class DraftError(Exception):
+    """Expected refusal from draft assembly; its message is user-facing."""
+
+
+class DraftNewError(DraftError):
+    """Expected refusal from ``assemble_draft_new``; its message is user-facing."""
+
+
+class DraftReplyError(DraftError):
     """Expected refusal from ``assemble_draft_reply``; its message is user-facing."""
 
 
@@ -887,6 +920,10 @@ class DraftReplyResult:
     fingerprint: str
     body_text: str = ""
     attachment_sources: tuple[tuple[str, str, int], ...] = ()
+    recipient_checks: tuple[RecipientFamiliarity, ...] = ()
+
+
+DraftNewResult = DraftReplyResult
 
 
 def _validate_custom_subject(subject: str) -> None:
@@ -894,13 +931,102 @@ def _validate_custom_subject(subject: str) -> None:
         raise DraftReplyError(
             '--subject must not be empty. Omit it to reply as "Re: <original subject>".'
         )
+    _reject_multiline_subject(subject, DraftReplyError)
+
+
+def _reject_multiline_subject(subject: str, error_cls: type[DraftError]) -> None:
     # Line breaks (including U+2028/U+2029, which the email package also
     # refuses) cannot go into a header value, and the draft summary the user
     # reviews must not carry terminal control sequences.
     if any(unicodedata.category(char) in {"Cc", "Zl", "Zp"} for char in subject):
-        raise DraftReplyError(
-            "--subject must be a single line without control characters."
+        raise error_cls("--subject must be a single line without control characters.")
+
+
+def _attach_files(
+    msg: EmailMessage,
+    attachments: Sequence[str | Path] | None,
+    *,
+    error_cls: type[DraftError] = DraftReplyError,
+) -> list[tuple[Path, bytes]]:
+    """Validate, read, and attach files to an EmailMessage."""
+    attachment_payloads: list[tuple[Path, bytes]] = []
+    for path_item in attachments or []:
+        path = Path(path_item)
+        try:
+            if not path.is_file():
+                raise error_cls(f"Attachment path is not a file: {path}")
+            data = path.read_bytes()
+        except OSError as exc:
+            raise error_cls(f"Could not read attachment file {path}: {exc}") from exc
+        attachment_payloads.append((path, data))
+
+    for path, data in attachment_payloads:
+        maintype, subtype = resolve_attachment_mime_type(path.name)
+        if (maintype, subtype) == ("message", "rfc822"):
+            nested = _round_trippable_nested_message(data)
+            if nested is not None:
+                msg.add_attachment(nested, filename=path.name)
+                continue
+            # Not provably preserved as a nested message (raw 8-bit headers,
+            # parse defects): keep the original bytes as a binary attachment.
+            maintype, subtype = "application", "octet-stream"
+        msg.add_attachment(
+            data,
+            maintype=maintype,
+            subtype=subtype,
+            filename=path.name,
         )
+    return attachment_payloads
+
+
+def _write_draft_eml(
+    database_path: str | Path,
+    draft_id: str,
+    msg: EmailMessage,
+    *,
+    draft_dir: str | Path | None = None,
+) -> tuple[Path, bytes]:
+    """Write draft to <draft_dir>/<draft_id>.eml with CRLF line endings.
+
+    Outlook drops the character after a QP soft break that ends in a bare LF,
+    so the reviewed preview would differ (#33).
+    """
+    out_dir = Path(draft_dir) if draft_dir is not None else _draft_dir(database_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    draft_path = out_dir / f"{draft_id}.eml"
+    draft_bytes = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
+    draft_path.write_bytes(draft_bytes)
+    return draft_path, draft_bytes
+
+
+def _check_explicit_recipients_familiarity(
+    database_path: str | Path,
+    *,
+    to: Sequence[str] | None = None,
+    cc: Sequence[str] | None = None,
+    bcc: Sequence[str] | None = None,
+    own_address: str,
+    read_only: bool = False,
+) -> tuple[RecipientFamiliarity, ...]:
+    """Extract explicit addresses from options and check familiarity against DB.
+
+    ``--bcc <own address>`` is the automatic BCC-self entry and is never
+    listed, matching the send-time review.
+    """
+    own = extract_address(own_address)
+    explicit_recipient_addresses: list[str] = [
+        addr
+        for values, flag in ((to, "--to"), (cc, "--cc"), (bcc, "--bcc"))
+        for _disp, addr in _parse_recipient_options(values, flag)
+        if not (flag == "--bcc" and extract_address(addr) == own)
+    ]
+    explicit_recipient_addresses = list(dict.fromkeys(explicit_recipient_addresses))
+    if explicit_recipient_addresses:
+        familiarity = check_recipient_familiarity(
+            database_path, explicit_recipient_addresses, read_only=read_only
+        )
+        return tuple(familiarity)
+    return ()
 
 
 def assemble_draft_reply(
@@ -1026,43 +1152,18 @@ def assemble_draft_reply(
     msg.set_content(plain_body, charset="utf-8")
     msg.add_alternative(html_body, subtype="html", charset="utf-8")
 
-    attachment_payloads: list[tuple[Path, bytes]] = []
-    for path_item in attachments or []:
-        path = Path(path_item)
-        try:
-            if not path.is_file():
-                raise DraftReplyError(f"Attachment path is not a file: {path}")
-            data = path.read_bytes()
-        except OSError as exc:
-            raise DraftReplyError(
-                f"Could not read attachment file {path}: {exc}"
-            ) from exc
-        attachment_payloads.append((path, data))
-
-    for path, data in attachment_payloads:
-        maintype, subtype = resolve_attachment_mime_type(path.name)
-        if (maintype, subtype) == ("message", "rfc822"):
-            nested = _round_trippable_nested_message(data)
-            if nested is not None:
-                msg.add_attachment(nested, filename=path.name)
-                continue
-            # Not provably preserved as a nested message (raw 8-bit headers,
-            # parse defects): keep the original bytes as a binary attachment.
-            maintype, subtype = "application", "octet-stream"
-        msg.add_attachment(
-            data,
-            maintype=maintype,
-            subtype=subtype,
-            filename=path.name,
-        )
-
-    out_dir = Path(draft_dir) if draft_dir is not None else _draft_dir(database_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    draft_path = out_dir / f"{draft_id}.eml"
-    # CRLF like the wire copy: Outlook drops the character after a QP soft
-    # break that ends in a bare LF, so the reviewed preview would differ (#33).
-    draft_bytes = msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
-    draft_path.write_bytes(draft_bytes)
+    attachment_payloads = _attach_files(msg, attachments, error_cls=DraftReplyError)
+    draft_path, draft_bytes = _write_draft_eml(
+        database_path, draft_id, msg, draft_dir=draft_dir
+    )
+    recipient_checks = _check_explicit_recipients_familiarity(
+        database_path,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        own_address=own_address,
+        read_only=read_only,
+    )
 
     return DraftReplyResult(
         draft_id=draft_id,
@@ -1080,6 +1181,132 @@ def assemble_draft_reply(
             (str(path.resolve()), path.name, len(data))
             for path, data in attachment_payloads
         ),
+        recipient_checks=recipient_checks,
+    )
+
+
+def assemble_draft_new(
+    database_path: str | Path,
+    *,
+    own_address: str,
+    to: Sequence[str] | None = None,
+    subject: str,
+    draft_dir: str | Path | None = None,
+    body_text: str | None = None,
+    body_from: str | Path | None = None,
+    cc: Sequence[str] | None = None,
+    bcc: Sequence[str] | None = None,
+    attachments: Sequence[str | Path] | None = None,
+    read_only: bool = False,
+    font_style: str = "",
+) -> DraftNewResult:
+    """Build a new-thread draft and write ``<draft_dir>/<draft_id>.eml``.
+
+    Anchored to no existing message: has a freshly generated Message-ID, and no
+    In-Reply-To or References headers.
+    Required: at least one To recipient and a non-blank subject.
+    The body comes from ``body_text`` or, if that is None, the file ``body_from``.
+    From follows ``own_address`` (derived from SMTP account or the single declared
+    self address).
+    BCC-self is added automatically as for reply drafts.
+    ``font_style`` styles the HTML body.
+    Expected refusals raise ``DraftNewError`` or ``ValueError``.
+    """
+    if not subject.strip():
+        raise DraftNewError("--subject must not be empty or whitespace-only.")
+    _reject_multiline_subject(subject, DraftNewError)
+
+    if body_text is None:
+        if body_from is None:
+            raise ValueError("Either body_text or body_from is required")
+        try:
+            body_text = Path(body_from).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise DraftNewError(f"Could not read draft body file: {exc}") from exc
+
+    parsed_to = _parse_recipient_options(to, "--to")
+    if not parsed_to:
+        raise DraftNewError("draft-new: at least one To recipient is required")
+    parsed_cc = _parse_recipient_options(cc, "--cc")
+    parsed_bcc = _parse_recipient_options(bcc, "--bcc")
+
+    result_recipients: dict[str, list[tuple[str | None, str]]] = {
+        "to": [],
+        "cc": [],
+        "bcc": [],
+    }
+    seen: set[str] = set()
+
+    def add(bucket: str, recipient: tuple[str | None, str]) -> None:
+        normalized = recipient[1].casefold()
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        result_recipients[bucket].append(recipient)
+
+    for bucket, parsed in (("to", parsed_to), ("cc", parsed_cc)):
+        for recipient in parsed:
+            add(bucket, recipient)
+
+    # Automatic BCC-self
+    _append_bcc_self_and_explicit(
+        result_recipients["bcc"],
+        parsed_bcc,
+        own_address=own_address,
+        seen=seen,
+    )
+
+    draft_message_id = generate_draft_message_id(own_address)
+    draft_id = str(uuid.uuid4())
+
+    msg = EmailMessage()
+    msg["From"] = own_address
+    msg["To"] = _format_address_header(result_recipients["to"])
+    if result_recipients["cc"]:
+        msg["Cc"] = _format_address_header(result_recipients["cc"])
+    msg["Bcc"] = _format_address_header(result_recipients["bcc"])
+    msg["Message-ID"] = draft_message_id
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+
+    plain_body = body_text
+    html_body = _esc(plain_body)
+    if font_style:
+        html_body = f'<div style="{font_style}">\n{html_body}\n</div>'
+
+    msg.set_content(plain_body, charset="utf-8")
+    msg.add_alternative(html_body, subtype="html", charset="utf-8")
+
+    attachment_payloads = _attach_files(msg, attachments, error_cls=DraftNewError)
+    draft_path, draft_bytes = _write_draft_eml(
+        database_path, draft_id, msg, draft_dir=draft_dir
+    )
+    recipient_checks = _check_explicit_recipients_familiarity(
+        database_path,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        own_address=own_address,
+        read_only=read_only,
+    )
+
+    return DraftNewResult(
+        draft_id=draft_id,
+        draft_path=draft_path,
+        message_id=draft_message_id,
+        from_address=str(msg["From"]),
+        subject=str(msg["Subject"]),
+        to=str(msg["To"]),
+        cc=str(msg.get("Cc", "")),
+        bcc=str(msg["Bcc"]),
+        attachments=tuple((path.name, len(data)) for path, data in attachment_payloads),
+        fingerprint=draft_fingerprint(draft_bytes),
+        body_text=plain_body,
+        attachment_sources=tuple(
+            (str(path.resolve()), path.name, len(data))
+            for path, data in attachment_payloads
+        ),
+        recipient_checks=recipient_checks,
     )
 
 
@@ -1477,6 +1704,50 @@ def _format_recipient_summary(
     return ", ".join(parts)
 
 
+def _extract_explicit_recipients_for_send(
+    msg: EmailMessage,
+    database_path: Path | str,
+    recipients_by_header: Mapping[str, list[tuple[str | None, str]]],
+) -> list[str]:
+    """Return explicit recipient addresses on draft.
+
+    Excludes anchor-derived recipients and the automatic BCC-self (the From
+    address in Bcc); an own address given as To/Cc is still explicit (#46).
+    """
+    own_addr = extract_address(str(msg.get("From", "")))
+    self_addrs = {own_addr}
+    with contextlib.suppress(FileNotFoundError, sqlite3.Error):
+        self_addrs.update(
+            extract_address(a)
+            for a in _declared_self_addresses(database_path, read_only=True)
+        )
+
+    derived_addresses: set[str] = set()
+    in_reply_to = str(msg.get("In-Reply-To", "")).strip()
+    if in_reply_to:
+        with contextlib.suppress(KeyError, FileNotFoundError, sqlite3.Error):
+            original = _get_message_by_rfc822_message_id(
+                database_path, in_reply_to, read_only=True
+            )
+            derived = reply_all_recipients(original, self_addrs)
+            derived_addresses = {
+                extract_address(addr)
+                for bucket in ("to", "cc")
+                for _, addr in derived[bucket]
+            }
+
+    explicit_addresses: list[str] = []
+    for bucket in ("To", "Cc", "Bcc"):
+        for _, addr in recipients_by_header.get(bucket, []):
+            clean = extract_address(addr)
+            if bucket == "Bcc" and clean == own_addr:
+                continue
+            if clean and clean not in derived_addresses:
+                explicit_addresses.append(addr)
+
+    return list(dict.fromkeys(explicit_addresses))
+
+
 def _prepare_draft_for_send(
     draft_id: str,
     database_path: Path | str,
@@ -1545,6 +1816,20 @@ def _prepare_draft_for_send(
         if attachment_names:
             summary_line += f"  Attachments: {len(attachment_names)}\n"
             summary_line += "".join(f"    - {name}\n" for name in attachment_names)
+
+        db_path_obj = Path(database_path)
+        if db_path_obj.exists():
+            explicit_addresses = _extract_explicit_recipients_for_send(
+                msg, database_path, recipients_by_header
+            )
+            if explicit_addresses:
+                familiarity = check_recipient_familiarity(
+                    database_path, explicit_addresses, read_only=True
+                )
+                summary_line += "  Recipient check:\n"
+                for item in familiarity:
+                    addr_str = _sanitize_for_terminal(item.address)
+                    summary_line += f"    - {addr_str}: {item.mark}\n"
     except Exception as exc:  # noqa: BLE001 -- message_id is already known here
         raise _PrepFailure(
             message_id,

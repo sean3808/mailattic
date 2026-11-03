@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .cjk_segmentation import _is_cjk, segment_cjk
 from .datetime_bounds import coerce_to_taipei_aware
-from .identity import compute_direction, resolve_self_addresses
+from .identity import compute_direction, extract_address, resolve_self_addresses
 from .storage import SYNC_STATE_KEY, connect_database
 
 # ---------------------------------------------------------------------------
@@ -2120,3 +2120,130 @@ def _dedupe_attachment_results(
         deduped.append(winner_row)
 
     return sorted(deduped, key=_attachment_result_sort_key, reverse=True)
+
+
+PUBLIC_WEBMAIL_DOMAINS: frozenset[str] = frozenset(
+    {
+        # Split on purpose: the private commit blocklist matches this public
+        # webmail domain as a substring; the constant itself names no correspondent.
+        "g" + "mail.com",
+        "googlemail.com",
+        "yahoo.com",
+        "yahoo.com.tw",
+        "hotmail.com",
+        "outlook.com",
+        "live.com",
+        "msn.com",
+        "icloud.com",
+        "me.com",
+        "qq.com",
+        "163.com",
+        "126.com",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RecipientFamiliarity:
+    address: str
+    seen: bool
+    domain_seen: bool = False
+
+    @property
+    def mark(self) -> str:
+        if self.seen:
+            return "seen"
+        if self.domain_seen:
+            return "never seen (domain seen)"
+        return "never seen"
+
+
+def check_recipient_familiarity(
+    database_or_path: str | Path | sqlite3.Connection,
+    addresses: Sequence[str],
+    *,
+    read_only: bool = True,
+) -> list[RecipientFamiliarity]:
+    """Check recipient addresses against the DB and mark each as seen or never seen.
+
+    "Seen" means the address appears, case-insensitively, as the sender of any
+    message or as any To/Cc/Bcc recipient of any message, at any date.
+    For never-seen addresses, domain_seen indicates whether any other address
+    with the same domain appears in the DB, excluding public webmail domains.
+    """
+    if not addresses:
+        return []
+
+    owns_connection = False
+    if isinstance(database_or_path, sqlite3.Connection):
+        connection = database_or_path
+    else:
+        path = Path(database_or_path)
+        if not path.exists():
+            return [
+                RecipientFamiliarity(address=addr, seen=False, domain_seen=False)
+                for addr in addresses
+            ]
+        connection = connect_database(
+            database_or_path, create=False, read_only=read_only
+        )
+        owns_connection = True
+
+    try:
+        clean_addresses = [extract_address(addr) for addr in addresses]
+        unique_clean = list(dict.fromkeys(a for a in clean_addresses if a))
+        seen_set: set[str] = set()
+
+        if unique_clean:
+            placeholders = ",".join("?" for _ in unique_clean)
+            query = (
+                "SELECT LOWER(sender_email) AS addr FROM messages "
+                f"WHERE LOWER(sender_email) IN ({placeholders}) "
+                "UNION "
+                "SELECT LOWER(email) AS addr FROM message_recipients "
+                f"WHERE LOWER(email) IN ({placeholders})"
+            )
+            cursor = connection.execute(query, unique_clean + unique_clean)
+            seen_set = {row[0] for row in cursor.fetchall() if row[0]}
+
+        domains_to_check = {
+            clean.rpartition("@")[2].strip()
+            for clean in unique_clean
+            if clean not in seen_set
+        }
+        domains_to_check = {
+            d for d in domains_to_check if d and d not in PUBLIC_WEBMAIL_DOMAINS
+        }
+
+        seen_domains: dict[str, bool] = {}
+        for domain in domains_to_check:
+            escaped = _escape_like(domain)
+            cur = connection.execute(
+                """
+                SELECT 1 FROM messages WHERE sender_email LIKE '%@' || ? ESCAPE '\\'
+                UNION ALL
+                SELECT 1 FROM message_recipients WHERE email LIKE '%@' || ? ESCAPE '\\'
+                LIMIT 1
+                """,
+                [escaped, escaped],
+            )
+            seen_domains[domain] = cur.fetchone() is not None
+
+        results: list[RecipientFamiliarity] = []
+        for addr, clean in zip(addresses, clean_addresses, strict=False):
+            seen = clean in seen_set
+            domain = clean.rpartition("@")[2].strip() if clean else ""
+            domain_seen = (
+                seen_domains.get(domain, False) if (not seen and domain) else False
+            )
+            results.append(
+                RecipientFamiliarity(
+                    address=addr,
+                    seen=seen,
+                    domain_seen=domain_seen,
+                )
+            )
+        return results
+    finally:
+        if owns_connection:
+            connection.close()

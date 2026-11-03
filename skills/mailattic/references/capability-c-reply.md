@@ -8,7 +8,7 @@
 
 - The user says "幫我回覆 X 那封", "draft 一個 reply 給 Y", or "我要對某封信回信"
 - Capability B found the original and the user follows with "OK 對這封寫個回覆"
-- **Precondition**: the mail being replied to must be an **existing DB mail** (the thread exists). To start a new thread to a new recipient, see "Unsupported capabilities" in SKILL.md
+- **Precondition**: the mail being replied to must be an **existing DB mail** (the thread exists). A reply to an existing mail stays the default when one exists. To start an anchorless new thread, see Capability D (new-thread draft, capability-d-new-thread.md).
 
 ## How to use
 
@@ -97,6 +97,7 @@ bes behaviour (none of it needs caller intervention):
 - The body you wrote (the Step 1 file content)
 - Attachment names and sizes (as in Step 2's stdout; say none if there are none)
 - Fingerprint (`fingerprint:` in Step 2's stdout)
+- **Agent Duty**: explicitly name every recipient marked `never seen` or `never seen (domain seen)` in the recipient check, so that typos or unvetted addresses stand out immediately
 
 Go to Step 4 only when the user clearly says send ("寄", "送出", "幫我寄"). If the user wants changes: delete the old `.eml`, edit the body file, rerun Step 2, and **present the new draft id and fingerprint for review again**.
 
