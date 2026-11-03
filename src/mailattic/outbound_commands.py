@@ -277,6 +277,10 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
     else:
         print("Attachments: none")
     print(f"fingerprint: {result.fingerprint}")
+    if result.recipient_checks:
+        print("Recipient check:")
+        for addr, mark in result.recipient_checks:
+            print(f"  - {safe(addr)}: {mark}")
     return 0
 
 
