@@ -9,9 +9,9 @@ import pytest
 
 from mailattic.cli import build_parser
 from mailattic.models import MailboxParticipant, NormalizedMessage
-from mailattic.outbound import assemble_draft_reply
 from mailattic.outbound_commands import (
     _handle_draft_new,
+    _handle_draft_reply,
     _handle_send_batch,
     _handle_send_draft,
 )
@@ -43,7 +43,11 @@ def _seed_recipient_history(db_path: Path) -> None:
                     display_name="Colleague", email="colleague@domain-only.test"
                 ),
             ),
-            bcc_recipients=(),
+            bcc_recipients=(
+                MailboxParticipant(
+                    display_name="Auditor", email="auditor_bcc@bcc-domain.test"
+                ),
+            ),
             sent_at=datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
             received_at=datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
             body_text="Earlier message body",
@@ -95,9 +99,11 @@ def test_draft_new_cli_creates_draft_with_headers_and_no_reply_headers(
             "--to",
             "Alice <known_to@example.com>",
             "--cc",
-            "Bob <new_user@domain-only.test>",
+            "Auditor <AUDITOR_BCC@bcc-domain.test>",
+            "--cc",
+            "Bob <New_User@domain-only.test>",
             "--bcc",
-            "Eve <stranger@unknown-world.org>",
+            "Eve <Stranger@unknown-world.org>",
             "--subject",
             "A Fresh Conversation",
             "--body-from",
@@ -119,10 +125,11 @@ def test_draft_new_cli_creates_draft_with_headers_and_no_reply_headers(
     assert f"From: {SMTP_USER}" in stdout
     assert "Subject: A Fresh Conversation" in stdout
     assert "To: Alice <known_to@example.com>" in stdout
-    assert "Cc: Bob <new_user@domain-only.test>" in stdout
+    assert "Auditor <AUDITOR_BCC@bcc-domain.test>" in stdout
+    assert "Bob <New_User@domain-only.test>" in stdout
     assert "Bcc: " in stdout
     assert f"{SMTP_USER}" in stdout
-    assert "Eve <stranger@unknown-world.org>" in stdout
+    assert "Eve <Stranger@unknown-world.org>" in stdout
     assert "Attachments: 1" in stdout
     assert "doc.pdf" in stdout
     assert "fingerprint:" in stdout
@@ -130,8 +137,9 @@ def test_draft_new_cli_creates_draft_with_headers_and_no_reply_headers(
     # Recipient checks
     assert "Recipient check:" in stdout
     assert "known_to@example.com: seen" in stdout
-    assert "new_user@domain-only.test: never seen (domain seen)" in stdout
-    assert "stranger@unknown-world.org: never seen" in stdout
+    assert "AUDITOR_BCC@bcc-domain.test: seen" in stdout
+    assert "New_User@domain-only.test: never seen (domain seen)" in stdout
+    assert "Stranger@unknown-world.org: never seen" in stdout
     # BCC-self is not in recipient check
     assert SMTP_USER not in stdout.split("Recipient check:")[1]
 
@@ -141,8 +149,9 @@ def test_draft_new_cli_creates_draft_with_headers_and_no_reply_headers(
     assert parsed["Subject"] == "A Fresh Conversation"
     assert parsed["From"] == SMTP_USER
     assert "known_to@example.com" in parsed["To"]
-    assert "new_user@domain-only.test" in parsed["Cc"]
-    assert "stranger@unknown-world.org" in parsed["Bcc"]
+    assert "AUDITOR_BCC@bcc-domain.test" in parsed["Cc"]
+    assert "New_User@domain-only.test" in parsed["Cc"]
+    assert "Stranger@unknown-world.org" in parsed["Bcc"]
     assert SMTP_USER in parsed["Bcc"]
 
     # In-Reply-To and References MUST NOT be present
@@ -347,15 +356,37 @@ def test_send_batch_accepts_new_thread_draft_alongside_reply_draft(
 
     parser = build_parser()
 
-    # 1. Create a reply draft
-    reply_result = assemble_draft_reply(
-        database_path=db_path,
-        message_id="<prior-msg-1@mailattic.test>",
-        own_address=SMTP_USER,
-        body_text="Reply text",
+    # 1. Create a reply draft through CLI seam
+    reply_body_file = tmp_path / "reply_body.txt"
+    reply_body_file.write_text("Reply text", encoding="utf-8")
+    reply_args = parser.parse_args(
+        [
+            "draft-reply",
+            "<prior-msg-1@mailattic.test>",
+            "--body-from",
+            str(reply_body_file),
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(env_file),
+        ]
     )
-    reply_draft_id = reply_result.draft_id
-    reply_fp = reply_result.fingerprint
+    assert _handle_draft_reply(reply_args) == 0
+    reply_stdout = capsys.readouterr().out
+    reply_draft_id = (
+        next(line for line in reply_stdout.splitlines() if line.startswith("draft_id:"))
+        .split(":")[1]
+        .strip()
+    )
+    reply_fp = (
+        next(
+            line
+            for line in reply_stdout.splitlines()
+            if line.startswith("fingerprint:")
+        )
+        .split(":")[1]
+        .strip()
+    )
 
     # 2. Create a new-thread draft
     draft_args = parser.parse_args(

@@ -86,7 +86,9 @@ __all__ = [
     "DEFAULT_SMTP_ENV_FILE",
     "ENV_VAR_SMTP_ENV_FILE",
     "assemble_draft_reply",
+    "DraftError",
     "DraftReplyError",
+    "DraftNewError",
     "DraftReplyResult",
     "DraftNewResult",
     "assemble_draft_new",
@@ -788,7 +790,15 @@ ARCHIVE_ANCHOR_REFUSAL = (
 )
 
 
-class DraftReplyError(Exception):
+class DraftError(Exception):
+    """Expected refusal from draft assembly; its message is user-facing."""
+
+
+class DraftNewError(DraftError):
+    """Expected refusal from ``assemble_draft_new``; its message is user-facing."""
+
+
+class DraftReplyError(DraftError):
     """Expected refusal from ``assemble_draft_reply``; its message is user-facing."""
 
 
@@ -1132,12 +1142,12 @@ def assemble_draft_new(
     self address).
     BCC-self is added automatically as for reply drafts.
     ``font_style`` styles the HTML body.
-    Expected refusals raise ``DraftReplyError`` or ``ValueError``.
+    Expected refusals raise ``DraftNewError`` or ``ValueError``.
     """
     if subject is None or not subject.strip():
-        raise DraftReplyError("--subject must not be empty or whitespace-only.")
+        raise DraftNewError("--subject must not be empty or whitespace-only.")
     if any(unicodedata.category(char) in {"Cc", "Zl", "Zp"} for char in subject):
-        raise DraftReplyError(
+        raise DraftNewError(
             "--subject must be a single line without control characters."
         )
 
@@ -1147,11 +1157,11 @@ def assemble_draft_new(
         try:
             body_text = Path(body_from).read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
-            raise DraftReplyError(f"Could not read draft body file: {exc}") from exc
+            raise DraftNewError(f"Could not read draft body file: {exc}") from exc
 
     parsed_to = _parse_recipient_options(to, "--to")
     if not parsed_to:
-        raise DraftReplyError("draft-new: at least one To recipient is required")
+        raise DraftNewError("draft-new: at least one To recipient is required")
     parsed_cc = _parse_recipient_options(cc, "--cc")
     parsed_bcc = _parse_recipient_options(bcc, "--bcc")
 
@@ -1174,7 +1184,7 @@ def assemble_draft_new(
             add(bucket, recipient)
 
     if not result_recipients["to"]:
-        raise DraftReplyError("draft-new: at least one To recipient is required")
+        raise DraftNewError("draft-new: at least one To recipient is required")
 
     # Automatic BCC-self
     result_recipients["bcc"].append((None, own_address))
@@ -1216,10 +1226,10 @@ def assemble_draft_new(
         path = Path(path_item)
         try:
             if not path.is_file():
-                raise DraftReplyError(f"Attachment path is not a file: {path}")
+                raise DraftNewError(f"Attachment path is not a file: {path}")
             data = path.read_bytes()
         except OSError as exc:
-            raise DraftReplyError(
+            raise DraftNewError(
                 f"Could not read attachment file {path}: {exc}"
             ) from exc
         attachment_payloads.append((path, data))

@@ -21,7 +21,10 @@ from .imap_runtime import load_env_file
 from .outbound import (
     DEFAULT_SMTP_ENV_FILE,
     ENV_VAR_SMTP_ENV_FILE,
+    DraftError,
+    DraftNewResult,
     DraftReplyError,
+    DraftReplyResult,
     SendRefused,
     SmtpConfig,
     _sanitize_for_terminal,
@@ -266,6 +269,31 @@ def register_outbound_commands(subparsers: argparse._SubParsersAction) -> None: 
     list_drafts_parser.set_defaults(handler=_handle_list_drafts)
 
 
+def _print_draft_summary(result: DraftReplyResult | DraftNewResult) -> int:
+    # This stdout is what the user reviews before a fingerprint send, so
+    # data-influenced text must not carry terminal control sequences.
+    safe = _sanitize_for_terminal
+    print(f"draft_id: {result.draft_id}")
+    print(f"From: {safe(result.from_address)}")
+    print(f"Subject: {safe(result.subject)}")
+    print(f"To: {safe(result.to)}")
+    print(f"Cc: {safe(result.cc)}")
+    print(f"Bcc: {safe(result.bcc)}")
+    print(f"Message-ID: {result.message_id}")
+    if result.attachments:
+        print(f"Attachments: {len(result.attachments)}")
+        for name, size in result.attachments:
+            print(f"  - {safe(name)} ({size} bytes)")
+    else:
+        print("Attachments: none")
+    print(f"fingerprint: {result.fingerprint}")
+    if result.recipient_checks:
+        print("Recipient check:")
+        for item in result.recipient_checks:
+            print(f"  - {safe(item.address)}: {item.mark}")
+    return 0
+
+
 def _handle_draft_reply(args: argparse.Namespace) -> int:
     resolved_env_file = resolve_smtp_env_file(args.env_file)
     env: dict[str, str] = {}
@@ -316,28 +344,7 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
         print(exc, file=sys.stderr)
         return 2
 
-    # This stdout is what the user reviews before a fingerprint send, so
-    # data-influenced text must not carry terminal control sequences.
-    safe = _sanitize_for_terminal
-    print(f"draft_id: {result.draft_id}")
-    print(f"From: {safe(result.from_address)}")
-    print(f"Subject: {safe(result.subject)}")
-    print(f"To: {safe(result.to)}")
-    print(f"Cc: {safe(result.cc)}")
-    print(f"Bcc: {safe(result.bcc)}")
-    print(f"Message-ID: {result.message_id}")
-    if result.attachments:
-        print(f"Attachments: {len(result.attachments)}")
-        for name, size in result.attachments:
-            print(f"  - {safe(name)} ({size} bytes)")
-    else:
-        print("Attachments: none")
-    print(f"fingerprint: {result.fingerprint}")
-    if result.recipient_checks:
-        print("Recipient check:")
-        for item in result.recipient_checks:
-            print(f"  - {safe(item.address)}: {item.mark}")
-    return 0
+    return _print_draft_summary(result)
 
 
 def _handle_draft_new(args: argparse.Namespace) -> int:
@@ -369,30 +376,11 @@ def _handle_draft_new(args: argparse.Namespace) -> int:
             attachments=args.attach,
             font_style=reply_font_style(env),
         )
-    except (DraftReplyError, ValueError) as exc:
+    except (DraftError, ValueError) as exc:
         print(exc, file=sys.stderr)
         return 2
 
-    safe = _sanitize_for_terminal
-    print(f"draft_id: {result.draft_id}")
-    print(f"From: {safe(result.from_address)}")
-    print(f"Subject: {safe(result.subject)}")
-    print(f"To: {safe(result.to)}")
-    print(f"Cc: {safe(result.cc)}")
-    print(f"Bcc: {safe(result.bcc)}")
-    print(f"Message-ID: {result.message_id}")
-    if result.attachments:
-        print(f"Attachments: {len(result.attachments)}")
-        for name, size in result.attachments:
-            print(f"  - {safe(name)} ({size} bytes)")
-    else:
-        print("Attachments: none")
-    print(f"fingerprint: {result.fingerprint}")
-    if result.recipient_checks:
-        print("Recipient check:")
-        for item in result.recipient_checks:
-            print(f"  - {safe(item.address)}: {item.mark}")
-    return 0
+    return _print_draft_summary(result)
 
 
 def _handle_list_drafts(args: argparse.Namespace) -> int:
