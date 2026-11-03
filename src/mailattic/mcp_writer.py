@@ -254,6 +254,21 @@ class MailWriter:
             refuse_filename=_refuse_runnable_filename,
         ).items
 
+    def _resolve_sender_and_env(self) -> tuple[Mapping[str, str], str]:
+        # #268 (overturns #189's "settings load only at send time"): From is
+        # the configured account, so the send-time from-invariant accepts
+        # what was reviewed. No account configured and no single declared
+        # self address means no draft -- there is no built-in address.
+        env: Mapping[str, str] = {}
+        try:
+            env, smtp_config = _load_mcp_smtp_env()
+            own_address = smtp_config.user
+        except ValueError:
+            own_address = own_address_without_smtp_settings(
+                self.database_path, read_only=True
+            )
+        return env, own_address
+
     def draft_reply(
         self,
         message_id: str,
@@ -267,18 +282,7 @@ class MailWriter:
         attachments: Sequence[str | Path] | None = None,
     ) -> DraftReplyResult:
         """Assemble a reply draft in the MCP-dedicated drafts folder."""
-        # #268 (overturns #189's "settings load only at send time"): From is
-        # the configured account, so the send-time from-invariant accepts
-        # what was reviewed. No account configured and no single declared
-        # self address means no draft -- there is no built-in address.
-        env: Mapping[str, str] = {}
-        try:
-            env, smtp_config = _load_mcp_smtp_env()
-            own_address = smtp_config.user
-        except ValueError:
-            own_address = own_address_without_smtp_settings(
-                self.database_path, read_only=True
-            )
+        env, own_address = self._resolve_sender_and_env()
         return assemble_draft_reply(
             database_path=self.database_path,
             message_id=message_id,
@@ -306,14 +310,7 @@ class MailWriter:
         attachments: Sequence[str | Path] | None = None,
     ) -> DraftNewResult:
         """Assemble a new-thread draft in the MCP-dedicated drafts folder."""
-        env: Mapping[str, str] = {}
-        try:
-            env, smtp_config = _load_mcp_smtp_env()
-            own_address = smtp_config.user
-        except ValueError:
-            own_address = own_address_without_smtp_settings(
-                self.database_path, read_only=True
-            )
+        env, own_address = self._resolve_sender_and_env()
         return assemble_draft_new(
             database_path=self.database_path,
             own_address=own_address,

@@ -1523,6 +1523,41 @@ def _flag_ladder_states(
     return [stamped(state, index == 0) for index, state in enumerate(states)]
 
 
+def _shape_draft_attachments(
+    attachment_sources: Sequence[tuple[str, str, int]],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "path": src_path,
+            "name": name,
+            "size_bytes": size,
+        }
+        for src_path, name, size in attachment_sources
+    ]
+
+
+def _draft_ladder_states(
+    body_text: str,
+    make_payload: Callable[..., dict[str, object]],
+) -> list[Callable[[], dict[str, object]]]:
+    def _shrunk_payload(kept: int) -> dict[str, object]:
+        # Keep head and tail halves (D-20260924-1 §5); built only when the
+        # ladder actually reaches this rung.
+        half = kept // 2
+        omitted = len(body_text) - 2 * half
+        return make_payload(
+            f"{body_text[:half]}\n\n"
+            f"... [{omitted} characters truncated for delivery budget] ...\n\n"
+            f"{body_text[-half:]}",
+            truncated=True,
+        )
+
+    states: list[Callable[[], dict[str, object]]] = [lambda: make_payload(body_text)]
+    shrunk_states, _ = _halving_ladder_states(len(body_text), 1000, _shrunk_payload)
+    states.extend(shrunk_states)
+    return states
+
+
 _SEND_RECEIPT_CLOSE_CAP = 1000
 _SEND_RECEIPT_LIST_CAP = 25
 _SEND_RECEIPT_REASON_CAP = 100
@@ -2417,14 +2452,7 @@ def create_server(
                 detail=str(exc),
             ) from exc
 
-        attachments_payload: list[dict[str, object]] = [
-            {
-                "path": src_path,
-                "name": name,
-                "size_bytes": size,
-            }
-            for src_path, name, size in result.attachment_sources
-        ]
+        attachments_payload = _shape_draft_attachments(result.attachment_sources)
 
         def _make_payload(body: str, *, truncated: bool = False) -> dict[str, object]:
             # A truncated body is not what the fingerprint covers, so the user
@@ -2443,26 +2471,7 @@ def create_server(
                 "attachments": attachments_payload,
             }
 
-        def _shrunk_payload(kept: int) -> dict[str, object]:
-            # Keep head and tail halves (D-20260924-1 §5); built only when the
-            # ladder actually reaches this rung.
-            half = kept // 2
-            omitted = len(result.body_text) - 2 * half
-            return _make_payload(
-                f"{result.body_text[:half]}\n\n"
-                f"... [{omitted} characters truncated for delivery budget] ...\n\n"
-                f"{result.body_text[-half:]}",
-                truncated=True,
-            )
-
-        states: list[Callable[[], dict[str, object]]] = [
-            lambda: _make_payload(result.body_text)
-        ]
-        shrunk_states, _ = _halving_ladder_states(
-            len(result.body_text), 1000, _shrunk_payload
-        )
-        states.extend(shrunk_states)
-
+        states = _draft_ladder_states(result.body_text, _make_payload)
         tool = _get_registered_tool("mail_draft_reply")
         try:
             outcome = walk_ladder(_flag_ladder_states(states), tool=tool)
@@ -2508,14 +2517,7 @@ def create_server(
                 detail=str(exc),
             ) from exc
 
-        attachments_payload: list[dict[str, object]] = [
-            {
-                "path": src_path,
-                "name": name,
-                "size_bytes": size,
-            }
-            for src_path, name, size in result.attachment_sources
-        ]
+        attachments_payload = _shape_draft_attachments(result.attachment_sources)
 
         recipient_checks_payload: list[dict[str, object]] = [
             {
@@ -2545,26 +2547,7 @@ def create_server(
                 "recipient_checks": recipient_checks_payload,
             }
 
-        def _shrunk_payload(kept: int) -> dict[str, object]:
-            # Keep head and tail halves (D-20260924-1 §5); built only when the
-            # ladder actually reaches this rung.
-            half = kept // 2
-            omitted = len(result.body_text) - 2 * half
-            return _make_payload(
-                f"{result.body_text[:half]}\n\n"
-                f"... [{omitted} characters truncated for delivery budget] ...\n\n"
-                f"{result.body_text[-half:]}",
-                truncated=True,
-            )
-
-        states: list[Callable[[], dict[str, object]]] = [
-            lambda: _make_payload(result.body_text)
-        ]
-        shrunk_states, _ = _halving_ladder_states(
-            len(result.body_text), 1000, _shrunk_payload
-        )
-        states.extend(shrunk_states)
-
+        states = _draft_ladder_states(result.body_text, _make_payload)
         tool = _get_registered_tool("mail_draft_new")
         try:
             outcome = walk_ladder(_flag_ladder_states(states), tool=tool)
