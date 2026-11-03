@@ -214,9 +214,20 @@ _MAIL_DRAFT_REPLY_DESCRIPTION = (
     "the complete draft (Subject, To, Cc, Bcc, body, attachments, draft_id, and "
     "fingerprint) to the user for conversational review before calling mail_send."
 )
+_MAIL_DRAFT_NEW_DESCRIPTION = (
+    "Generate a new-thread draft email and write it to the MCP-dedicated "
+    "draft folder. Anchored to no prior message. Requires at least one To "
+    "recipient and a non-blank subject. Returns its draft_id, content "
+    "fingerprint (SHA-256), full draft text, and recipient familiarity "
+    "marks for review. The draft is NOT sent. Present the complete draft "
+    "(Subject, To, Cc, Bcc, body, attachments, recipient check marks, "
+    "draft_id, and fingerprint) to the user for conversational review "
+    "before calling mail_send."
+)
 _MAIL_SEND_DESCRIPTION = (
     "Send a reviewed draft from the MCP-dedicated draft folder. Requires the "
-    "draft_id and the matching SHA-256 fingerprint obtained from mail_draft_reply. "
+    "draft_id and the matching SHA-256 fingerprint obtained from mail_draft_reply "
+    "or mail_draft_new. "
     "Requires MAILATTIC_SMTP_ENV_FILE environment variable to point to a valid "
     "SMTP configuration file. Only call this after the user has reviewed the draft "
     "and explicitly confirmed to send. status='partial' means SMTP refused some "
@@ -1512,6 +1523,41 @@ def _flag_ladder_states(
     return [stamped(state, index == 0) for index, state in enumerate(states)]
 
 
+def _shape_draft_attachments(
+    attachment_sources: Sequence[tuple[str, str, int]],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "path": src_path,
+            "name": name,
+            "size_bytes": size,
+        }
+        for src_path, name, size in attachment_sources
+    ]
+
+
+def _draft_ladder_states(
+    body_text: str,
+    make_payload: Callable[..., dict[str, object]],
+) -> list[Callable[[], dict[str, object]]]:
+    def _shrunk_payload(kept: int) -> dict[str, object]:
+        # Keep head and tail halves (D-20260924-1 §5); built only when the
+        # ladder actually reaches this rung.
+        half = kept // 2
+        omitted = len(body_text) - 2 * half
+        return make_payload(
+            f"{body_text[:half]}\n\n"
+            f"... [{omitted} characters truncated for delivery budget] ...\n\n"
+            f"{body_text[-half:]}",
+            truncated=True,
+        )
+
+    states: list[Callable[[], dict[str, object]]] = [lambda: make_payload(body_text)]
+    shrunk_states, _ = _halving_ladder_states(len(body_text), 1000, _shrunk_payload)
+    states.extend(shrunk_states)
+    return states
+
+
 _SEND_RECEIPT_CLOSE_CAP = 1000
 _SEND_RECEIPT_LIST_CAP = 25
 _SEND_RECEIPT_REASON_CAP = 100
@@ -2406,14 +2452,7 @@ def create_server(
                 detail=str(exc),
             ) from exc
 
-        attachments_payload: list[dict[str, object]] = [
-            {
-                "path": src_path,
-                "name": name,
-                "size_bytes": size,
-            }
-            for src_path, name, size in result.attachment_sources
-        ]
+        attachments_payload = _shape_draft_attachments(result.attachment_sources)
 
         def _make_payload(body: str, *, truncated: bool = False) -> dict[str, object]:
             # A truncated body is not what the fingerprint covers, so the user
@@ -2432,26 +2471,7 @@ def create_server(
                 "attachments": attachments_payload,
             }
 
-        def _shrunk_payload(kept: int) -> dict[str, object]:
-            # Keep head and tail halves (D-20260924-1 §5); built only when the
-            # ladder actually reaches this rung.
-            half = kept // 2
-            omitted = len(result.body_text) - 2 * half
-            return _make_payload(
-                f"{result.body_text[:half]}\n\n"
-                f"... [{omitted} characters truncated for delivery budget] ...\n\n"
-                f"{result.body_text[-half:]}",
-                truncated=True,
-            )
-
-        states: list[Callable[[], dict[str, object]]] = [
-            lambda: _make_payload(result.body_text)
-        ]
-        shrunk_states, _ = _halving_ladder_states(
-            len(result.body_text), 1000, _shrunk_payload
-        )
-        states.extend(shrunk_states)
-
+        states = _draft_ladder_states(result.body_text, _make_payload)
         tool = _get_registered_tool("mail_draft_reply")
         try:
             outcome = walk_ladder(_flag_ladder_states(states), tool=tool)
@@ -2459,6 +2479,82 @@ def create_server(
             raise build_tool_error(
                 ValueError,
                 "mail_draft_reply result exceeds the delivery budget of "
+                "{budget} characters",
+                budget=MCP_RESPONSE_BUDGET_CHARS,
+            ) from exc
+        return outcome.delivered
+
+    @server.tool(
+        name="mail_draft_new",
+        title="Draft a new email thread",
+        description=_MAIL_DRAFT_NEW_DESCRIPTION,
+        annotations=ToolAnnotations(
+            title="Draft a new email thread",
+            **{**_READ_ONLY_HINTS, "readOnlyHint": False, "idempotentHint": False},
+        ),
+    )
+    def mail_draft_new(
+        to: list[StrictStr],
+        subject: StrictStr,
+        body_text: StrictStr,
+        cc: list[StrictStr] | None = None,
+        bcc: list[StrictStr] | None = None,
+        attachments: list[StrictStr] | None = None,
+    ) -> Annotated[CallToolResult, dict[str, object]]:
+        try:
+            result = writer.draft_new(
+                to=to,
+                subject=subject,
+                body_text=body_text,
+                cc=cc,
+                bcc=bcc,
+                attachments=attachments,
+            )
+        except Exception as exc:
+            raise build_tool_error(
+                ValueError,
+                "Failed to draft new email: {detail}",
+                detail=str(exc),
+            ) from exc
+
+        attachments_payload = _shape_draft_attachments(result.attachment_sources)
+
+        recipient_checks_payload: list[dict[str, object]] = [
+            {
+                "address": check.address,
+                "seen": check.seen,
+                "domain_seen": check.domain_seen,
+                "mark": check.mark,
+            }
+            for check in result.recipient_checks
+        ]
+
+        def _make_payload(body: str, *, truncated: bool = False) -> dict[str, object]:
+            # A truncated body is not what the fingerprint covers, so the user
+            # cannot have reviewed the draft being sent: withhold it (#189
+            # "寄出的＝使用者看過的"). mail_send then has nothing to match.
+            return {
+                "draft_id": result.draft_id,
+                "fingerprint": None if truncated else result.fingerprint,
+                "message_id": result.message_id,
+                "from": result.from_address,
+                "subject": result.subject,
+                "to": result.to,
+                "cc": result.cc,
+                "bcc": result.bcc,
+                "body_text": body,
+                "attachments": attachments_payload,
+                "recipient_checks": recipient_checks_payload,
+            }
+
+        states = _draft_ladder_states(result.body_text, _make_payload)
+        tool = _get_registered_tool("mail_draft_new")
+        try:
+            outcome = walk_ladder(_flag_ladder_states(states), tool=tool)
+        except LadderExhausted as exc:
+            raise build_tool_error(
+                ValueError,
+                "mail_draft_new result exceeds the delivery budget of "
                 "{budget} characters",
                 budget=MCP_RESPONSE_BUDGET_CHARS,
             ) from exc
@@ -2488,7 +2584,7 @@ def create_server(
             raise build_tool_error(
                 ValueError,
                 "Not sent: draft not found in MCP drafts folder. Use the draft_id "
-                "returned by mail_draft_reply. Draft: {draft_id}",
+                "returned by mail_draft_reply or mail_draft_new. Draft: {draft_id}",
                 draft_id=draft_id,
             ) from exc
         except Exception as exc:

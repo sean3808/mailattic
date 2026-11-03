@@ -1571,6 +1571,7 @@ class McpServerTests(unittest.TestCase):
                 "mail_sync_status",
                 "mail_attachment_export",
                 "mail_draft_reply",
+                "mail_draft_new",
                 "mail_send",
             },
         )
@@ -1800,15 +1801,16 @@ class McpServerTests(unittest.TestCase):
                     not in {
                         "mail_attachment_export",
                         "mail_draft_reply",
+                        "mail_draft_new",
                         "mail_send",
                     },
                 )
                 self.assertFalse(tool.annotations.destructive_hint)
-                # Each mail_draft_reply call writes a new draft; mail_send
+                # Each draft call writes a new draft; mail_send
                 # reaches external recipients.
                 self.assertEqual(
                     tool.annotations.idempotent_hint,
-                    name not in {"mail_draft_reply", "mail_send"},
+                    name not in {"mail_draft_reply", "mail_draft_new", "mail_send"},
                 )
                 self.assertEqual(tool.annotations.open_world_hint, name == "mail_send")
 

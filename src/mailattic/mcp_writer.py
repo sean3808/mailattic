@@ -15,8 +15,9 @@ It writes host files in three controlled ways:
    the caller names (issue #28). It never overwrites: an existing destination
    file is reported as skipped and left byte-for-byte untouched. It never
    lands a file type Windows runs when the file is opened (issue #205).
-2. Reply drafts in the MCP-dedicated drafts folder (issue #189), assembled
-   via :func:`~mailattic.outbound.assemble_draft_reply`.
+2. Reply and new-thread drafts in the MCP-dedicated drafts folder (issues
+   #189, #49), assembled via :func:`~mailattic.outbound.assemble_draft_reply`
+   and :func:`~mailattic.outbound.assemble_draft_new`.
 3. Outbound mail submission of a reviewed MCP draft (issue #189), after
    re-verifying the draft's SHA-256 fingerprint against the draft on disk.
 """
@@ -38,12 +39,14 @@ from .attachment_store import (
 from .imap_runtime import load_env_file
 from .outbound import (
     ENV_VAR_SMTP_ENV_FILE,
+    DraftNewResult,
     DraftReplyResult,
     SmtpConfig,
     _prepare_draft_for_send,
     _read_marker,
     _submit_prepared_draft,
     _verify_fingerprint,
+    assemble_draft_new,
     assemble_draft_reply,
     load_smtp_config,
     own_address_without_smtp_settings,
@@ -251,6 +254,21 @@ class MailWriter:
             refuse_filename=_refuse_runnable_filename,
         ).items
 
+    def _resolve_sender_and_env(self) -> tuple[Mapping[str, str], str]:
+        # #268 (overturns #189's "settings load only at send time"): From is
+        # the configured account, so the send-time from-invariant accepts
+        # what was reviewed. No account configured and no single declared
+        # self address means no draft -- there is no built-in address.
+        env: Mapping[str, str] = {}
+        try:
+            env, smtp_config = _load_mcp_smtp_env()
+            own_address = smtp_config.user
+        except ValueError:
+            own_address = own_address_without_smtp_settings(
+                self.database_path, read_only=True
+            )
+        return env, own_address
+
     def draft_reply(
         self,
         message_id: str,
@@ -264,18 +282,7 @@ class MailWriter:
         attachments: Sequence[str | Path] | None = None,
     ) -> DraftReplyResult:
         """Assemble a reply draft in the MCP-dedicated drafts folder."""
-        # #268 (overturns #189's "settings load only at send time"): From is
-        # the configured account, so the send-time from-invariant accepts
-        # what was reviewed. No account configured and no single declared
-        # self address means no draft -- there is no built-in address.
-        env: Mapping[str, str] = {}
-        try:
-            env, smtp_config = _load_mcp_smtp_env()
-            own_address = smtp_config.user
-        except ValueError:
-            own_address = own_address_without_smtp_settings(
-                self.database_path, read_only=True
-            )
+        env, own_address = self._resolve_sender_and_env()
         return assemble_draft_reply(
             database_path=self.database_path,
             message_id=message_id,
@@ -287,6 +294,32 @@ class MailWriter:
             bcc=bcc,
             exclude=exclude,
             replace_recipients=replace_recipients,
+            attachments=attachments,
+            read_only=True,
+            font_style=reply_font_style(env),
+        )
+
+    def draft_new(
+        self,
+        *,
+        subject: str,
+        body_text: str,
+        to: Sequence[str] | None = None,
+        cc: Sequence[str] | None = None,
+        bcc: Sequence[str] | None = None,
+        attachments: Sequence[str | Path] | None = None,
+    ) -> DraftNewResult:
+        """Assemble a new-thread draft in the MCP-dedicated drafts folder."""
+        env, own_address = self._resolve_sender_and_env()
+        return assemble_draft_new(
+            database_path=self.database_path,
+            own_address=own_address,
+            to=to,
+            subject=subject,
+            draft_dir=self.draft_dir,
+            body_text=body_text,
+            cc=cc,
+            bcc=bcc,
             attachments=attachments,
             read_only=True,
             font_style=reply_font_style(env),
@@ -318,7 +351,7 @@ class MailWriter:
             raise ValueError(
                 "Invalid draft_id (must be a bare filename without path "
                 "components); not sent. Use the draft_id returned by "
-                f"mail_draft_reply. Received: '{draft_id}'"
+                f"mail_draft_reply or mail_draft_new. Received: '{draft_id}'"
             )
 
         # Belt-and-braces: the bare-name check above already rules this out.
@@ -329,7 +362,7 @@ class MailWriter:
             raise ValueError(
                 "Invalid draft_id (path traversal outside MCP drafts "
                 "directory); not sent. Use the draft_id returned by "
-                f"mail_draft_reply. Received: '{draft_id}'"
+                f"mail_draft_reply or mail_draft_new. Received: '{draft_id}'"
             ) from exc
 
         env_mapping, smtp_config = _load_mcp_smtp_env()
