@@ -1309,9 +1309,8 @@ def test_import_embedded_msg_attachment_naming(
 ) -> None:
     pst_path = tmp_path / "archive.pst"
     source = PstSource(pst_path, "file", pst_path)
-    database_path = initialize_database(
-        tmp_path / f"evidence_{original_name or 'empty'}.db"
-    )
+    # tmp_path is unique per case; a name with ":" would land in an NTFS stream.
+    database_path = initialize_database(tmp_path / "evidence.db")
     attachment_root = resolve_store_root(database_path)
 
     fake_att = FakeEmbeddedAttachment(
