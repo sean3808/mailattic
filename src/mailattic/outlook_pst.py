@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -41,6 +42,9 @@ PR_TRANSPORT_MESSAGE_HEADERS = f"{_MAPI_PROPTAG}0x007D001E"
 PR_SENDER_SMTP_ADDRESS = f"{_MAPI_PROPTAG}0x5D01001E"
 PR_ATTACH_DATA_BIN = f"{_MAPI_PROPTAG}0x37010102"
 PR_ATTACH_MIME_TAG = f"{_MAPI_PROPTAG}0x370E001E"
+PR_ATTACH_METHOD = f"{_MAPI_PROPTAG}0x37050003"
+ATTACH_EMBEDDED_MSG = 5
+OL_EMBEDDED_ITEM = 5
 
 
 def resolve_extraction_summary_root(database_path: str | Path) -> Path:
@@ -197,6 +201,14 @@ class OutlookReader(Protocol):
     def iter_messages(
         self, source: PstSource
     ) -> Iterable[RawOutlookMessage | RawOutlookFailure]: ...
+
+
+def _is_embedded_item(source_attachment: Any, accessor: Any) -> bool:
+    attachment_type = _safe_attr(source_attachment, "Type")
+    if attachment_type in (OL_EMBEDDED_ITEM, str(OL_EMBEDDED_ITEM)):
+        return True
+    method = _optional_property(accessor, PR_ATTACH_METHOD)
+    return method in (ATTACH_EMBEDDED_MSG, str(ATTACH_EMBEDDED_MSG))
 
 
 class OutlookComReader:
@@ -440,18 +452,56 @@ class OutlookComReader:
                 "storage_path": None,
             }
             if self._attachment_root is not None:
-                accessor = source_attachment.PropertyAccessor
+                accessor = _safe_attr(source_attachment, "PropertyAccessor")
                 try:
                     payload = _optional_property(accessor, PR_ATTACH_DATA_BIN)
                     # pywin32 hands PT_BINARY back as memoryview (#32).
                     if not isinstance(payload, bytes | bytearray | memoryview):
-                        raise TypeError("Attachment binary property is unavailable")
+                        if _is_embedded_item(source_attachment, accessor):
+                            # ponytail: hashes of these attachments are not
+                            # stable across imports, so --dedupe content-hash
+                            # will not merge the same forwarded mail carried
+                            # by two messages, and the size match used by
+                            # duplicate repair (_expected_size) cannot pair two
+                            # saves of the same item.
+                            raw_file_name = str(
+                                _safe_attr(source_attachment, "FileName") or ""
+                            ).strip()
+                            if raw_file_name:
+                                file_name = (
+                                    raw_file_name
+                                    if raw_file_name.casefold().endswith(".msg")
+                                    else f"{raw_file_name}.msg"
+                                )
+                            else:
+                                file_name = (
+                                    f"unnamed-attachment-{unnamed_seq}.msg"
+                                    if unnamed_seq
+                                    else "unnamed-attachment-1.msg"
+                                )
+                            attachment["attachment_name"] = file_name
+                            mime_type = "application/vnd.ms-outlook"
+                            try:
+                                with tempfile.TemporaryDirectory() as temp_dir:
+                                    temp_file = Path(temp_dir) / f"{uuid4().hex}.msg"
+                                    try:
+                                        source_attachment.SaveAsFile(str(temp_file))
+                                        payload = temp_file.read_bytes()
+                                    finally:
+                                        temp_file.unlink(missing_ok=True)
+                            except Exception as exc:
+                                raise ValueError(
+                                    f"Failed to extract embedded item: {exc}"
+                                ) from exc
+                        else:
+                            raise TypeError("Attachment binary property is unavailable")
+                    else:
+                        mime_type = _coerce_optional_text(
+                            _optional_property(accessor, PR_ATTACH_MIME_TAG)
+                        )
                     # Kept before the CAS write so a failed write still leaves the
                     # size that shared duplicate repair matches against.
                     attachment["_expected_size"] = len(payload)
-                    mime_type = _coerce_optional_text(
-                        _optional_property(accessor, PR_ATTACH_MIME_TAG)
-                    )
                     record = attachment_store.write_attachment(
                         bytes(payload),
                         str(attachment["attachment_name"]),

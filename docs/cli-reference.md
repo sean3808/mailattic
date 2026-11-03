@@ -110,6 +110,7 @@ Windows-native IMAP sync 從這次指定的 `--env-file` 讀取 `IMAP_SECURITY`�
 - `--message <db_id>` 只回傳該封信（`messages.id`）夾帶的附件；與既有所有 filter 及 `--copy-to` 為 AND 關係；若 `db_id` 不存在則回傳空結果、exit 0、不匯出任何檔案（filter 語意，非 lookup）
 - 一列一附件；輸出同時帶 `attachment_id`、`message_db_id`、穩定引用用的 `rfc_message_id` / `dedup_key`、`exportable`、`carrying_messages`
 - 以附件形式轉寄的信（`message/rfc822`）整封算一列附件、可匯出（沒有檔名時以附信主旨加 `.eml` 命名）；其內文不併入外層信的本文與檢索，其內夾帶的附件不另列。退信通知（`multipart/report`）夾帶的原信則維持併入外層本文與檢索、不另立為附件，此為刻意設計以方便依原信內容檢索退信
+- 以附件形式轉寄的信在 Outlook 匯入路徑存為 `.msg`，在 RFC/maildir 匯入路徑存為 `.eml`。
 - `--copy-to` 只會複製 `storage_path` 非空的列；metadata-only attachment 會逐列回報 `skipped-non-exportable`，不是靜默忽略
 - 預設 export 不覆寫；`--overwrite` 覆寫、`--skip-existing` 跳過，兩者同時給會在 copy 前 exit 非 0
 - export run 完成後，**只有** `failed > 0` 會讓整體 exit 非 0；`copied` / `skipped-non-exportable` / `skipped-existing` 都不單獨構成失敗

@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from mailattic.attachment_store import resolve_store_root
 from mailattic.cli import main
 from mailattic.contact_history import aggregate_contact_history
 from mailattic.ingest import import_pst_sources
 from mailattic.models import ImportSummary, PstSource
 from mailattic.outlook_pst import (
+    PR_ADDRTYPE,
+    PR_ATTACH_DATA_BIN,
+    PR_ATTACH_METHOD,
+    PR_ATTACH_MIME_TAG,
+    PR_EMAIL_ADDRESS,
+    PR_SMTP_ADDRESS,
+    OutlookComReader,
     PstExtractionAccount,
     RawOutlookFailure,
     RawOutlookMessage,
@@ -1047,3 +1057,287 @@ def test_outlook_platform_dependency_and_operator_contract(capsys) -> None:
     assert "Outlook profile" in help_text
     assert "already be mounted" in help_text
     assert "--readpst-path" not in help_text
+
+
+class FakeCollection:
+    def __init__(self, *values: object) -> None:
+        self._values = values
+        self.Count = len(values)
+
+    def Item(self, index: int) -> object:
+        return self._values[index - 1]
+
+
+class FakeAccessor:
+    def __init__(self, values: dict[str, object] | None = None) -> None:
+        self._values = values or {}
+
+    def GetProperty(self, name: str) -> object:
+        if name not in self._values:
+            raise KeyError(name)
+        value = self._values[name]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+class FakeEmbeddedAttachment:
+    def __init__(
+        self,
+        name: str = "forwarded",
+        *,
+        content: bytes = b"fake-embedded-msg-bytes",
+        attachment_type: int = 5,
+        method: int | None = 5,
+        binary_error: Exception | None = None,
+    ) -> None:
+        self.FileName = name
+        self.Type = attachment_type
+        props: dict[str, object] = {
+            PR_ATTACH_DATA_BIN: (
+                binary_error
+                if binary_error is not None
+                else RuntimeError("Attachment binary property is unavailable")
+            )
+        }
+        if method is not None:
+            props[PR_ATTACH_METHOD] = method
+        self.PropertyAccessor = FakeAccessor(props)
+        self._content = content
+        self.saved_paths: list[str] = []
+
+    def SaveAsFile(self, path: str) -> None:
+        self.saved_paths.append(path)
+        Path(path).write_bytes(self._content)
+
+
+class FakeOrdinaryAttachment:
+    def __init__(
+        self,
+        name: str = "document.pdf",
+        *,
+        attachment_type: int = 1,
+        binary_error: Exception | None = None,
+    ) -> None:
+        self.FileName = name
+        self.Type = attachment_type
+        props: dict[str, object] = {
+            PR_ATTACH_DATA_BIN: binary_error or RuntimeError("binary unavailable"),
+            PR_ATTACH_MIME_TAG: "application/pdf",
+        }
+        self.PropertyAccessor = FakeAccessor(props)
+        self.saved_paths: list[str] = []
+
+    def SaveAsFile(self, path: str) -> None:
+        self.saved_paths.append(path)
+        raise RuntimeError("SaveAsFile should not be called on ordinary attachment")
+
+
+def _make_fake_outlook_item(attachments: list[object]) -> SimpleNamespace:
+    return SimpleNamespace(
+        Class=43,
+        EntryID="entry-test-1",
+        Subject="Message with attachment",
+        SenderName="Sender",
+        SenderEmailType="SMTP",
+        SenderEmailAddress="sender@example.com",
+        SentOn=None,
+        ReceivedTime=None,
+        Body="Body content",
+        To="recipient@example.com",
+        CC="",
+        BCC="",
+        Recipients=FakeCollection(
+            SimpleNamespace(
+                Name="Recipient",
+                Type=1,
+                PropertyAccessor=FakeAccessor(
+                    {
+                        PR_SMTP_ADDRESS: "recipient@example.com",
+                        PR_EMAIL_ADDRESS: "recipient@example.com",
+                        PR_ADDRTYPE: "SMTP",
+                    }
+                ),
+            )
+        ),
+        Attachments=FakeCollection(*attachments),
+        PropertyAccessor=FakeAccessor(),
+    )
+
+
+def test_import_stores_embedded_msg_attachment_when_binary_property_unavailable(
+    tmp_path: Path,
+) -> None:
+    pst_path = tmp_path / "archive.pst"
+    source = PstSource(pst_path, "file", pst_path)
+    database_path = initialize_database(tmp_path / "evidence.db")
+    attachment_root = resolve_store_root(database_path)
+
+    fake_att = FakeEmbeddedAttachment(
+        name="Forwarded Email",
+        content=b"sample msg content for embedded item",
+    )
+    fake_item = _make_fake_outlook_item([fake_att])
+
+    reader_com = OutlookComReader(attachment_root=attachment_root)
+    raw_message = reader_com._read_item(fake_item, folder_path="Inbox")
+    assert isinstance(raw_message, RawOutlookMessage)
+
+    summary = import_pst_sources(
+        database_path=database_path,
+        sources=[source],
+        reader=FakeOutlookReader([raw_message]),
+        summary_root=tmp_path / "summary",
+        run_id="run-embedded",
+    )
+
+    connection = sqlite3.connect(database_path)
+    try:
+        attachment_rows = connection.execute(
+            "SELECT attachment_name, content_hash, size_bytes, mime_type, storage_path "
+            "FROM message_attachments"
+        ).fetchall()
+        failures = connection.execute(
+            "SELECT error_stage, error_type FROM ingest_failures"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    expected_hash = hashlib.sha256(b"sample msg content for embedded item").hexdigest()
+    expected_size = len(b"sample msg content for embedded item")
+
+    assert summary.imported_messages == 1
+    assert summary.failure_count == 0
+    assert failures == []
+
+    assert len(attachment_rows) == 1
+    filename, content_hash, size_bytes, mime_type, storage_path = attachment_rows[0]
+    assert filename == "Forwarded Email.msg"
+    assert content_hash == expected_hash
+    assert size_bytes == expected_size
+    assert mime_type == "application/vnd.ms-outlook"
+    assert storage_path is not None
+    assert (
+        attachment_root.parent / storage_path
+    ).read_bytes() == b"sample msg content for embedded item"
+
+
+def test_import_cleans_up_temp_file_after_embedded_item_extraction(
+    tmp_path: Path,
+) -> None:
+    pst_path = tmp_path / "archive.pst"
+    source = PstSource(pst_path, "file", pst_path)
+    database_path = initialize_database(tmp_path / "evidence.db")
+    attachment_root = resolve_store_root(database_path)
+
+    fake_att = FakeEmbeddedAttachment(
+        name="Forwarded.msg",
+        content=b"embedded content to verify temp cleanup",
+    )
+    fake_item = _make_fake_outlook_item([fake_att])
+
+    reader_com = OutlookComReader(attachment_root=attachment_root)
+    raw_message = reader_com._read_item(fake_item, folder_path="Inbox")
+    assert isinstance(raw_message, RawOutlookMessage)
+
+    import_pst_sources(
+        database_path=database_path,
+        sources=[source],
+        reader=FakeOutlookReader([raw_message]),
+        summary_root=tmp_path / "summary",
+    )
+
+    assert len(fake_att.saved_paths) == 1
+    saved_path = Path(fake_att.saved_paths[0])
+    assert not saved_path.exists()
+    assert not saved_path.parent.exists()
+
+
+def test_import_records_decode_error_for_ordinary_attachment_missing_binary(
+    tmp_path: Path,
+) -> None:
+    pst_path = tmp_path / "archive.pst"
+    source = PstSource(pst_path, "file", pst_path)
+    database_path = initialize_database(tmp_path / "evidence.db")
+    attachment_root = resolve_store_root(database_path)
+
+    fake_att = FakeOrdinaryAttachment(name="report.pdf")
+    fake_item = _make_fake_outlook_item([fake_att])
+
+    reader_com = OutlookComReader(attachment_root=attachment_root)
+    raw_message = reader_com._read_item(fake_item, folder_path="Inbox")
+    assert isinstance(raw_message, RawOutlookMessage)
+
+    summary = import_pst_sources(
+        database_path=database_path,
+        sources=[source],
+        reader=FakeOutlookReader([raw_message]),
+        summary_root=tmp_path / "summary",
+        run_id="run-ordinary",
+    )
+
+    connection = sqlite3.connect(database_path)
+    try:
+        attachment_rows = connection.execute(
+            "SELECT attachment_name, content_hash, size_bytes, storage_path "
+            "FROM message_attachments"
+        ).fetchall()
+        failures = connection.execute(
+            "SELECT error_stage, error_type, attachment_name FROM ingest_failures"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert summary.imported_messages == 1
+    assert summary.failure_count == 1
+    assert failures == [("attachment-decode", "AttachmentError", "report.pdf")]
+    assert attachment_rows == [("report.pdf", None, None, None)]
+    assert len(fake_att.saved_paths) == 0
+
+
+@pytest.mark.parametrize(
+    ("original_name", "expected_name"),
+    [
+        ("FWD: Pricing", "FWD: Pricing.msg"),
+        ("FWD: Pricing.msg", "FWD: Pricing.msg"),
+        ("FWD: Pricing.MSG", "FWD: Pricing.MSG"),
+        ("", "unnamed-attachment-1.msg"),
+    ],
+)
+def test_import_embedded_msg_attachment_naming(
+    tmp_path: Path, original_name: str, expected_name: str
+) -> None:
+    pst_path = tmp_path / "archive.pst"
+    source = PstSource(pst_path, "file", pst_path)
+    database_path = initialize_database(
+        tmp_path / f"evidence_{original_name or 'empty'}.db"
+    )
+    attachment_root = resolve_store_root(database_path)
+
+    fake_att = FakeEmbeddedAttachment(
+        name=original_name,
+        content=b"test name bytes",
+    )
+    fake_item = _make_fake_outlook_item([fake_att])
+
+    reader_com = OutlookComReader(attachment_root=attachment_root)
+    raw_message = reader_com._read_item(fake_item, folder_path="Inbox")
+    assert isinstance(raw_message, RawOutlookMessage)
+
+    import_pst_sources(
+        database_path=database_path,
+        sources=[source],
+        reader=FakeOutlookReader([raw_message]),
+        summary_root=tmp_path / "summary",
+    )
+
+    connection = sqlite3.connect(database_path)
+    try:
+        attachment_rows = connection.execute(
+            "SELECT attachment_name, mime_type FROM message_attachments"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert len(attachment_rows) == 1
+    assert attachment_rows[0] == (expected_name, "application/vnd.ms-outlook")
