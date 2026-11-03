@@ -533,6 +533,11 @@ def _format_recipient_header(entries_raw: object) -> str:
     )
 
 
+def _esc(s: str) -> str:
+    """Escape plain text for an HTML body, keeping line breaks as <br>."""
+    return html.escape(s).replace("\n", "<br>")
+
+
 def build_quoted_reply_bodies(
     original: dict[str, object],
     reply_text: str,
@@ -598,9 +603,6 @@ def build_quoted_reply_bodies(
     )
 
     # HTML body: escaped reply + quoted block div with <hr> separator and <b> labels
-    def _esc(s: str) -> str:
-        return html.escape(s).replace("\n", "<br>")
-
     cc_row = f"<b>Cc:</b> {_esc(cc_val)}<br>\n" if cc_val else ""
     html_body = (
         _esc(reply_text)
@@ -929,13 +931,15 @@ def _validate_custom_subject(subject: str) -> None:
         raise DraftReplyError(
             '--subject must not be empty. Omit it to reply as "Re: <original subject>".'
         )
+    _reject_multiline_subject(subject, DraftReplyError)
+
+
+def _reject_multiline_subject(subject: str, error_cls: type[DraftError]) -> None:
     # Line breaks (including U+2028/U+2029, which the email package also
     # refuses) cannot go into a header value, and the draft summary the user
     # reviews must not carry terminal control sequences.
     if any(unicodedata.category(char) in {"Cc", "Zl", "Zp"} for char in subject):
-        raise DraftReplyError(
-            "--subject must be a single line without control characters."
-        )
+        raise error_cls("--subject must be a single line without control characters.")
 
 
 def _attach_files(
@@ -1200,12 +1204,9 @@ def assemble_draft_new(
     ``font_style`` styles the HTML body.
     Expected refusals raise ``DraftNewError`` or ``ValueError``.
     """
-    if subject is None or not subject.strip():
+    if not subject.strip():
         raise DraftNewError("--subject must not be empty or whitespace-only.")
-    if any(unicodedata.category(char) in {"Cc", "Zl", "Zp"} for char in subject):
-        raise DraftNewError(
-            "--subject must be a single line without control characters."
-        )
+    _reject_multiline_subject(subject, DraftNewError)
 
     if body_text is None:
         if body_from is None:
@@ -1239,9 +1240,6 @@ def assemble_draft_new(
         for recipient in parsed:
             add(bucket, recipient)
 
-    if not result_recipients["to"]:
-        raise DraftNewError("draft-new: at least one To recipient is required")
-
     # Automatic BCC-self
     _append_bcc_self_and_explicit(
         result_recipients["bcc"],
@@ -1264,10 +1262,6 @@ def assemble_draft_new(
     msg["Date"] = formatdate(localtime=True)
 
     plain_body = body_text
-
-    def _esc(s: str) -> str:
-        return html.escape(s).replace("\n", "<br>")
-
     html_body = _esc(plain_body)
     if font_style:
         html_body = f'<div style="{font_style}">\n{html_body}\n</div>'

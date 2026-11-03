@@ -2217,9 +2217,7 @@ def check_recipient_familiarity(
 
         seen_domains: dict[str, bool] = {}
         for domain in domains_to_check:
-            escaped = (
-                domain.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            )
+            escaped = _escape_like(domain)
             cur = connection.execute(
                 """
                 SELECT 1 FROM messages WHERE sender_email LIKE '%@' || ? ESCAPE '\\'

@@ -20,22 +20,10 @@ from mailattic.storage import (
     initialize_database,
     persist_message,
 )
+from tests.test_outbound_draft import _placeholder_env_file
 
 SMTP_USER = "sean3808@mailattic.test"
 GMAIL = "g" + "mail.com"  # split: see PUBLIC_WEBMAIL_DOMAINS in query.py
-PLACEHOLDER_SMTP_SETTINGS = (
-    "SMTP_HOST=smtp.example.com\n"
-    "SMTP_PORT=465\n"
-    f"SMTP_USER={SMTP_USER}\n"
-    "SMTP_PASSWORD=placeholder\n"
-)
-
-
-def _placeholder_env_file(tmp_path: Path) -> Path:
-    env_file = tmp_path / "placeholder.env"
-    if not env_file.exists():
-        env_file.write_text(PLACEHOLDER_SMTP_SETTINGS, encoding="utf-8")
-    return env_file
 
 
 def _seed_custom_message(

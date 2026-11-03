@@ -294,12 +294,12 @@ def _print_draft_summary(result: DraftReplyResult | DraftNewResult) -> int:
     return 0
 
 
-def _handle_draft_reply(args: argparse.Namespace) -> int:
+def _load_draft_sender(args: argparse.Namespace) -> tuple[str, dict[str, str]] | int:
+    """Return (own_address, env) for a new draft, or an exit code on refusal."""
     resolved_env_file = resolve_smtp_env_file(args.env_file)
-    env: dict[str, str] = {}
     try:
         env = load_env_file(resolved_env_file)
-        own_address = load_smtp_config(env).user
+        return load_smtp_config(env).user, env
     except FileNotFoundError:
         # #199: a missing file must not fall back to a sender the user never chose.
         print(_missing_smtp_env_file_error(resolved_env_file), file=sys.stderr)
@@ -308,12 +308,18 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
         # Unreadable or incomplete settings; anything else is a bug and
         # must not be relabelled as "set SMTP_USER". Fonts, like the MCP
         # path, apply only from settings that load (#13).
-        env = {}
         try:
-            own_address = own_address_without_smtp_settings(args.database)
+            return own_address_without_smtp_settings(args.database), {}
         except DraftReplyError as refusal:
             print(refusal, file=sys.stderr)
             return 2
+
+
+def _handle_draft_reply(args: argparse.Namespace) -> int:
+    sender = _load_draft_sender(args)
+    if isinstance(sender, int):
+        return sender
+    own_address, env = sender
 
     def warn_archive_anchor() -> None:
         print(
@@ -348,21 +354,10 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
 
 
 def _handle_draft_new(args: argparse.Namespace) -> int:
-    resolved_env_file = resolve_smtp_env_file(args.env_file)
-    env: dict[str, str] = {}
-    try:
-        env = load_env_file(resolved_env_file)
-        own_address = load_smtp_config(env).user
-    except FileNotFoundError:
-        print(_missing_smtp_env_file_error(resolved_env_file), file=sys.stderr)
-        return 2
-    except (OSError, ValueError):
-        env = {}
-        try:
-            own_address = own_address_without_smtp_settings(args.database)
-        except DraftReplyError as refusal:
-            print(refusal, file=sys.stderr)
-            return 2
+    sender = _load_draft_sender(args)
+    if isinstance(sender, int):
+        return sender
+    own_address, env = sender
 
     try:
         result = assemble_draft_new(
