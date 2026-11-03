@@ -930,6 +930,127 @@ def test_import_reconciles_when_recipient_has_unknown_role(tmp_path: Path) -> No
     assert payload["sources"][0]["recipient_reconciliation_difference"] == 0
 
 
+def test_import_reconciles_when_recipient_is_empty_group(tmp_path: Path) -> None:
+    """Each empty-group spelling is skipped, the message's other recipients are stored,
+    and unresolved_by_reason['empty_group'] reconciles the extraction ledger to 0."""
+    pst_path = tmp_path / "archive.pst"
+    source = PstSource(pst_path, "file", pst_path)
+    database_path = initialize_database(tmp_path / "evidence.db")
+    spellings = [
+        "undisclosed-recipients:",
+        '"Undisclosed-Recipient:;"',
+        "Undisclosed recipients:",
+    ]
+    messages = [
+        RawOutlookMessage(
+            raw_message={"subject": f"Empty group {idx}"},
+            folder_path="Inbox",
+            logical_locator=f"entry-empty-group-{idx}",
+            display_recipients={"to": f"user{idx}@example.test", "cc": "", "bcc": ""},
+            recipients=(
+                RawOutlookRecipient(
+                    display_name=None,
+                    smtp_address=spelling,
+                    email_address=None,
+                    addrtype="SMTP",
+                    recipient_type=1,
+                ),
+                RawOutlookRecipient(
+                    display_name=f"User {idx}",
+                    smtp_address=f"user{idx}@example.test",
+                    email_address=None,
+                    addrtype="SMTP",
+                    recipient_type=1,
+                ),
+            ),
+        )
+        for idx, spelling in enumerate(spellings, start=1)
+    ]
+    reader = FakeOutlookReader(messages)
+
+    summary = import_pst_sources(
+        database_path=database_path,
+        sources=[source],
+        reader=reader,
+        summary_root=tmp_path / "runtime",
+        run_id="empty-group",
+    )
+
+    payload = json.loads(
+        Path(summary.recipient_extraction_summary_path or "").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary.recipient_extraction_complete is True
+    assert summary.imported_messages == 3
+    assert summary.failure_count == 0
+    assert payload["complete"] is True
+    assert payload["sources"][0]["unresolved_by_reason"]["empty_group"] == 3
+    assert payload["sources"][0]["recipients_seen"] == 6
+    assert payload["sources"][0]["recipients_emitted"] == 3
+    assert payload["sources"][0]["recipient_reconciliation_difference"] == 0
+
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            "SELECT recipient_type, display_name, email "
+            "FROM message_recipients ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [
+        ("to", "User 1", "user1@example.test"),
+        ("to", "User 2", "user2@example.test"),
+        ("to", "User 3", "user3@example.test"),
+    ]
+
+
+def test_import_malformed_address_records_normalize_recipients_failure(
+    tmp_path: Path,
+) -> None:
+    pst_path = tmp_path / "archive.pst"
+    source = PstSource(pst_path, "file", pst_path)
+    database_path = initialize_database(tmp_path / "evidence.db")
+    reader = FakeOutlookReader(
+        [
+            RawOutlookMessage(
+                raw_message={"subject": "Trailing dot"},
+                folder_path="Inbox",
+                logical_locator="entry-trailing-dot",
+                display_recipients={"to": "", "cc": "", "bcc": ""},
+                recipients=(
+                    RawOutlookRecipient(
+                        display_name=None,
+                        smtp_address="user@example.test.",
+                        email_address=None,
+                        addrtype="SMTP",
+                        recipient_type=1,
+                    ),
+                ),
+            )
+        ]
+    )
+
+    summary = import_pst_sources(
+        database_path=database_path,
+        sources=[source],
+        reader=reader,
+        summary_root=tmp_path / "runtime",
+        run_id="malformed-address",
+    )
+
+    assert summary.failure_count == 1
+    connection = sqlite3.connect(database_path)
+    failures = connection.execute(
+        "SELECT error_stage, error_type, error_message FROM ingest_failures"
+    ).fetchall()
+    connection.close()
+    assert len(failures) == 1
+    assert failures[0][0] == "normalize-recipients"
+    assert failures[0][1] == "ValueError"
+    assert "not atomic" in failures[0][2]
+
+
 def test_packed_address_failure_is_named_and_next_message_is_imported(
     tmp_path: Path,
 ) -> None:

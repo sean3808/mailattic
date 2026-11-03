@@ -88,6 +88,7 @@ def test_normalize_rejects_packed_smtp_but_accepts_quoted_local_part() -> None:
     )
     assert result.recipients[0]["email"] == ('"owner.legacy@export-hub"@mailattic.test')
     assert result.unresolved_by_reason == {
+        "empty_group": 0,
         "missing_address": 0,
         "missing_addrtype": 0,
         "non_smtp_addrtype": 0,
@@ -154,6 +155,66 @@ def test_duplicate_and_quoted_local_part_addresses_remain_atomic_rows() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "undisclosed-recipients:",
+        '"Undisclosed-Recipient:;"',
+        "Undisclosed recipients:",
+    ],
+)
+def test_empty_group_spellings_skipped_and_unresolved_counted(spelling: str) -> None:
+    result = normalize_outlook_recipients(
+        [
+            RawOutlookRecipient(
+                display_name=None,
+                smtp_address=spelling,
+                email_address=None,
+                addrtype="SMTP",
+                recipient_type=1,
+            ),
+            RawOutlookRecipient(
+                display_name="Valid User",
+                smtp_address="user@example.test",
+                email_address=None,
+                addrtype="SMTP",
+                recipient_type=1,
+            ),
+        ]
+    )
+
+    assert result.recipients == (
+        {
+            "name": "Valid User",
+            "email": "user@example.test",
+            "recipient_type": "to",
+        },
+    )
+    assert result.unresolved_by_reason == {
+        "empty_group": 1,
+        "missing_address": 0,
+        "missing_addrtype": 0,
+        "non_smtp_addrtype": 0,
+        "unknown_recipient_type": 0,
+    }
+    assert result.empty_group == 1
+
+
+def test_malformed_address_with_trailing_dot_still_raises_valueerror() -> None:
+    with pytest.raises(ValueError, match="not atomic"):
+        normalize_outlook_recipients(
+            [
+                RawOutlookRecipient(
+                    display_name=None,
+                    smtp_address="user@example.test.",
+                    email_address=None,
+                    addrtype="SMTP",
+                    recipient_type=1,
+                )
+            ]
+        )
+
+
 def test_each_unresolved_recipient_has_one_explicit_reason() -> None:
     result = normalize_outlook_recipients(
         [
@@ -166,6 +227,7 @@ def test_each_unresolved_recipient_has_one_explicit_reason() -> None:
 
     assert result.recipients == ()
     assert result.unresolved_by_reason == {
+        "empty_group": 0,
         "missing_address": 1,
         "missing_addrtype": 1,
         "non_smtp_addrtype": 1,
@@ -284,6 +346,7 @@ def test_balanced_source_account_contains_every_required_counter() -> None:
         recipients_seen=5,
         recipients_emitted=3,
         unresolved_by_reason={
+            "empty_group": 0,
             "missing_address": 1,
             "missing_addrtype": 0,
             "non_smtp_addrtype": 1,
@@ -327,6 +390,7 @@ def test_source_account_rejects_unknown_or_missing_unresolved_categories() -> No
     unknown = PstExtractionAccount(
         source_path="archive.pst",
         unresolved_by_reason={
+            "empty_group": 0,
             "missing_address": 0,
             "missing_addrtype": 0,
             "non_smtp_addrtype": 0,
@@ -338,6 +402,7 @@ def test_source_account_rejects_unknown_or_missing_unresolved_categories() -> No
     missing = PstExtractionAccount(
         source_path="archive.pst",
         unresolved_by_reason={
+            "empty_group": 0,
             "missing_address": 0,
             "missing_addrtype": 0,
             "non_smtp_addrtype": 0,

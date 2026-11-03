@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unicodedata
 from collections.abc import Iterable, Mapping
@@ -65,6 +66,7 @@ def resolve_extraction_summary_root(database_path: str | Path) -> Path:
 RecipientRole = Literal["to", "cc", "bcc"]
 _RECIPIENT_ROLE_BY_TYPE: dict[int, RecipientRole] = {1: "to", 2: "cc", 3: "bcc"}
 _UNRESOLVED_REASON_KEYS = (
+    "empty_group",
     "missing_address",
     "missing_addrtype",
     "non_smtp_addrtype",
@@ -518,6 +520,7 @@ class OutlookComReader:
 @dataclass(frozen=True, slots=True)
 class RecipientNormalization:
     recipients: tuple[NormalizedRecipient, ...]
+    empty_group: int = 0
     missing_address: int = 0
     missing_addrtype: int = 0
     non_smtp_addrtype: int = 0
@@ -526,6 +529,29 @@ class RecipientNormalization:
     @property
     def unresolved_by_reason(self) -> dict[str, int]:
         return {key: getattr(self, key) for key in _UNRESOLVED_REASON_KEYS}
+
+
+_EMPTY_GROUP_RE = re.compile(
+    r"""
+    ^\s*
+    ["']?\s*
+    ([^"'@:;]+?)
+    \s*["']?\s*
+    :\s*;?
+    \s*["']?\s*$
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+
+def _is_empty_group(address: str) -> bool:
+    """Return True if the address value matches an RFC 5322 empty group.
+
+    An empty group consists of a display-name, a colon, and an optional
+    semicolon, with no recipient address (e.g. 'undisclosed-recipients:',
+    '"Undisclosed-Recipient:;"', 'Undisclosed recipients:').
+    """
+    return bool(_EMPTY_GROUP_RE.match(address))
 
 
 def normalize_outlook_recipients(
@@ -555,6 +581,10 @@ def normalize_outlook_recipients(
         address = _first_nonblank(raw.smtp_address, raw.email_address)
         if not address:
             record_unresolved("missing_address")
+            continue
+
+        if _is_empty_group(address):
+            record_unresolved("empty_group")
             continue
 
         try:
