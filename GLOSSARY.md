@@ -38,6 +38,12 @@
 - **Avoid**: 亂碼, 資料損毀 (overstates it: one byte per affected line, recoverable by eye), double dot bug (implies a mailattic bug), unstuffing (names a fix the platform deliberately does not apply)
 - **Why**: Two decisions hang on the term. Stored bodies are not rewritten, because they are evidence of the server fault and mail that reached the store without passing SMTP was never stuffed, so a blanket removal would corrupt it. Search needs no compensation, because keyword search splits on `.` and `example.com` already finds `example..com` (2026-10-29 production read-only probe: 312 of 312). What remains is a reading duty: a value copied out of a body may carry the residue. Owner: Sean (2026-10-29, `#10`); SoT: the copy-out caution in `skills/mailattic/references/capability-b-find.md`; source: [#10](https://github.com/sean3808/mailattic/issues/10).
 
+### Inline image (內嵌圖片)
+
+- **Definition**: An image attachment that the body references at a specific place (an HTML `cid:` reference), so it displays inside the text rather than in the attachment list. Its meaning comes from its position: the sentence beside it says what it shows. A reply carries the inline images of the quoted history too, so one message can hold the images of several earlier messages next to the one it added.
+- **Avoid**: 附件 (when it means an inline image; ordinary attachments carry no position), 最大的圖, embedded image
+- **Why**: Ordinary attachments and inline images sit in the same attachment list, but only inline images are read by position. Picking an image by size returned the right answer once by luck (the target happened to be the largest); the reliable anchor is the body's `[cid:...]` marker. Matching a marker to an attachment goes by file name, which Outlook makes equal to the marker's name part; the platform does not store the Content-ID itself. Owner: Sean (2026-11-03 grilling); SoT: the "Inline images" steps in `skills/mailattic/references/capability-b-find.md`.
+
 ---
 
 ## Mechanisms this platform invented (scope: mechanism)

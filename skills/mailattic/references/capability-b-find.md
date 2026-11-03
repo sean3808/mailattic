@@ -319,6 +319,17 @@ Known limits:
 - The `--copy-to` fallback output file name likewise looks only at `attachment_name` / `mime_type`; when neither yields an extension it uses `.bin`, and never guesses from the CAS path.
 - A mail forwarded as an attachment (`.eml`, `message/rfc822`) is **one attachment row**, and the whole archived mail is exportable (named with the attached mail's subject plus `.eml` when there is no file name). Its body does not count as the outer mail's body (`bes search --keyword` does not hit the outer mail through words inside the attached mail), and the attachments it carries are not listed separately. To see the content, export with `--copy-to` and read the `.eml`. For a bounce notice (`multipart/report`), the original mail it carries stays merged into the outer body and search and is not made a separate attachment; this is deliberate so a bounce can be searched by the original mail's content.
 
+### Inline images: read them by position
+
+An inline image means what the text beside it says, so locate it by its **position** in the body. Size says nothing: signature logos and images carried in from quoted history sit in the same attachment list. When the user asks about "the image in that mail":
+
+1. Run `bes show <db_id> --format text --new-only`. Every inline image appears in the body as a marker `[cid:<name>@<suffix>]` at the place the sender put it; a marker in the new content is an image this mail added.
+2. Match `<name>` (e.g. `image012.png`) against `attachment_name` in the mail's attachment list (`bes search --json` hit or `bes show <db_id> --format json`).
+3. Export it with `bes attachments --name-contains <name>` narrowed by the same sender domain and the same day, run once with `--json` first: keep only the row whose `message_db_id` equals this mail's db_id. Outlook numbers inline images from `image001` in every mail, so several mails from one sender on one day carry the same name. Then add `--copy-to <scratch dir>`.
+4. View the exported file (the Read tool shows images).
+
+A marker whose `<name>` matches no attachment name: report the marker and the attachment list to the user and let them pick.
+
 **For long threads, extract only new content**: add `--new-only` to `bes show/thread --format text` to keep only each mail's new content (quoted history removed; supports top-posted replies, bottom-posted replies, and replies interleaved between quotes; boundaries detected: `>` quoting, Outlook header blocks including the self-built CJK `寄件者:`/`收件者:`/`主旨:` labels, `-----Original Message-----`, external-mail banners, etc.). When a long thread quotes layer upon layer, size can shrink by an order of magnitude. **Conservative fallback**: when no boundary can be identified it returns the full text without truncating (better to cut too little than to cut real new content). Valid only with `--format text`; combined with `raw`/`json` it exits non-zero.
 
 **Batch retrieval (ingestion-grade, removes the N+1 `bes show`)**:
