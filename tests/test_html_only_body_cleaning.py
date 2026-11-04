@@ -84,8 +84,8 @@ def test_html_only_import_drops_style_script_title_and_keeps_breaks(
     assert body.splitlines() == [
         "Dear Owner,",
         "The paper ships on Monday.",
-        "Item Qty",
-        "Notebook 10",
+        "Item | Qty",
+        "Notebook | 10",
         "Best regards,",
         "Ana",
     ]

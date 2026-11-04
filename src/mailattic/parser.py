@@ -18,7 +18,7 @@ from email.utils import getaddresses, parsedate_to_datetime
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import charset_normalizer
 
@@ -1202,37 +1202,162 @@ _HTML_BLOCK_TAGS = frozenset(
 )  # fmt: skip
 
 
+_HTML_CELL_TAGS = frozenset({"td", "th"})
+_HTML_CELL_SEPARATOR = " | "
+
+
+class _LineBreak:
+    """Marks, inside a buffered table row, where a block tag ended a line."""
+
+
+_LINE_BREAK = _LineBreak()
+
+
+class _TableRow:
+    """One ``<tr>`` being read: where its words start and its cells so far.
+
+    While the row is open, block tags inside it record ``_LINE_BREAK`` instead
+    of ending the line, so the row can still be laid out as columns when it
+    closes; ``_HTMLTextExtractor._replay`` turns it back into the plain output
+    otherwise.
+    """
+
+    def __init__(self, word_mark: int) -> None:
+        self.word_mark = word_mark  # len(_words) when the row opened
+        self.cells: list[list[str | _LineBreak]] = []
+        self.cell_start: int | None = None  # index into _words of the open cell
+        self.stray_text = False  # text seen outside any cell
+
+
+def _cell_text(cell: list[str | _LineBreak]) -> str | None:
+    """The cell as one line, or None when it holds more than one line."""
+    start, end = 0, len(cell)
+    while start < end and cell[start] is _LINE_BREAK:
+        start += 1
+    while end > start and cell[end - 1] is _LINE_BREAK:
+        end -= 1
+    words = cell[start:end]
+    if any(word is _LINE_BREAK for word in words):
+        return None
+    return " ".join(" ".join(str(word) for word in words).split())
+
+
 class _HTMLTextExtractor(HTMLParser):
     """Text nodes joined by spaces within a line; block tags start a new line.
 
     ``style`` / ``script`` / ``title`` content is dropped (#294). One pass over
     the parser's events, no regex.
+
+    Table rows with two or more filled cells become one line with
+    ``_HTML_CELL_SEPARATOR`` between cells, an empty cell keeping its slot, so
+    values do not shift columns (#14). A row the converter cannot map to
+    columns (more than one line inside a cell, a nested table, text outside any
+    cell, a single filled cell) keeps the plain space-joined output.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._lines: list[str] = []
-        self._words: list[str] = []
+        # Holds _LINE_BREAK only while a row is buffering; plain str otherwise.
+        self._words: list[str | _LineBreak] = []
         self._skipped: list[str] = []
         self._skip_depth = 0
+        # One entry per open <table>: its buffering row, or None between rows
+        # and once a row has been given up as columns.
+        self._tables: list[_TableRow | None] = []
+
+    def _open_row(self) -> _TableRow | None:
+        return self._tables[-1] if self._tables else None
 
     def _end_line(self) -> None:
+        if self._open_row() is not None:
+            if self._words and self._words[-1] is not _LINE_BREAK:
+                self._words.append(_LINE_BREAK)
+            return
         if self._words:
-            self._lines.append(" ".join(self._words))
+            self._lines.append(" ".join(cast("list[str]", self._words)))
             self._words = []
+
+    def _replay(self, row: _TableRow) -> None:
+        """Give ``row`` up as columns and emit its words as plain output.
+
+        The caller has already cleared the row's slot in ``_tables``.
+        """
+        buffered = self._words[row.word_mark :]
+        del self._words[row.word_mark :]
+        for word in buffered:
+            if word is _LINE_BREAK:
+                self._end_line()
+            else:
+                self._words.append(word)
+
+    def _close_cell(self, row: _TableRow) -> None:
+        if row.cell_start is not None:
+            row.cells.append(self._words[row.cell_start :])
+            row.cell_start = None
+
+    def _close_row(self) -> None:
+        row = self._open_row()
+        if row is None:
+            return
+        self._tables[-1] = None
+        self._close_cell(row)
+        cell_texts = [_cell_text(cell) for cell in row.cells]
+        if (
+            not row.stray_text
+            and None not in cell_texts
+            and sum(1 for text in cell_texts if text) >= 2
+        ):
+            del self._words[row.word_mark :]
+            self._words.append(
+                _HTML_CELL_SEPARATOR.join(str(text) for text in cell_texts)
+            )
+        else:
+            self._replay(row)
+        self._end_line()
+
+    def _close_table(self) -> None:
+        self._close_row()
+        self._tables.pop()
 
     def handle_starttag(self, tag: str, attrs: Any) -> None:
         if tag in _HTML_SKIPPED_TAGS:
             self._skip_depth += 1
-        elif tag in _HTML_BLOCK_TAGS:
+            return
+        if tag == "table":
+            outer = self._open_row()
+            if outer is not None:  # a nested table: the outer row is not columns
+                self._tables[-1] = None
+                self._replay(outer)
+        elif tag == "tr":
+            self._close_row()
+        if tag in _HTML_BLOCK_TAGS:
             self._end_line()
+        if tag == "table":
+            self._tables.append(None)
+        elif tag == "tr" and self._tables:
+            self._tables[-1] = _TableRow(len(self._words))
+        elif tag in _HTML_CELL_TAGS:
+            row = self._open_row()
+            if row is not None:
+                self._close_cell(row)
+                row.cell_start = len(self._words)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in _HTML_SKIPPED_TAGS:
             self._skip_depth = max(0, self._skip_depth - 1)
             if not self._skip_depth:
                 self._skipped = []
-        elif tag in _HTML_BLOCK_TAGS:
+            return
+        if tag in _HTML_CELL_TAGS:
+            row = self._open_row()
+            if row is not None:
+                self._close_cell(row)
+        elif tag == "tr":
+            self._close_row()
+        elif tag == "table" and self._tables:
+            self._close_table()
+        if tag in _HTML_BLOCK_TAGS:
             self._end_line()
 
     def handle_data(self, data: str) -> None:
@@ -1240,10 +1365,15 @@ class _HTMLTextExtractor(HTMLParser):
             return
         if self._skip_depth:
             self._skipped.append(data.strip())
-        else:
-            self._words.append(data.strip())
+            return
+        row = self._open_row()
+        if row is not None and row.cell_start is None:
+            row.stray_text = True
+        self._words.append(data.strip())
 
     def get_text(self) -> str:
+        while self._tables:  # tables left open by malformed HTML
+            self._close_table()
         if self._skip_depth:
             # The skipped element never closed (malformed HTML), so "skipped"
             # swallowed the rest of the mail. Keep that text rather than store
