@@ -476,6 +476,270 @@ def test_locator_not_found_and_pst_filter(tmp_path, stub_readpst):
 
 
 # ---------------------------------------------------------------------------
+# Message-ID fallback (rows whose locator pairing failed because the PST
+# changed after import).
+# ---------------------------------------------------------------------------
+
+M1 = "<m1@example.test>"
+M2 = "<m2@example.test>"
+
+
+def test_shifted_locator_in_same_pst_is_staged_via_message_id_fallback(
+    tmp_path, stub_readpst
+):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [
+        _plain_message("<other@example.test>"),  # now occupies #1
+        _table_message(M1),  # shifted to #2
+        _table_message(M2),  # at #3; the row still says #9
+    ]
+    db, (mid1, mid2) = _canonical(
+        tmp_path,
+        [
+            _row(pst=pst, index=1, message_id=M1, body=PLAIN_FLAT),
+            _row(pst=pst, index=9, message_id=M2, body=PLAIN_FLAT),
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    staged = _staged(stage)
+    assert set(staged) == {mid1, mid2}
+    assert staged[mid1]["new_body_text"] == TABLE_BODY
+    assert staged[mid1]["expected_message_id"] == "m1@example.test"
+    assert (
+        staged[mid1]["pre_image_sha256"]
+        == hashlib.sha256(PLAIN_FLAT.encode("utf-8")).hexdigest()
+    )
+    counts = _report(stage)["counts"]
+    assert counts["rewrite"] == 2
+    assert counts["paired_by_message_id"] == 2
+    assert counts["message_id_mismatch"] == 0
+    assert counts["locator_not_found"] == 0
+
+
+def test_row_of_pst_a_found_only_in_pst_b_is_staged_and_attributed_to_a(
+    tmp_path, stub_readpst
+):
+    readpst, mboxes = stub_readpst
+    a = _make_pst(tmp_path, "a.pst")
+    b = _make_pst(tmp_path, "b.pst")
+    mboxes["a.pst"] = [_plain_message("<other@example.test>")]
+    mboxes["b.pst"] = [_plain_message("<b1@example.test>"), _table_message(M1)]
+    db, (mid_a, _mid_b) = _canonical(
+        tmp_path,
+        [
+            _row(pst=a, index=1, message_id=M1, body=PLAIN_FLAT),
+            _row(pst=b, index=1, message_id="<b1@example.test>", body="Hello there"),
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    assert set(_staged(stage)) == {mid_a}
+    report = _report(stage)
+    by_pst = {Path(p["pst_source"]).name: p["counts"] for p in report["per_pst"]}
+    assert by_pst["a.pst"]["rewrite"] == 1
+    assert by_pst["a.pst"]["paired_by_message_id"] == 1
+    assert by_pst["b.pst"]["rewrite"] == 0
+    assert by_pst["b.pst"]["unchanged"] == 1
+    assert by_pst["b.pst"]["paired_by_message_id"] == 0
+    assert report["counts"]["rewrite"] == 1
+
+
+def test_same_message_id_twice_with_identical_bodies_is_staged_once(
+    tmp_path, stub_readpst
+):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [
+        _plain_message("<other@example.test>"),
+        _table_message(M1),
+        _table_message(M1),
+    ]
+    db, (mid,) = _canonical(
+        tmp_path, [_row(pst=pst, index=9, message_id=M1, body=PLAIN_FLAT)]
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    assert set(_staged(stage)) == {mid}
+    counts = _report(stage)["counts"]
+    assert counts["rewrite"] == 1
+    assert counts["message_id_ambiguous"] == 0
+
+
+def test_same_message_id_with_different_bodies_is_ambiguous_and_not_staged(
+    tmp_path, stub_readpst
+):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [
+        _plain_message("<other@example.test>"),
+        _table_message(M1),
+        _plain_message(M1, "A different body entirely"),
+    ]
+    db, _ = _canonical(
+        tmp_path, [_row(pst=pst, index=9, message_id=M1, body=PLAIN_FLAT)]
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    assert _staged(stage) == {}
+    counts = _report(stage)["counts"]
+    assert counts["message_id_ambiguous"] == 1
+    assert counts["locator_not_found"] == 0
+    assert counts["rewrite"] == 0
+    assert counts["unchanged"] == 0
+
+
+def test_message_id_absent_everywhere_keeps_the_original_locator_reason(
+    tmp_path, stub_readpst
+):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [_plain_message("<other@example.test>")]
+    db, _ = _canonical(
+        tmp_path,
+        [
+            _row(pst=pst, index=1, message_id=M1, body=PLAIN_FLAT),  # mismatch
+            _row(pst=pst, index=9, message_id=M2, body=PLAIN_FLAT),  # not found
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    assert _staged(stage) == {}
+    counts = _report(stage)["counts"]
+    assert counts["message_id_mismatch"] == 1
+    assert counts["locator_not_found"] == 1
+    assert counts["message_id_ambiguous"] == 0
+    assert counts["paired_by_message_id"] == 0
+
+
+def test_rows_without_message_id_never_use_the_fallback(tmp_path, stub_readpst):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    # An id-less extracted message exists, but the id-less row's locator (#9)
+    # finds nothing: it must stay locator_not_found, never be paired to it.
+    mboxes["a.pst"] = [_table_message(None)]
+    db, _ = _canonical(
+        tmp_path, [_row(pst=pst, index=9, message_id=None, body=PLAIN_FLAT)]
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    assert _staged(stage) == {}
+    counts = _report(stage)["counts"]
+    assert counts["locator_not_found"] == 1
+    assert counts["rewrite"] == 0
+    assert counts["paired_by_message_id"] == 0
+
+
+def test_locator_paired_row_is_not_repaired_by_the_fallback(tmp_path, stub_readpst):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    # The row pairs at #1; an identical copy of the same message sits at #2.
+    mboxes["a.pst"] = [_table_message(M1), _table_message(M1)]
+    db, (mid,) = _canonical(
+        tmp_path, [_row(pst=pst, index=1, message_id=M1, body=PLAIN_FLAT)]
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    assert set(_staged(stage)) == {mid}
+    counts = _report(stage)["counts"]
+    assert counts["rewrite"] == 1
+    assert counts["paired_by_message_id"] == 0
+
+
+def test_fallback_database_is_removed_after_a_run(tmp_path, stub_readpst):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [_table_message(M1)]
+    db, _ = _canonical(
+        tmp_path, [_row(pst=pst, index=5, message_id=M1, body=PLAIN_FLAT)]
+    )
+    stage = tmp_path / "out" / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    assert not (tmp_path / "out" / "stage-work").exists()
+
+
+class _Boom(Exception):
+    pass
+
+
+def test_fallback_database_is_removed_when_the_run_raises(
+    tmp_path, stub_readpst, monkeypatch
+):
+    readpst, mboxes = stub_readpst
+    first = _make_pst(tmp_path, "a.pst")
+    second = _make_pst(tmp_path, "b.pst")
+    mboxes["a.pst"] = [_table_message(M1)]
+    db, _ = _canonical(
+        tmp_path,
+        [
+            _row(pst=first, index=5, message_id=M1, body=PLAIN_FLAT),
+            _row(pst=second, index=1, message_id=M2, body="x"),
+        ],
+    )
+    stage = tmp_path / "out" / "stage.db"
+    work = tmp_path / "out" / "stage-work"
+    stubbed = ReadpstParser._extract_pst
+    seen_during_run: list[bool] = []
+
+    def extract_or_blow_up(self, source_path: Path, output_root: Path) -> None:
+        if source_path.name == "b.pst":
+            seen_during_run.append((work / "message-id-fallback.db").exists())
+            raise _Boom("unexpected failure mid-run")
+        stubbed(self, source_path, output_root)
+
+    monkeypatch.setattr(ReadpstParser, "_extract_pst", extract_or_blow_up)
+
+    with pytest.raises(_Boom):
+        _run(db, stage, readpst)
+
+    assert seen_during_run == [True]  # it did exist mid-run
+    assert not work.exists()
+
+
+def test_extracted_messages_are_reported_per_pst(tmp_path, stub_readpst):
+    readpst, mboxes = stub_readpst
+    a = _make_pst(tmp_path, "a.pst")
+    gone = _make_pst(tmp_path, "gone.pst")
+    mboxes["a.pst"] = [
+        _plain_message("<x1@example.test>"),
+        _plain_message(None, "id-less"),
+        _plain_message("<x3@example.test>"),
+    ]
+    db, _ = _canonical(
+        tmp_path,
+        [
+            _row(pst=a, index=1, message_id="<x1@example.test>", body="Hello there"),
+            _row(pst=gone, index=1, message_id=M1, body="x"),
+        ],
+    )
+    gone.unlink()
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    by_pst = {Path(p["pst_source"]).name: p for p in _report(stage)["per_pst"]}
+    assert by_pst["a.pst"]["extracted_messages"] == 3
+    assert by_pst["gone.pst"]["extracted_messages"] == 0
+
+
+# ---------------------------------------------------------------------------
 # imap subcommand. The IMAP connection is a recording fake injected under
 # ``NativeImapClient``; everything after the wire (LIST parsing, wire-name
 # mapping, ``fetch_rfc822``, MIME parse, ``_extract_body_text``) is production

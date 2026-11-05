@@ -16,10 +16,28 @@ How a row is re-derived (``pst`` subcommand):
   2. a canonical row is paired with the re-unpacked message by
      (``pst_source``, ``logical_locator`` = ``<folder>/mbox#N``) and the pair
      is then verified by Message-ID (``query.normalize_message_id``);
+  2b. Message-ID fallback: a row WITH a Message-ID whose locator pairing failed
+     (``locator_not_found`` or ``message_id_mismatch`` at the locator -- the
+     PST changed after import) joins a pool. ``parse_failure`` /
+     ``pst_unreadable`` / ``pst_missing`` rows do not. While every selected PST
+     is re-unpacked, each extracted message that has a Message-ID is recorded
+     (normalized Message-ID -> normalized body) in a temporary SQLite file in
+     the ``-work`` directory (removed at the end, also when the run raises).
+     After all PSTs are done the pool is resolved across ALL PSTs of the run:
+     the Message-ID is found and every candidate carries the same body ->
+     paired (``unchanged`` or staged ``rewrite``, counted again in the
+     informational ``paired_by_message_id``); candidates disagree ->
+     ``message_id_ambiguous`` (not staged); not found anywhere -> the row keeps
+     its original locator reason. Counts are attributed to the row's own
+     ``pst_source``. Rows paired by locator are never re-paired;
   3. rows with no Message-ID are NEVER staged (Sean ruling, issue #14: their
      ``dedup_key`` embeds a body hash, so rewriting the body would make a
      later re-import disagree with the stored key). They are counted, and so
-     is how many of them would contain a data table after re-derivation.
+     is how many of them would contain a data table after re-derivation. They
+     never use the fallback.
+
+The report's per-PST entries also carry ``extracted_messages`` (how many
+messages readpst yielded), for cross-checking extraction completeness.
 
 "Contains a table" is phase 1's own decision: ``_HTMLTextExtractor.
 has_data_table`` as returned by ``parser._html_to_text_and_table_flag`` for the
@@ -134,6 +152,11 @@ _OUTCOMES = (
     "pst_missing",
     "parse_failure",
     "pst_unreadable",
+    # message_id_ambiguous: fallback found the Message-ID with differing bodies.
+    # paired_by_message_id: informational; how many of rewrite + unchanged came
+    # via the fallback (those two stay the true totals).
+    "message_id_ambiguous",
+    "paired_by_message_id",
 )
 
 _IMAP_OUTCOMES = (
@@ -286,6 +309,89 @@ def _clear_stage_target(stage: Path) -> None:
     stage.parent.mkdir(parents=True, exist_ok=True)
 
 
+class _FallbackStore:
+    """On-disk (SQLite, inside the work directory) Message-ID fallback state:
+    every extracted message that has a Message-ID, and the pool of canonical
+    rows whose locator pairing failed. Kept off the Python heap: a real run
+    holds tens of thousands of bodies."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._con = sqlite3.connect(path)
+        self._con.executescript(
+            "CREATE TABLE extracted (message_id TEXT NOT NULL, "
+            "body_sha256 TEXT NOT NULL, body_text TEXT NOT NULL);"
+            "CREATE TABLE pool (row_id INTEGER NOT NULL, pst_source TEXT NOT NULL, "
+            "message_id TEXT NOT NULL, body_sha256 TEXT NOT NULL, "
+            "reason TEXT NOT NULL);"
+        )
+
+    def add_extracted(self, message_id: str, body: str) -> None:
+        self._con.execute(
+            "INSERT INTO extracted VALUES (?, ?, ?)",
+            (message_id, _sha256_text(body), body),
+        )
+
+    def add_pool(self, pst_source: str, row: dict, reason: str) -> None:
+        self._con.execute(
+            "INSERT INTO pool VALUES (?, ?, ?, ?, ?)",
+            (row["id"], pst_source, row["message_id"], row["body_sha256"], reason),
+        )
+
+    def commit(self) -> None:
+        self._con.commit()
+
+    def resolve(self) -> Iterator[tuple[str, dict, str, list[str]]]:
+        """Yield (pst_source, row, reason, candidate bodies): one distinct body
+        per entry of the list, [] when the Message-ID was never extracted."""
+        self._con.commit()
+        self._con.execute(
+            "CREATE INDEX IF NOT EXISTS extracted_mid ON extracted (message_id)"
+        )
+        pool = self._con.execute(
+            "SELECT row_id, pst_source, message_id, body_sha256, reason FROM pool "
+            "ORDER BY rowid"
+        )
+        for row_id, pst_source, message_id, body_sha256, reason in pool:
+            bodies = [
+                r[0]
+                for r in self._con.execute(
+                    "SELECT MIN(body_text) FROM extracted WHERE message_id = ? "
+                    "GROUP BY body_sha256",
+                    (message_id,),
+                )
+            ]
+            row = {"id": row_id, "message_id": message_id, "body_sha256": body_sha256}
+            yield pst_source, row, reason, bodies
+
+    def discard(self) -> None:
+        with suppress(sqlite3.Error):
+            self._con.close()
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            with suppress(OSError):
+                Path(str(self.path) + suffix).unlink(missing_ok=True)
+
+
+def _resolve_fallback(
+    store: _FallbackStore,
+    stage_con: sqlite3.Connection,
+    counts_by_pst: dict[str, dict[str, int]],
+) -> None:
+    for pst_source, row, reason, bodies in store.resolve():
+        counts = counts_by_pst[pst_source]
+        if not bodies:
+            counts[reason] += 1
+        elif len(bodies) > 1:
+            counts["message_id_ambiguous"] += 1
+        elif _sha256_text(bodies[0]) == row["body_sha256"]:
+            counts["unchanged"] += 1
+            counts["paired_by_message_id"] += 1
+        else:
+            _stage_rewrite(stage_con, row, bodies[0], SOURCE_KIND_PST)
+            counts["rewrite"] += 1
+            counts["paired_by_message_id"] += 1
+
+
 def _classify_pair(
     row: dict,
     derived_message_id: str,
@@ -293,6 +399,8 @@ def _classify_pair(
     has_table: bool,
     counts: dict[str, int],
     stage_con: sqlite3.Connection,
+    pst_source: str,
+    store: _FallbackStore,
 ) -> None:
     if not row["message_id"]:
         # Never staged. Only count a table when the re-unpacked message is
@@ -304,7 +412,8 @@ def _classify_pair(
             counts["no_message_id_with_table"] += 1
         return
     if derived_message_id != row["message_id"]:
-        counts["message_id_mismatch"] += 1
+        # The PST changed since import: try the Message-ID fallback later.
+        store.add_pool(pst_source, row, "message_id_mismatch")
         return
     if _sha256_text(new_body) == row["body_sha256"]:
         counts["unchanged"] += 1
@@ -319,7 +428,8 @@ def _process_pst(
     parser_factory,
     stage_con: sqlite3.Connection,
     read_from: Path,
-) -> dict[str, int]:
+    store: _FallbackStore,
+) -> tuple[dict[str, int], int]:
     """``pst_source`` keys the canonical rows; ``read_from`` is the file read.
 
     They differ when the PST moved since import (``--pst-map``). The locator
@@ -328,11 +438,12 @@ def _process_pst(
     counts = _empty_counts()
     if not read_from.exists():
         counts["pst_missing"] = sum(len(v) for v in rows.values())
-        return counts
+        return counts, 0
 
     source = PstSource(path=read_from, input_mode="file", requested_from=read_from)
     failed_locators: set[str] = set()
     pst_level_failure = False
+    extracted_count = 0
     parser = parser_factory()
     with _record_table_flag() as recorder:
         iterator = iter(parser.iter_extraction_results(source))
@@ -353,28 +464,41 @@ def _process_pst(
             extracted = result.message
             if extracted is None:
                 continue
-            matched = rows.pop(extracted.logical_locator, None)
-            if matched is None:
-                continue
+            extracted_count += 1
             raw = extracted.raw_message
             derived_message_id = normalize_message_id(raw.get("message_id"))
             new_body = _normalize_body_text(raw.get("body_text"))
+            if derived_message_id:
+                store.add_extracted(derived_message_id, new_body)
+            matched = rows.pop(extracted.logical_locator, None)
+            if matched is None:
+                continue
             for row in matched:
                 _classify_pair(
-                    row, derived_message_id, new_body, recorder.seen, counts, stage_con
+                    row,
+                    derived_message_id,
+                    new_body,
+                    recorder.seen,
+                    counts,
+                    stage_con,
+                    pst_source,
+                    store,
                 )
 
     for locator, leftover in rows.items():
         if pst_level_failure:
             # readpst itself failed (e.g. the file is locked by Outlook): the
             # rows were never examined, which is not a per-message parse error.
-            key = "pst_unreadable"
+            counts["pst_unreadable"] += len(leftover)
         elif locator in failed_locators:
-            key = "parse_failure"
+            counts["parse_failure"] += len(leftover)
         else:
-            key = "locator_not_found"
-        counts[key] += len(leftover)
-    return counts
+            for row in leftover:
+                if row["message_id"]:
+                    store.add_pool(pst_source, row, "locator_not_found")
+                else:
+                    counts["locator_not_found"] += 1
+    return counts, extracted_count
 
 
 def build_pst_stage(
@@ -424,8 +548,9 @@ def build_pst_stage(
                 )
             return parser_cache[0]
 
+        work_root.mkdir(parents=True, exist_ok=True)
+        store = _FallbackStore(work_root / "message-id-fallback.db")
         stage_con = sqlite3.connect(stage)
-        totals = _empty_counts()
         per_pst: list[dict] = []
         try:
             stage_con.executescript(_STAGE_SCHEMA)
@@ -434,21 +559,31 @@ def build_pst_stage(
                 rows = _canonical_rows_by_locator(canonical, pst_source)
                 row_count = sum(len(v) for v in rows.values())
                 read_from = pst_map.get(pst_source, Path(pst_source))
-                counts = _process_pst(
-                    pst_source, rows, parser_factory, stage_con, read_from
+                counts, extracted_count = _process_pst(
+                    pst_source, rows, parser_factory, stage_con, read_from, store
                 )
                 stage_con.commit()
-                for key, value in counts.items():
-                    totals[key] += value
+                store.commit()
                 per_pst.append(
                     {
                         "pst_source": pst_source,
                         "read_from": str(read_from),
                         "rows": row_count,
+                        "extracted_messages": extracted_count,
                         "elapsed_seconds": round(time.perf_counter() - began, 3),
                         "counts": counts,
                     }
                 )
+            # Every PST is unpacked: resolve the fallback pool across all of
+            # them (a row of PST A may live in PST B now).
+            _resolve_fallback(
+                store, stage_con, {p["pst_source"]: p["counts"] for p in per_pst}
+            )
+            stage_con.commit()
+            totals = _empty_counts()
+            for entry in per_pst:
+                for key, value in entry["counts"].items():
+                    totals[key] += value
             report = {
                 "mode": "pst",
                 "canonical": str(database),
@@ -477,6 +612,7 @@ def build_pst_stage(
             stage_con.commit()
         finally:
             stage_con.close()
+            store.discard()
     finally:
         canonical.close()
         with suppress(OSError):
