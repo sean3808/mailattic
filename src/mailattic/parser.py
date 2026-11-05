@@ -1579,7 +1579,11 @@ class _HTMLTextExtractor(HTMLParser):
         for name, value in attrs:
             if not value:
                 continue
-            counted = name == "href" or (tag == "img" and name in ("src", "alt"))
+            # Only what the reader of the HTML sees as a link or image: a
+            # <link>/<base> href is not content and must not cover plain text.
+            counted = (tag == "a" and name == "href") or (
+                tag == "img" and name in ("src", "alt")
+            )
             if counted and not value.lstrip().lower().startswith("data:"):
                 self.attribute_values.append(value)
 

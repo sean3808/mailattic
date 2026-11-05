@@ -489,3 +489,17 @@ def test_number_split_by_an_inline_tag_is_still_covered() -> None:
     body = _parse(msg)
     assert not body.startswith("[表格失真提示]")
     assert "A | B" in body
+
+
+def test_href_on_a_non_anchor_tag_supplies_nothing() -> None:
+    # Review: a <link href> is not visible content and must not cover a
+    # number missing from the HTML text.
+    html = (
+        '<link href="/123"><table><tr><td>Item</td><td>Qty</td></tr>'
+        "<tr><td>X</td><td>2</td></tr></table>"
+    )
+    msg = EmailMessage()
+    msg.set_content("Item\nQty\n2\n123\n")
+    msg.add_alternative(html, subtype="html")
+    body = _parse(msg)
+    assert body.splitlines()[0] == parser.PLAIN_TABLE_FIDELITY_WARNING
