@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from email import policy
 from email.errors import InvalidHeaderDefect
@@ -1053,6 +1054,7 @@ def _fallback_attachment_name(mime_type: str | None, sequence_number: int) -> st
 def _extract_body_text(message: Any) -> str:
     plain_parts: list[str] = []
     html_parts: list[str] = []
+    has_data_table = False
 
     for part, in_alt in _walk_own_parts_with_context(message):
         if part.is_multipart():
@@ -1069,18 +1071,67 @@ def _extract_body_text(message: Any) -> str:
         if part.get_content_subtype() == "plain":
             plain_parts.append(content)
         elif part.get_content_subtype() == "html":
-            html_parts.append(_html_to_text(content))
+            html_text, html_has_data_table = _html_to_text_and_table_flag(content)
+            html_parts.append(html_text)
+            has_data_table = has_data_table or html_has_data_table
 
     cleaned_plain_parts = [
         candidate.strip() for candidate in plain_parts if candidate.strip()
     ]
-    if cleaned_plain_parts:
+    # A data table in the HTML wins over a plain part: sender clients flatten
+    # tables in the plain alternative (#14, D-20261105-1).
+    if cleaned_plain_parts and not has_data_table:
         return "\n\n".join(cleaned_plain_parts)
 
     cleaned_html_parts = [
         candidate.strip() for candidate in html_parts if candidate.strip()
     ]
-    return "\n\n".join(cleaned_html_parts)
+    html_body = "\n\n".join(cleaned_html_parts)
+    if not cleaned_plain_parts:
+        return html_body
+
+    # Switch to the HTML text only when it still carries what the plain body
+    # had (#14, addendum 1c); otherwise keep plain and flag the flattened table.
+    plain_body = "\n\n".join(cleaned_plain_parts)
+    if _html_covers_plain(plain_body, html_body):
+        return html_body
+    return f"{PLAIN_TABLE_FIDELITY_WARNING}\n{plain_body}"
+
+
+# Placed as the first line of a plain body kept despite an HTML data table.
+PLAIN_TABLE_FIDELITY_WARNING = (
+    "[表格失真提示] 本信的表格在純文字版中可能已經攤平，"
+    "欄位對應無法確定，請勿依文字判斷數值，請對照原信"
+)
+_COVERAGE_MIN_PERCENT = 95
+_COVERAGE_NOISE_PREFIXES = ("mailto:", "cid:", "[cid:")
+
+
+def _is_coverage_noise(token: str) -> bool:
+    """URLs, cid references and e-mail addresses: plain parts spell them out,
+    HTML keeps them in attributes. Token checks, not a regex, so a long
+    near-miss run stays linear (PC-231)."""
+    return "@" in token or "://" in token or token.startswith(_COVERAGE_NOISE_PREFIXES)
+
+
+def _coverage_bag(text: str) -> Counter[str]:
+    return Counter(
+        ch
+        for token in text.lower().split()
+        if not _is_coverage_noise(token)
+        for ch in token
+        if ch.isalnum()
+    )
+
+
+def _html_covers_plain(plain: str, html_text: str) -> bool:
+    """Whether the HTML text keeps at least 95% of the plain alnum characters."""
+    plain_bag = _coverage_bag(plain)
+    total = sum(plain_bag.values())
+    if total == 0:
+        return True
+    lost = sum((plain_bag - _coverage_bag(html_text)).values())
+    return lost * 100 <= total * (100 - _COVERAGE_MIN_PERCENT)
 
 
 def _extract_attachments(
@@ -1185,11 +1236,17 @@ def _is_attachment_part(
     return not in_alternative
 
 
-def _html_to_text(html: str) -> str:
+def _html_to_text_and_table_flag(html: str) -> tuple[str, bool]:
+    """The HTML as text, and whether it rendered a data table (one parse)."""
     parser = _HTMLTextExtractor()
     parser.feed(html)
     parser.close()
-    return parser.get_text()
+    text = parser.get_text()
+    return text, parser.has_data_table
+
+
+def _html_to_text(html: str) -> str:
+    return _html_to_text_and_table_flag(html)[0]
 
 
 _HTML_SKIPPED_TAGS = frozenset({"style", "script", "title"})
@@ -1207,6 +1264,7 @@ _HTML_CELL_SEPARATOR = " | "
 _HTML_SPAN_LIMIT = 100
 _HTML_PROSE_MAX_LINES = 5
 _HTML_PROSE_MAX_CHARS = 200
+_HTML_GRID_SLOT_LIMIT = 100_000
 
 # Placed on its own line right before a table whose columns cannot be trusted.
 TABLE_FIDELITY_WARNING = (
@@ -1297,6 +1355,7 @@ class _Table:
         self.cell: _Cell | None = None
         self.has_nested = False
         self.clamped = False  # a colspan/rowspan above the limit was cut
+        self.max_row_width = 0  # widest row by summed colspans, for the slot cap
 
     def close_cell(self) -> None:
         if self.cell is not None:
@@ -1307,6 +1366,9 @@ class _Table:
         self.close_cell()
         if self.row is not None:
             self.row.end = len(self.tokens)
+            self.max_row_width = max(
+                self.max_row_width, sum(cell.colspan for cell in self.row.cells)
+            )
             self.rows.append(self.row)
             self.row = None
 
@@ -1352,11 +1414,17 @@ def _row_strays(tokens: list[_Token], row: _Row) -> list[_Token]:
     return strays
 
 
-def _render_table(table: _Table) -> list[str]:
-    """The table's output lines; the caller has already closed its last row."""
+def _render_table(table: _Table) -> tuple[list[str], bool]:
+    """The table's output lines and whether it is a data table.
+
+    The caller has already closed the last row.
+    """
     tokens = table.tokens
     if table.has_nested:
-        return _plain_lines(tokens)
+        return _plain_lines(tokens), False
+    if len(table.rows) * table.max_row_width > _HTML_GRID_SLOT_LIMIT:
+        # Decided before the grid exists: an oversize grid is never built.
+        return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
 
     # Lay the table out on the HTML grid. ``pending`` carries rowspan cells
     # into the rows below as column -> (text, rows still to cover).
@@ -1392,9 +1460,9 @@ def _render_table(table: _Table) -> list[str]:
 
     is_data = any(sum(1 for text in slots.values() if text) >= 2 for slots in grid)
     if not is_data:
-        return _plain_lines(tokens)
+        return _plain_lines(tokens), False
     if prose:
-        return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)]
+        return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], True
 
     width = max((max(slots) + 1 for slots in grid if slots), default=0)
     warn = table.clamped
@@ -1415,7 +1483,7 @@ def _render_table(table: _Table) -> list[str]:
             lines.extend(_plain_lines(strays))
         position = row.end
     lines.extend(_plain_lines(tokens[position:]))
-    return [TABLE_FIDELITY_WARNING, *lines] if warn and lines else lines
+    return ([TABLE_FIDELITY_WARNING, *lines] if warn and lines else lines), True
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -1445,6 +1513,7 @@ class _HTMLTextExtractor(HTMLParser):
         self._skip_depth = 0
         # One entry per open <table>; words go to the innermost one.
         self._tables: list[_Table] = []
+        self.has_data_table = False  # set while rendering; read after get_text()
 
     def _end_line(self) -> None:
         if self._tables:
@@ -1459,7 +1528,8 @@ class _HTMLTextExtractor(HTMLParser):
     def _finish_table(self) -> None:
         table = self._tables.pop()
         table.close_row()
-        lines = _render_table(table)
+        lines, is_data = _render_table(table)
+        self.has_data_table = self.has_data_table or is_data
         if self._tables:
             self._tables[-1].tokens.append(_Block(lines))
         else:

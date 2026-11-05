@@ -114,9 +114,17 @@ def test_healthy_inline_html_text_is_unchanged(tmp_path: Path) -> None:
 
 
 def test_text_plus_html_mail_is_stored_as_the_plain_part(tmp_path: Path) -> None:
+    # An HTML part carrying a data table wins over the plain part (#14,
+    # tests/test_body_selection_tables.py); without one the plain part is kept.
+    html_without_table = HTML_ONLY.replace(
+        "<table><tr><td>Item</td><td>Qty</td></tr>"
+        "<tr><td>Notebook</td><td>10</td></tr></table>",
+        "",
+    )
+    assert "<table>" not in html_without_table
     msg = EmailMessage()
     msg.set_content("Plain part line 1\n\nPlain part line 2\n")
-    msg.add_alternative(HTML_ONLY, subtype="html")
+    msg.add_alternative(html_without_table, subtype="html")
     db_path = _import(tmp_path, msg)
     assert _stored_body(db_path) == "Plain part line 1\n\nPlain part line 2"
 
