@@ -135,7 +135,8 @@ Exit codes:
         run with an unreadable PST (``pst_unreadable``) or an incomplete
         extraction (``extraction_incomplete``: rerun; the ledger may be lspst's
         or the recount's). A PST whose ledger stays ``unavailable`` (lspst and
-        recount both failed) keeps exit 0 but the summary prints a warning
+        recount both failed) also exits 2: completeness unknown is not success
+        (a missing PST file is reported as ``pst_missing`` and keeps exit 0)
 """
 
 from __future__ import annotations
@@ -1226,8 +1227,8 @@ def _print_summary(report: dict, report_path: Path) -> None:
             ):
                 print(
                     f"[stage] WARNING: no completeness ledger for "
-                    f"{entry['pst_source']} ({entry['ledger_note']}); an early "
-                    "readpst stop would not be detected"
+                    f"{entry['pst_source']} ({entry['ledger_note']}); "
+                    "completeness cannot be proven, rerun the stage"
                 )
     print(f"[stage] stage database: {report['stage']}")
     print(f"[stage] report: {report_path}")
@@ -1358,10 +1359,18 @@ def main(argv: list[str] | None = None) -> int:
         if report["aborted"] or counts["fetch_error"] or counts["select_failed"]:
             return 2
     elif report["counts"]["pst_unreadable"] or any(
-        e["extraction_complete"] is False for e in report["per_pst"]
+        e["extraction_complete"] is False
+        # No ledger at all (lspst and the recount both failed): completeness is
+        # unknown, which is not success either. A missing PST file has nothing
+        # to extract and is reported as pst_missing instead.
+        or (
+            e["ledger"] == "unavailable"
+            and e["ledger_note"] != _LEDGER_NOTE_PST_MISSING
+        )
+        for e in report["per_pst"]
     ):
-        # An unreadable or incompletely extracted PST leaves rows unexamined;
-        # never report success.
+        # An unreadable, incompletely extracted or unverifiable PST leaves rows
+        # unexamined or unproven; never report success.
         return 2
     return 0
 

@@ -905,7 +905,7 @@ def test_extraction_short_of_the_ledger_exits_two_and_does_not_pool(
     assert str(pst.resolve()) in out
 
 
-def test_ledger_abort_line_is_unavailable_exits_zero_and_warns(
+def test_ledger_abort_line_is_unavailable_exits_two_and_warns(
     tmp_path, stub_readpst, lspst_overrides, capsys, monkeypatch
 ):
     _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=2, rows=2)
@@ -917,7 +917,8 @@ def test_ledger_abort_line_is_unavailable_exits_zero_and_warns(
         "",
     )
 
-    assert _run(db, stage, readpst) == 0
+    # No ledger from lspst nor the recount: completeness unknown -> exit 2.
+    assert _run(db, stage, readpst) == 2
 
     entry = _report(stage)["per_pst"][0]
     assert entry["ledger"] == "unavailable"
@@ -934,7 +935,7 @@ def test_lspst_nonzero_exit_is_unavailable(
     _fail_recount(monkeypatch, stub_readpst[1])  # recount has its own tests
     lspst_overrides["a.pst"] = (3, "", "boom")
 
-    assert _run(db, stage, readpst) == 0
+    assert _run(db, stage, readpst) == 2
 
     entry = _report(stage)["per_pst"][0]
     assert entry["ledger"] == "unavailable"
@@ -949,7 +950,7 @@ def test_lspst_listing_no_email_items_is_unavailable(
     _fail_recount(monkeypatch, stub_readpst[1])  # recount has its own tests
     lspst_overrides["a.pst"] = (0, 'Folder "x"\n', "")
 
-    assert _run(db, stage, readpst) == 0
+    assert _run(db, stage, readpst) == 2
 
     entry = _report(stage)["per_pst"][0]
     assert entry["ledger"] == "unavailable"
@@ -1184,7 +1185,8 @@ def test_recount_that_fails_leaves_ledger_unavailable_and_warns(
         [_msgs(2), RuntimeError("readpst failed for a.pst: synthetic")],
     )
 
-    assert _run(db, stage, readpst) == 0
+    # Neither ledger available: completeness unknown is not success.
+    assert _run(db, stage, readpst) == 2
 
     entry = _report(stage)["per_pst"][0]
     assert entry["ledger"] == "unavailable"
@@ -1230,7 +1232,8 @@ def test_recount_temp_dir_is_removed(
         [_msgs(2), steps[recount_step]],
     )
 
-    assert _run(db, stage, readpst) == 0
+    # A failed recount leaves no ledger at all -> exit 2 (completeness unknown).
+    assert _run(db, stage, readpst) == (0 if recount_step == "ok" else 2)
 
     assert len(calls) == 2
     recount_output = calls[1][1]

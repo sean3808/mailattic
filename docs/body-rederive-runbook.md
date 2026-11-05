@@ -38,8 +38,7 @@ uv run python scripts/body_rederive_stage.py pst \
   --overwrite
 ```
 
-- **結束碼必須是 0**。2 = 某個 PST 解包不完整（readpst 偶發中途停止、仍回報成功，#56）或讀不到 → 直接重跑同一行。
-- 摘要出現 `WARNING: no completeness ledger` 而且沒有「recount」字樣時，表示那個 PST 沒有可比對的封數帳本，重跑一次比對 `extracted_messages` 是否一致。
+- **結束碼必須是 0**。2 = 某個 PST 解包不完整（readpst 偶發中途停止、仍回報成功，#56）、讀不到，或連封數帳本都拿不到（lspst 與重數都失敗，摘要印 `WARNING: no completeness ledger`）→ 直接重跑同一行。
 - 跑完以 Windows 端 `robocopy "\\wsl$\Ubuntu-24.04\<路徑>" "<Windows 目的地>" stage-pst.db stage-pst-report.json /Z /R:2 /W:2` 搬回。
 
 ### 3. IMAP 暫存（Windows）
@@ -80,3 +79,16 @@ uv run python scripts/body_rederive_apply.py --canonical mailattic.db --restore 
 - 還原實測：一次 47,533 封的寫入以 `--restore` 還原，內文與搜尋索引逐封與原值相同（0 不符）。
 - 試跑中 readpst 曾三次中途停止仍回報成功（兩次在 2024–2025 封存檔、一次在 Outlook 本機檔），封數帳本就是為此而設；遇到結束碼 2 重跑即可。
 - 精確數字與過程記在 #14 留言。
+
+### 無法重做的信（#14 留言要求的封數）
+
+| 類別 | 封數 | 說明 |
+|---|---|---|
+| IMAP：伺服器已刪 | 1,301 | 其中 1,054 封仍在 Outlook 本機 PST（依 Message-ID 比對），**247 封伺服器已刪且不在任何 PST** |
+| IMAP：舊 mbsync 檔名無法定位 | 107 | 其中 91 封不在 PST |
+| PST：無 Message-ID（不重做，Sean 拍板） | 7,790 | 含表格估計 2,221 封（2020–2023 封存檔 701 封可靠；其餘 PST 的位置有偏移，只是估計），另 1,745 封無法判斷 |
+| PST：重做後內文變差而保留（#57） | 304 | 亂碼或 base64，待 #57 修好後可再重做 |
+| PST：同一 Message-ID 內文不一致 | 1 | 不寫入 |
+| PST：`archive.pst` 原檔已不存在 | 36 | |
+
+比對「是否在 PST」用的是三個 PST 副本以 `ReadpstParser` 全量解出的 Message-ID 清單（2026-11-05）；伺服器已刪的 1,301 封全是 2026 年 5 月以後的信，兩個封存檔不會有。
