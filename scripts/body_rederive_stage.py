@@ -57,6 +57,17 @@ fallback store. More extracted than listed is fine. Per-PST entries carry
 ``ledger``, ``ledger_emails``, ``ledger_note`` and ``extraction_complete``
 (null when the ledger is unavailable).
 
+Recount ledger: a PST whose lspst ledger is ``unavailable`` (and that exists and
+was read) is extracted once more by the same ``ReadpstParser`` command into a
+fresh temporary directory under ``-work`` (removed afterwards, also on error)
+and its messages are counted without parsing bodies (every ``mbox`` key plus
+``*.eml`` files). State ``recount``: ``ledger_emails`` = that count,
+``ledger_note`` = the lspst reason, and the completeness rule above applies to
+it. Main extracted + failures above the recount keeps the PST complete but
+prints a WARNING (the recount stopped early). A recount that cannot run leaves
+the ledger ``unavailable`` (note extended). PSTs with an ``ok`` ledger are not
+recounted. Per-PST entries carry ``recount_seconds`` (null when not run).
+
 "Contains a table" is phase 1's own decision: ``_HTMLTextExtractor.
 has_data_table`` as returned by ``parser._html_to_text_and_table_flag`` for the
 message's HTML part(s). ``_extract_body_text`` consumes that flag but does not
@@ -122,8 +133,9 @@ Exit codes:
         IMAP settings / connection could not be established
     2 — imap run stopped part-way (connection lost) or had fetch errors; pst
         run with an unreadable PST (``pst_unreadable``) or an incomplete
-        extraction (``extraction_incomplete``: rerun). A PST whose ledger is
-        ``unavailable`` keeps exit 0 but the summary prints a warning for it
+        extraction (``extraction_incomplete``: rerun; the ledger may be lspst's
+        or the recount's). A PST whose ledger stays ``unavailable`` (lspst and
+        recount both failed) keeps exit 0 but the summary prints a warning
 """
 
 from __future__ import annotations
@@ -132,12 +144,14 @@ import argparse
 import hashlib
 import imaplib
 import json
+import mailbox
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
@@ -306,6 +320,39 @@ def _lspst_ledger(lspst: Path, pst: Path) -> dict:
         # Nothing to compare against: an empty listing proves no completeness.
         return _ledger("unavailable", None, "lspst listed no Email items")
     return _ledger("ok", emails, None)
+
+
+def _count_extraction(output_root: Path) -> int:
+    """Messages in a readpst output tree, enumerated the way
+    ``ReadpstParser.iter_extraction_results`` walks it (every ``*.eml`` plus
+    every key of every ``mbox``), without parsing any body."""
+    total = sum(1 for _ in output_root.rglob("*.eml"))
+    for mbox_path in sorted(output_root.rglob("mbox")):
+        mbox = mailbox.mbox(mbox_path, create=False)
+        try:
+            total += sum(1 for _ in mbox.iterkeys())
+        finally:
+            mbox.close()
+    return total
+
+
+def _recount_ledger(
+    parser: ReadpstParser, pst: Path, work_root: Path, lspst_note: str | None
+) -> dict:
+    """Second ledger source for a PST lspst cannot list: run readpst once more
+    (the parser's own command) into a fresh temp dir and count what it yields.
+    The temp dir is removed afterwards, also on error."""
+    work_root.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(dir=work_root, prefix="recount-"))
+    try:
+        output_root = temp_dir / "out"
+        output_root.mkdir()
+        parser._extract_pst(pst, output_root)
+        return _ledger("recount", _count_extraction(output_root), lspst_note)
+    except (OSError, RuntimeError, mailbox.Error) as exc:
+        return _ledger("unavailable", None, f"{lspst_note}; recount failed: {exc}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _sha256_text(text: str) -> str:
@@ -631,16 +678,21 @@ def _process_pst(
     canonical: sqlite3.Connection,
     samples: _DegradedSamples,
     ledger: dict | None = None,
-) -> tuple[dict[str, int], int, bool | None]:
+    work_root: Path | None = None,
+) -> tuple[dict[str, int], int, bool | None, dict | None, float | None]:
     """``pst_source`` keys the canonical rows; ``read_from`` is the file read.
 
     They differ when the PST moved since import (``--pst-map``). The locator
     is relative to readpst's output root, so pairing does not depend on it.
+
+    Returns (counts, extracted, extraction_complete, the ledger actually used
+    -- an ``unavailable`` lspst ledger is replaced by a ``recount`` one when
+    *work_root* is given and the recount ran -- and the recount seconds).
     """
     counts = _empty_counts()
     if not read_from.exists():
         counts["pst_missing"] = sum(len(v) for v in rows.values())
-        return counts, 0, None
+        return counts, 0, None, ledger, None
 
     source = PstSource(path=read_from, input_mode="file", requested_from=read_from)
     failed_locators: set[str] = set()
@@ -691,8 +743,26 @@ def _process_pst(
                     samples,
                 )
 
+    recount_seconds: float | None = None
+    if (
+        ledger is not None
+        and ledger["state"] == "unavailable"
+        and not pst_level_failure
+        and work_root is not None
+    ):
+        began = time.perf_counter()
+        ledger = _recount_ledger(parser, read_from, work_root, ledger["note"])
+        recount_seconds = round(time.perf_counter() - began, 3)
+        main_total = extracted_count + failure_count
+        if ledger["state"] == "recount" and main_total > ledger["emails"]:
+            print(
+                f"[stage] WARNING: recount of {pst_source} found "
+                f"{ledger['emails']} messages but the main pass yielded "
+                f"{main_total}; the recount itself stopped early (an early stop "
+                "in the main pass cannot be ruled out with certainty)"
+            )
     extraction_complete: bool | None = None
-    if ledger is not None and ledger["state"] == "ok":
+    if ledger is not None and ledger["state"] in ("ok", "recount"):
         extraction_complete = extracted_count + failure_count >= ledger["emails"]
     for locator, leftover in rows.items():
         if pst_level_failure:
@@ -710,7 +780,7 @@ def _process_pst(
                     store.add_pool(pst_source, row, "locator_not_found")
                 else:
                     counts["locator_not_found"] += 1
-    return counts, extracted_count, extraction_complete
+    return counts, extracted_count, extraction_complete, ledger, recount_seconds
 
 
 def build_pst_stage(
@@ -782,17 +852,21 @@ def build_pst_stage(
                     ledger = _lspst_ledger(lspst, read_from)
                 else:
                     ledger = _ledger("unavailable", None, _LEDGER_NOTE_PST_MISSING)
-                counts, extracted_count, complete = _process_pst(
-                    pst_source,
-                    rows,
-                    parser_factory,
-                    stage_con,
-                    read_from,
-                    store,
-                    canonical,
-                    samples,
-                    ledger,
+                counts, extracted_count, complete, ledger, recount_seconds = (
+                    _process_pst(
+                        pst_source,
+                        rows,
+                        parser_factory,
+                        stage_con,
+                        read_from,
+                        store,
+                        canonical,
+                        samples,
+                        ledger,
+                        work_root,
+                    )
                 )
+                assert ledger is not None
                 stage_con.commit()
                 store.commit()
                 per_pst.append(
@@ -805,6 +879,7 @@ def build_pst_stage(
                         "ledger_emails": ledger["emails"],
                         "ledger_note": ledger["note"],
                         "extraction_complete": complete,
+                        "recount_seconds": recount_seconds,
                         "elapsed_seconds": round(time.perf_counter() - began, 3),
                         "counts": counts,
                     }
@@ -1137,10 +1212,13 @@ def _print_summary(report: dict, report_path: Path) -> None:
                     "not examined"
                 )
             elif entry["extraction_complete"] is False:
+                source_word = (
+                    "recount found" if entry["ledger"] == "recount" else "lspst lists"
+                )
                 print(
                     f"[stage] INCOMPLETE extraction: {entry['pst_source']} "
-                    f"(extracted {entry['extracted_messages']}, lspst lists "
-                    f"{entry['ledger_emails']}); rerun the stage"
+                    f"(extracted {entry['extracted_messages']}, "
+                    f"{source_word} {entry['ledger_emails']}); rerun the stage"
                 )
             elif (
                 entry["ledger"] == "unavailable"

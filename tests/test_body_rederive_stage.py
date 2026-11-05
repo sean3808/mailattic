@@ -821,6 +821,41 @@ def _ledger_world(tmp_path: Path, stub_readpst, *, in_mbox: int, rows: int):
     return pst, db, ids, readpst, tmp_path / "out" / "stage.db"
 
 
+def _script_extractions(monkeypatch, mboxes, per_call):
+    """Replace the stubbed ``_extract_pst``: call N (1-based, per PST file name)
+    of a PST answers with ``per_call[N-1]`` -- a list of messages to unpack, or
+    an Exception instance to raise. Returns the list of (pst name, output dir)
+    seen, so a test can check the call count and the temp dirs."""
+    calls: list[tuple[str, Path]] = []
+
+    def scripted(self, source_path: Path, output_root: Path) -> None:
+        calls.append((source_path.name, output_root))
+        step = per_call[sum(1 for name, _ in calls if name == source_path.name) - 1]
+        if isinstance(step, Exception):
+            raise step
+        folder = output_root / "Inbox"
+        folder.mkdir(parents=True)
+        box = mailbox.mbox(folder / "mbox", create=True)
+        try:
+            for message in step:
+                box.add(message)
+            box.flush()
+        finally:
+            box.close()
+
+    monkeypatch.setattr(ReadpstParser, "_extract_pst", scripted)
+    return calls
+
+
+def _fail_recount(monkeypatch, mboxes):
+    """Main pass unpacks ``mboxes['a.pst']``; the recount's readpst fails."""
+    return _script_extractions(
+        monkeypatch,
+        mboxes,
+        [mboxes["a.pst"], RuntimeError("readpst failed for a.pst: synthetic")],
+    )
+
+
 def test_ledger_ok_and_complete_extraction_exits_zero(tmp_path, stub_readpst):
     _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=2, rows=2)
 
@@ -871,9 +906,10 @@ def test_extraction_short_of_the_ledger_exits_two_and_does_not_pool(
 
 
 def test_ledger_abort_line_is_unavailable_exits_zero_and_warns(
-    tmp_path, stub_readpst, lspst_overrides, capsys
+    tmp_path, stub_readpst, lspst_overrides, capsys, monkeypatch
 ):
     _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=2, rows=2)
+    _fail_recount(monkeypatch, stub_readpst[1])  # recount has its own tests
     lspst_overrides["a.pst"] = (
         0,
         "Email\tFrom: x\nA second message_store has been found. Sorry, this "
@@ -891,8 +927,11 @@ def test_ledger_abort_line_is_unavailable_exits_zero_and_warns(
     assert "WARNING" in capsys.readouterr().out
 
 
-def test_lspst_nonzero_exit_is_unavailable(tmp_path, stub_readpst, lspst_overrides):
+def test_lspst_nonzero_exit_is_unavailable(
+    tmp_path, stub_readpst, lspst_overrides, monkeypatch
+):
     _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=1, rows=1)
+    _fail_recount(monkeypatch, stub_readpst[1])  # recount has its own tests
     lspst_overrides["a.pst"] = (3, "", "boom")
 
     assert _run(db, stage, readpst) == 0
@@ -904,9 +943,10 @@ def test_lspst_nonzero_exit_is_unavailable(tmp_path, stub_readpst, lspst_overrid
 
 
 def test_lspst_listing_no_email_items_is_unavailable(
-    tmp_path, stub_readpst, lspst_overrides
+    tmp_path, stub_readpst, lspst_overrides, monkeypatch
 ):
     _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=1, rows=1)
+    _fail_recount(monkeypatch, stub_readpst[1])  # recount has its own tests
     lspst_overrides["a.pst"] = (0, 'Folder "x"\n', "")
 
     assert _run(db, stage, readpst) == 0
@@ -1033,6 +1073,204 @@ def test_missing_pst_has_no_ledger_and_no_warning(tmp_path, stub_readpst, capsys
     assert entry["ledger"] == "unavailable"
     assert entry["extraction_complete"] is None
     assert "WARNING" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Recount ledger: a PST whose lspst ledger is unavailable is unpacked once more
+# and counted. The scripted ``_extract_pst`` answers call 1 (main pass) and
+# call 2 (recount) differently.
+# ---------------------------------------------------------------------------
+
+_LSPST_ABORT = (0, "A second message_store has been found. Sorry.\n", "")
+
+
+def _msgs(count: int) -> list[EmailMessage]:
+    return [_plain_message(f"<m{i}@example.test>") for i in range(count)]
+
+
+def _recount_world(tmp_path, stub_readpst, lspst_overrides, monkeypatch, per_call):
+    """PST a.pst with lspst unavailable; canonical rows: #1 (<m0>) pairs by
+    locator, #3 (<m1>) has no message at #3 but <m1> exists in the PST, so the
+    fallback WOULD resolve it were it pooled."""
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = []
+    lspst_overrides["a.pst"] = _LSPST_ABORT
+    db, ids = _canonical(
+        tmp_path,
+        [
+            _row(pst=pst, index=1, message_id="<m0@example.test>", body="old body"),
+            _row(pst=pst, index=3, message_id="<m1@example.test>", body="old body"),
+        ],
+    )
+    calls = _script_extractions(monkeypatch, mboxes, per_call)
+    return pst, db, ids, readpst, tmp_path / "out" / "stage.db", calls
+
+
+def test_recount_higher_than_main_is_incomplete_exit_two_not_pooled(
+    tmp_path, stub_readpst, lspst_overrides, monkeypatch, capsys
+):
+    pst, db, (paired, extra), readpst, stage, calls = _recount_world(
+        tmp_path, stub_readpst, lspst_overrides, monkeypatch, [_msgs(2), _msgs(4)]
+    )
+
+    assert _run(db, stage, readpst) == 2
+
+    counts = _report(stage)["counts"]
+    assert counts["extraction_incomplete"] == 1
+    assert counts["locator_not_found"] == 0
+    assert counts["paired_by_message_id"] == 0
+    assert set(_staged(stage)) == {paired}
+    entry = _report(stage)["per_pst"][0]
+    assert entry["ledger"] == "recount"
+    assert entry["ledger_emails"] == 4
+    assert "second message_store" in entry["ledger_note"]
+    assert entry["extraction_complete"] is False
+    assert isinstance(entry["recount_seconds"], float)
+    out = capsys.readouterr().out
+    assert "INCOMPLETE" in out
+    assert "recount found 4" in out
+    assert len(calls) == 2
+
+
+def test_recount_equal_to_main_is_complete_exit_zero(
+    tmp_path, stub_readpst, lspst_overrides, monkeypatch, capsys
+):
+    pst, db, (paired, extra), readpst, stage, calls = _recount_world(
+        tmp_path, stub_readpst, lspst_overrides, monkeypatch, [_msgs(2), _msgs(2)]
+    )
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["ledger"] == "recount"
+    assert entry["ledger_emails"] == 2
+    assert entry["extraction_complete"] is True
+    counts = _report(stage)["counts"]
+    assert counts["extraction_incomplete"] == 0
+    assert counts["paired_by_message_id"] == 1  # the fallback ran for the row
+    assert set(_staged(stage)) == {paired, extra}
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_recount_lower_than_main_is_complete_and_warns(
+    tmp_path, stub_readpst, lspst_overrides, monkeypatch, capsys
+):
+    pst, db, _, readpst, stage, calls = _recount_world(
+        tmp_path, stub_readpst, lspst_overrides, monkeypatch, [_msgs(4), _msgs(2)]
+    )
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["ledger"] == "recount"
+    assert entry["ledger_emails"] == 2
+    assert entry["extraction_complete"] is True
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert str(pst.resolve()) in out
+    assert "found 2" in out
+    assert "yielded 4" in out
+
+
+def test_recount_that_fails_leaves_ledger_unavailable_and_warns(
+    tmp_path, stub_readpst, lspst_overrides, monkeypatch, capsys
+):
+    pst, db, _, readpst, stage, calls = _recount_world(
+        tmp_path,
+        stub_readpst,
+        lspst_overrides,
+        monkeypatch,
+        [_msgs(2), RuntimeError("readpst failed for a.pst: synthetic")],
+    )
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["ledger"] == "unavailable"
+    assert entry["ledger_emails"] is None
+    assert "second message_store" in entry["ledger_note"]
+    assert "recount failed" in entry["ledger_note"]
+    assert entry["extraction_complete"] is None
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_ok_ledger_is_not_recounted(tmp_path, stub_readpst, monkeypatch):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = _msgs(2)  # default stub lspst lists 2 -> state ok
+    db, _ = _canonical(
+        tmp_path,
+        [_row(pst=pst, index=1, message_id="<m0@example.test>", body="old body")],
+    )
+    calls = _script_extractions(monkeypatch, mboxes, [_msgs(2), _msgs(2)])
+
+    assert _run(db, tmp_path / "out" / "stage.db", readpst) == 0
+
+    assert len(calls) == 1
+    entry = _report(tmp_path / "out" / "stage.db")["per_pst"][0]
+    assert entry["ledger"] == "ok"
+    assert entry["recount_seconds"] is None
+
+
+@pytest.mark.parametrize("recount_step", ["ok", "raises", "unexpected"])
+def test_recount_temp_dir_is_removed(
+    tmp_path, stub_readpst, lspst_overrides, monkeypatch, recount_step
+):
+    steps = {
+        "ok": _msgs(2),
+        "raises": RuntimeError("readpst failed for a.pst: synthetic"),
+        "unexpected": OSError("disk gone"),
+    }
+    pst, db, _, readpst, stage, calls = _recount_world(
+        tmp_path,
+        stub_readpst,
+        lspst_overrides,
+        monkeypatch,
+        [_msgs(2), steps[recount_step]],
+    )
+
+    assert _run(db, stage, readpst) == 0
+
+    assert len(calls) == 2
+    recount_output = calls[1][1]
+    assert recount_output.parent.name.startswith("recount-")
+    assert not recount_output.parent.exists()
+    assert not (tmp_path / "out" / "stage-work").exists()
+
+
+def test_recount_temp_dir_is_removed_when_counting_blows_up(
+    tmp_path, stub_readpst, lspst_overrides, monkeypatch
+):
+    pst, db, _, readpst, stage, calls = _recount_world(
+        tmp_path, stub_readpst, lspst_overrides, monkeypatch, [_msgs(2), _msgs(2)]
+    )
+
+    def boom(output_root):
+        raise _Boom("counting failed")
+
+    monkeypatch.setattr(stage_module, "_count_extraction", boom)
+
+    with pytest.raises(_Boom):
+        _run(db, stage, readpst)
+
+    assert not calls[1][1].parent.exists()
+
+
+def test_count_extraction_counts_mbox_keys_and_eml_files(tmp_path):
+    folder = tmp_path / "Inbox"
+    folder.mkdir()
+    box = mailbox.mbox(folder / "mbox", create=True)
+    try:
+        for message in _msgs(3):
+            box.add(message)
+        box.flush()
+    finally:
+        box.close()
+    (folder / "1.eml").write_bytes(b"Subject: x\n\nbody\n")
+    (folder / "2.eml").write_bytes(b"Subject: y\n\nbody\n")
+
+    assert stage_module._count_extraction(tmp_path) == 5
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="uses a .cmd stub")
