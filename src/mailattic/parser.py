@@ -1108,14 +1108,17 @@ PLAIN_TABLE_FIDELITY_WARNING = (
     f"{_TABLE_FIDELITY_PREFIX} 本信的表格在純文字版中可能已經攤平，"
     f"{_TABLE_FIDELITY_ADVICE}"
 )
-# Disjoint alternatives, so linear. Letters and digits are separate runs:
-# the HTML text splits "NTD210" / "27<sup>th</sup>" at inline tags.
-_COVERAGE_TOKEN = re.compile(r"[a-z]+|[0-9]+|[^\W_]")
+# CJK scripts have no spaces between words, so each character is a token;
+# any other run of letters/digits ("AB12", "Café") is one token, so swapped
+# identifiers cannot cover each other (#14 comment 5). The two alternatives
+# are disjoint character classes, so matching is linear.
+_CJK_CHARS = "぀-ヿ㐀-䶿一-鿿豈-﫿가-힯"
+_COVERAGE_TOKEN = re.compile(rf"[{_CJK_CHARS}]|[^\W_{_CJK_CHARS}]+")
 
 
 def _coverage_tokens(text: str) -> Counter[str]:
-    """Words for the coverage check: an ASCII letter run or digit run is one
-    token, every other alphanumeric character (CJK etc.) its own token."""
+    """Words for the coverage check: a CJK character is one token, every other
+    run of letters/digits is one token."""
     folded = unicodedata.normalize("NFKC", text).casefold()
     return Counter(_COVERAGE_TOKEN.findall(folded))
 
@@ -1273,8 +1276,18 @@ _HTML_BLOCK_TAGS = frozenset(
 
 
 _HTML_CELL_TAGS = frozenset({"td", "th"})
-# Tags that separate the text nodes around them; inline tags do not (#14).
-_HTML_SEPARATING_TAGS = _HTML_BLOCK_TAGS | _HTML_CELL_TAGS
+# Text nodes on either side of these tags are one word when no whitespace
+# separates them ("NTD<b>8</b>5" -> "NTD85"); any other tag separates (#14).
+_HTML_GLUE_TAGS = frozenset(
+    {
+        "a", "abbr", "b", "big", "cite", "code", "del", "dfn", "em", "font", "i",
+        "ins", "kbd", "mark", "o:p", "q", "s", "samp", "small", "span", "strike",
+        "strong", "sub", "sup", "time", "u", "var",
+    }
+)  # fmt: skip
+# Row groups end the open row, the same as a new <tr> does in a browser.
+_HTML_ROW_GROUP_TAGS = frozenset({"thead", "tbody", "tfoot"})
+_URL_LEADING_JUNK = "".join(chr(code) for code in range(0x21))
 _HTML_CELL_SEPARATOR = " | "
 _HTML_SPAN_LIMIT = 100
 _HTML_PROSE_MAX_LINES = 5
@@ -1571,7 +1584,7 @@ class _HTMLTextExtractor(HTMLParser):
         # One entry per open <table>; words go to the innermost one.
         self._tables: list[_Table] = []
         self.has_data_table = False  # set while rendering; read after get_text()
-        # href (any tag) / img src / img alt values, for the coverage check;
+        # <a href> / <img src> / <img alt> values, for the coverage check;
         # HTMLParser has already unescaped them.
         self.attribute_values: list[str] = []
 
@@ -1581,10 +1594,13 @@ class _HTMLTextExtractor(HTMLParser):
                 continue
             # Only what the reader of the HTML sees as a link or image: a
             # <link>/<base> href is not content and must not cover plain text.
-            counted = (tag == "a" and name == "href") or (
-                tag == "img" and name in ("src", "alt")
+            # A data: URI (browsers ignore leading control characters and
+            # spaces) is an inline payload, not a link anyone reads.
+            is_link = (tag == "a" and name == "href") or (
+                tag == "img" and name == "src"
             )
-            if counted and not value.lstrip().lower().startswith("data:"):
+            is_data_uri = value.lstrip(_URL_LEADING_JUNK).lower().startswith("data:")
+            if (tag == "img" and name == "alt") or (is_link and not is_data_uri):
                 self.attribute_values.append(value)
 
     def _end_line(self) -> None:
@@ -1614,14 +1630,14 @@ class _HTMLTextExtractor(HTMLParser):
         if tag in _HTML_SKIPPED_TAGS:
             self._skip_depth += 1
             return
-        if tag in _HTML_SEPARATING_TAGS:
+        if tag not in _HTML_GLUE_TAGS:
             self._glue = False
         if not self._skip_depth:
             self._collect_attribute_values(tag, attrs)
         if self._tables:
             if tag == "table":
                 self._tables[-1].has_nested = True
-            elif tag == "tr":
+            elif tag == "tr" or tag in _HTML_ROW_GROUP_TAGS:
                 self._tables[-1].close_row()
         if tag in _HTML_BLOCK_TAGS:
             self._end_line()
@@ -1639,12 +1655,12 @@ class _HTMLTextExtractor(HTMLParser):
             if not self._skip_depth:
                 self._skipped = []
             return
-        if tag in _HTML_SEPARATING_TAGS:
+        if tag not in _HTML_GLUE_TAGS:
             self._glue = False
         if tag in _HTML_CELL_TAGS:
             if self._tables:
                 self._tables[-1].close_cell()
-        elif tag == "tr":
+        elif tag == "tr" or tag in _HTML_ROW_GROUP_TAGS:
             if self._tables:
                 self._tables[-1].close_row()
         elif tag == "table" and self._tables:

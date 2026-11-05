@@ -461,3 +461,16 @@ def test_colspan_crossing_a_carried_rowspan_warns() -> None:
     lines = _lines(html)
     assert lines[0] == _warning()
     assert lines.count(_warning()) == 1
+
+
+def test_row_groups_without_tr_end_the_implicit_row() -> None:
+    html = (
+        "<table><thead><td>H1<td>H2</thead><tbody><td>a<td></td><td>b</tbody></table>"
+    )
+    assert _lines(html) == ["H1 | H2 | ", "a |  | b"]
+
+
+def test_only_inline_tags_join_text_nodes() -> None:
+    # center / img are not inline text formatting: the words stay apart.
+    assert "Total500" not in _html_to_text("<center>Total</center><center>500</center>")
+    assert _lines('x<img src="cid:a">5') == ["x 5"]

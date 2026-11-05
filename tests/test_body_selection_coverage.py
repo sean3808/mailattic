@@ -25,6 +25,7 @@ Assumptions encoded: the warning and the plain body are separated by a newline
 from __future__ import annotations
 
 import time
+from collections import Counter
 from email import message_from_bytes, policy
 from email.message import EmailMessage
 
@@ -503,3 +504,47 @@ def test_href_on_a_non_anchor_tag_supplies_nothing() -> None:
     msg.add_alternative(html, subtype="html")
     body = _parse(msg)
     assert body.splitlines()[0] == parser.PLAIN_TABLE_FIDELITY_WARNING
+
+
+def test_swapped_identifiers_do_not_cover_each_other() -> None:
+    # Review: "AB12" is one token; HTML showing AB34 / CD12 does not carry
+    # the plain part's AB12 / CD34.
+    html = (
+        "<table><tr><td>Item</td><td>Qty</td></tr>"
+        "<tr><td>AB34</td><td>CD12</td></tr></table>"
+    )
+    msg = EmailMessage()
+    msg.set_content("Item\nQty\nAB12\nCD34\n")
+    msg.add_alternative(html, subtype="html")
+    body = _parse(msg)
+    assert body.splitlines()[0] == parser.PLAIN_TABLE_FIDELITY_WARNING
+
+
+def test_data_uri_with_leading_control_characters_supplies_nothing() -> None:
+    # Browsers ignore leading control characters, so this is still data:.
+    html = (
+        '<a href="\x01data:text/plain,warehouse 2">x</a>'
+        "<table><tr><td>A</td><td>B</td></tr></table>"
+    )
+    msg = EmailMessage()
+    msg.set_content("A\nB\nDo not ship to warehouse 2\n")
+    msg.add_alternative(html, subtype="html")
+    body = _parse(msg)
+    assert body.splitlines()[0] == parser.PLAIN_TABLE_FIDELITY_WARNING
+
+
+def test_img_alt_starting_with_data_is_still_evidence() -> None:
+    html = (
+        '<img src="cid:x" alt="Data: 12 pcs">'
+        "<table><tr><td>A</td><td>B</td></tr></table>"
+    )
+    msg = EmailMessage()
+    msg.set_content("Data: 12 pcs\nA\nB\n")
+    msg.add_alternative(html, subtype="html")
+    assert "A | B" in _parse(msg)
+
+
+def test_non_ascii_letter_runs_are_one_token() -> None:
+    assert parser._coverage_tokens("Café ЖУК 中文") == Counter(
+        {"café": 1, "жук": 1, "中": 1, "文": 1}
+    )
