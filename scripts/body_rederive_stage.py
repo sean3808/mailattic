@@ -607,9 +607,8 @@ class _FallbackStore:
     def discard(self) -> None:
         with suppress(sqlite3.Error):
             self._con.close()
-        for suffix in ("", "-wal", "-shm", "-journal"):
-            with suppress(OSError):
-                Path(str(self.path) + suffix).unlink(missing_ok=True)
+        with suppress(OSError):
+            _remove_stage_files(self.path)
 
 
 def _resolve_fallback(
