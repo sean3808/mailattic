@@ -675,6 +675,32 @@ def test_fallback_database_is_removed_after_a_run(tmp_path, stub_readpst):
     assert not (tmp_path / "out" / "stage-work").exists()
 
 
+def test_leftover_fallback_database_from_a_killed_run_does_not_block(
+    tmp_path, stub_readpst
+):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [_table_message(M1)]
+    db, _ = _canonical(
+        tmp_path, [_row(pst=pst, index=5, message_id=M1, body=PLAIN_FLAT)]
+    )
+    stage = tmp_path / "out" / "stage.db"
+    work = tmp_path / "out" / "stage-work"
+    work.mkdir(parents=True)
+    leftover = sqlite3.connect(work / "message-id-fallback.db")
+    leftover.executescript(
+        "CREATE TABLE extracted (x); CREATE TABLE pool (x); "
+        "INSERT INTO pool VALUES (1);"
+    )
+    leftover.commit()
+    leftover.close()
+
+    assert _run(db, stage, readpst) == 0
+
+    assert len(_staged(stage)) == 1
+    assert not work.exists()
+
+
 class _Boom(Exception):
     pass
 

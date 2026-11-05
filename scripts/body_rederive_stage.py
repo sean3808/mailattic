@@ -317,6 +317,8 @@ class _FallbackStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        # A hard-killed earlier run can leave the file behind; it is scratch.
+        _remove_stage_files(path)
         self._con = sqlite3.connect(path)
         self._con.executescript(
             "CREATE TABLE extracted (message_id TEXT NOT NULL, "
@@ -550,7 +552,11 @@ def build_pst_stage(
 
         work_root.mkdir(parents=True, exist_ok=True)
         store = _FallbackStore(work_root / "message-id-fallback.db")
-        stage_con = sqlite3.connect(stage)
+        try:
+            stage_con = sqlite3.connect(stage)
+        except BaseException:
+            store.discard()
+            raise
         per_pst: list[dict] = []
         try:
             stage_con.executescript(_STAGE_SCHEMA)
