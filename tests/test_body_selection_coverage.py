@@ -21,6 +21,7 @@ tolerated); a coverage of exactly 0.95 counts as covered (">= 0.95").
 from __future__ import annotations
 
 import time
+from collections import Counter
 from email import message_from_bytes, policy
 from email.message import EmailMessage
 
@@ -277,3 +278,52 @@ def test_near_miss_noise_runs_stay_linear() -> None:
     start = time.perf_counter()
     assert parser._html_covers_plain(run, run)
     assert time.perf_counter() - start < 2.0
+
+
+# --- review round 1 fixes (spec-1d): text glued to an address or URL --------
+
+
+def test_coverage_bag_counts_prefix_glued_to_an_address() -> None:
+    assert parser._coverage_bag("URGENT:owner@example.test") == Counter("urgent")
+
+
+def test_coverage_bag_counts_prefix_glued_to_a_url() -> None:
+    assert parser._coverage_bag("see:https://example.test/x") == Counter("see")
+
+
+def test_coverage_bag_drops_bare_address_url_and_prefixed_tokens() -> None:
+    # pins unchanged behaviour
+    for token in (
+        "owner@example.test",
+        "https://example.test/x",
+        "<https://example.test/x>",
+        "mailto:someone@example.test",
+        "cid:image001",
+        "[cid:image001@example.test]",
+    ):
+        assert not parser._coverage_bag(token), token
+
+
+def test_coverage_bag_keeps_neighbouring_words() -> None:
+    # pins unchanged behaviour
+    bag = parser._coverage_bag(
+        "keep owner@example.test also https://example.test/x end"
+    )
+    assert bag == Counter("keepalsoend")
+
+
+def test_plain_instruction_glued_to_an_address_triggers_plain_fallback() -> None:
+    plain = f"{TABLE_FLATTENED}\nURGENT:owner@example.test\n"
+    html = f"<html><body>{TABLE_HTML}</body></html>"
+    first, rest = _split_warning(_parse(_alternative(plain, html)))
+    assert first == parser.PLAIN_TABLE_FIDELITY_WARNING
+    assert rest == plain.strip()
+
+
+def test_coverage_bag_drops_outlook_mailto_wrappers() -> None:
+    # Outlook plain parts write links as "Name [mailto:x@y]" and
+    # "x@y<mailto:x@y>"; the scheme belongs to the address, not the text.
+    assert parser._coverage_bag("Owner [mailto:owner@example.test]") == Counter("owner")
+    assert parser._coverage_bag("owner@example.test<mailto:owner@example.test>") == (
+        Counter()
+    )

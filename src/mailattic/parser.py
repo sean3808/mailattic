@@ -1107,18 +1107,49 @@ _COVERAGE_MIN_PERCENT = 95
 _COVERAGE_NOISE_PREFIXES = ("mailto:", "cid:", "[cid:")
 
 
-def _is_coverage_noise(token: str) -> bool:
-    """URLs, cid references and e-mail addresses: plain parts spell them out,
-    HTML keeps them in attributes. Token checks, not a regex, so a long
+_URL_SCHEME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
+)
+_EMAIL_LOCAL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._%+-"
+)
+
+
+def _strip_before(token: str, end: int, allowed: frozenset[str]) -> str:
+    """``token[:end]`` minus the maximal run of ``allowed`` characters at its end."""
+    start = end
+    while start > 0 and token[start - 1] in allowed:
+        start -= 1
+    return token[:start]
+
+
+def _coverage_text(token: str) -> str:
+    """The part of a whitespace token that counts for coverage.
+
+    URLs, cid references and e-mail addresses: plain parts spell them out,
+    HTML keeps them in attributes. Only the address/URL part is removed; text
+    glued in front of it still counts. Index scans, not a regex, so a long
     near-miss run stays linear (PC-231)."""
-    return "@" in token or "://" in token or token.startswith(_COVERAGE_NOISE_PREFIXES)
+    if token.startswith(_COVERAGE_NOISE_PREFIXES):
+        return ""
+    index = token.find("://")
+    if index >= 0:
+        token = _strip_before(token, index, _URL_SCHEME_CHARS)
+    index = token.find("@")
+    if index >= 0:
+        token = _strip_before(token, index, _EMAIL_LOCAL_CHARS)
+    # Outlook writes "Name [mailto:x@y]" / "x@y<mailto:x@y>": the scheme left
+    # in front of a removed address is part of the address, not text.
+    for scheme in ("mailto:", "cid:"):
+        if token.endswith(scheme):
+            token = token[: -len(scheme)]
+    return token
 
 
 def _coverage_bag(text: str) -> Counter[str]:
     bag: Counter[str] = Counter()
     for token in text.lower().split():
-        if not _is_coverage_noise(token):
-            bag.update(filter(str.isalnum, token))
+        bag.update(filter(str.isalnum, _coverage_text(token)))
     return bag
 
 
@@ -1410,6 +1441,31 @@ def _row_strays(tokens: list[_Token], row: _Row) -> list[_Token]:
     return strays
 
 
+def _nested_container_reads_as_columns(table: _Table) -> bool:
+    """Whether a table holding nested tables may hide a column mapping.
+
+    True when some row has two or more cells with own text (it reads as
+    columns) and some row has two or more filled cells (own text or a nested
+    table) of which one holds a nested table. Layout shapes stay plain."""
+    tokens = table.tokens
+    text_columns = False
+    nested_columns = False
+    for row in table.rows:
+        texted = 0
+        filled = 0
+        has_block = False
+        for cell in row.cells:
+            span = tokens[cell.start : cell.end]
+            has_text = any(isinstance(token, str) for token in span)
+            has_inner = any(isinstance(token, _Block) for token in span)
+            texted += has_text
+            filled += has_text or has_inner
+            has_block = has_block or has_inner
+        text_columns = text_columns or texted >= 2
+        nested_columns = nested_columns or (filled >= 2 and has_block)
+    return text_columns and nested_columns
+
+
 def _render_table(table: _Table) -> tuple[list[str], bool]:
     """The table's output lines and whether it is a data table.
 
@@ -1417,9 +1473,11 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
     """
     tokens = table.tokens
     if table.has_nested:
+        if _nested_container_reads_as_columns(table):
+            return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
         return _plain_lines(tokens), False
     if len(table.rows) * table.max_row_width > _HTML_GRID_SLOT_LIMIT:
-        # Decided before the grid exists: an oversize grid is never built.
+        # Cheap pre-check; the running count below covers rowspan carry-over.
         return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
 
     # Lay the table out on the HTML grid. ``pending`` carries rowspan cells
@@ -1430,6 +1488,7 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
     prose = False
     is_data = False
     width = 0
+    total_slots = 0  # running grid size; stops the layout at the cap
     for row in table.rows:
         slots: dict[int, str] = {}
         carried: dict[int, tuple[str, int]] = {}
@@ -1437,6 +1496,9 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
             slots[column] = text
             if remaining > 1:
                 carried[column] = (text, remaining - 1)
+        total_slots += len(slots)
+        if total_slots > _HTML_GRID_SLOT_LIMIT:
+            return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
         column = 0
         written = 0
         for cell in row.cells:
@@ -1449,6 +1511,9 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
                 if target not in slots:
                     slots[target] = text
                     written += 1
+                    total_slots += 1
+                    if total_slots > _HTML_GRID_SLOT_LIMIT:
+                        return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
                     if cell.rowspan > 1:
                         carried[target] = (text, cell.rowspan - 1)
             column += cell.colspan

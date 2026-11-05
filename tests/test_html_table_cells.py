@@ -339,13 +339,81 @@ def test_large_table_converts_quickly() -> None:
 
 
 def test_many_rowspan_100_cells_convert_quickly() -> None:
-    # Pins unchanged behaviour on speed: every row adds a rowspan=100 cell.
+    # Speed pin: every row adds a rowspan=100 cell, so about 100 carried
+    # slots live per row. 900 rows stay under the 100,000-slot cap (the real
+    # grid, carried slots included; spec-1d) and still render as a grid.
     rows = "".join(
-        f"<tr><td rowspan=100>a{r}</td><td>b{r}</td></tr>" for r in range(2000)
+        f"<tr><td rowspan=100>a{r}</td><td>b{r}</td></tr>" for r in range(900)
     )
     html = f"<table>{rows}</table>"
     start = time.perf_counter()
     lines = _lines(html)
     elapsed = time.perf_counter() - start
-    assert len(lines) == 2000
+    assert len(lines) == 900
+    assert _warning() not in lines
     assert elapsed < 1.0
+
+
+# --- review round 1 fixes (spec-1d) ----------------------------------------
+
+
+def test_nested_table_in_data_row_warns_and_renders_plain() -> None:
+    # The value 5 sits in a nested table, so it silently loses its column.
+    html = (
+        "<table><tr><th>Item</th><th>Qty</th></tr>"
+        "<tr><td>PEN</td><td><table><tr><td>5</td></tr></table></td></tr></table>"
+    )
+    assert _lines(html) == [_warning(), "Item Qty", "PEN", "5"]
+
+
+def test_two_nested_tables_in_one_row_count_as_two_filled_cells() -> None:
+    html = (
+        "<table><tr><th>H1</th><th>H2</th></tr><tr>"
+        "<td><table><tr><td>L</td></tr></table></td>"
+        "<td><table><tr><td>R</td></tr></table></td>"
+        "</tr></table>"
+    )
+    lines = _lines(html)
+    assert lines[0] == _warning()
+    assert lines.count(_warning()) == 1
+    assert lines[1:] == ["H1 H2", "L", "R"]
+
+
+def test_nested_tables_side_by_side_without_a_text_row_do_not_warn() -> None:
+    # Two-column layout: no row has two text cells, so nothing reads as
+    # columns that a nested table could fall out of.
+    html = (
+        "<table><tr>"
+        "<td><table><tr><td>L</td></tr></table></td>"
+        "<td><table><tr><td>R</td></tr></table></td>"
+        "</tr></table>"
+    )
+    assert _lines(html) == ["L", "R"]
+
+
+def test_layout_container_with_one_filled_cell_per_row_does_not_warn() -> None:
+    # Newsletter shape: each outer row has at most one filled cell (a nested
+    # table counts as filled); the inner data table is delimited on its own.
+    html = (
+        "<table>"
+        "<tr><td></td><td><table><tr><td>A</td><td>B</td></tr></table></td></tr>"
+        "<tr><td>Footer</td><td></td></tr>"
+        "</table>"
+    )
+    assert _lines(html) == ["A | B", "Footer"]
+
+
+def test_rowspan_carry_over_beyond_slot_limit_warns_and_stays_fast() -> None:
+    # rows x max_row_width stays under the pre-check, but rowspan carry-over
+    # widens the real grid to millions of slots.
+    rows = "".join(
+        "<tr>" + "".join(f"<td rowspan=100>r{r}c{c}</td>" for c in range(100)) + "</tr>"
+        for r in range(1000)
+    )
+    html = f"<table>{rows}</table>"
+    start = time.perf_counter()
+    lines = _lines(html)
+    elapsed = time.perf_counter() - start
+    assert lines[0] == _warning()
+    assert " | " not in "\n".join(lines)  # plain fallback, no grid
+    assert elapsed < 2.0
