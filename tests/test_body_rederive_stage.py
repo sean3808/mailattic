@@ -1154,19 +1154,22 @@ def test_recount_equal_to_main_is_complete_exit_zero(
     assert "WARNING" not in capsys.readouterr().out
 
 
-def test_recount_lower_than_main_is_complete_and_warns(
+def test_recount_lower_than_main_leaves_no_ledger_and_exits_two(
     tmp_path, stub_readpst, lspst_overrides, monkeypatch, capsys
 ):
+    # PST really holds 5, main pass yields 4, recount yields 2: the passes
+    # disagree, so the main pass cannot be proven complete.
     pst, db, _, readpst, stage, calls = _recount_world(
         tmp_path, stub_readpst, lspst_overrides, monkeypatch, [_msgs(4), _msgs(2)]
     )
 
-    assert _run(db, stage, readpst) == 0
+    assert _run(db, stage, readpst) == 2
 
     entry = _report(stage)["per_pst"][0]
-    assert entry["ledger"] == "recount"
-    assert entry["ledger_emails"] == 2
-    assert entry["extraction_complete"] is True
+    assert entry["ledger"] == "unavailable"
+    assert entry["ledger_emails"] is None
+    assert "recount 2 < main 4" in entry["ledger_note"]
+    assert entry["extraction_complete"] is None
     out = capsys.readouterr().out
     assert "WARNING" in out
     assert str(pst.resolve()) in out

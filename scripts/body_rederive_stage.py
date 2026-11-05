@@ -63,9 +63,10 @@ fresh temporary directory under ``-work`` (removed afterwards, also on error)
 and its messages are counted without parsing bodies (every ``mbox`` key plus
 ``*.eml`` files). State ``recount``: ``ledger_emails`` = that count,
 ``ledger_note`` = the lspst reason, and the completeness rule above applies to
-it. Main extracted + failures above the recount keeps the PST complete but
-prints a WARNING (the recount stopped early). A recount that cannot run leaves
-the ledger ``unavailable`` (note extended). PSTs with an ``ok`` ledger are not
+it. Main extracted + failures above the recount means the two passes disagree
+(at least one stopped early): the ledger becomes ``unavailable`` with a WARNING,
+so the run exits 2. A recount that cannot run leaves the ledger
+``unavailable`` (note extended). PSTs with an ``ok`` ledger are not
 recounted. Per-PST entries carry ``recount_seconds`` (null when not run).
 
 "Contains a table" is phase 1's own decision: ``_HTMLTextExtractor.
@@ -755,11 +756,18 @@ def _process_pst(
         recount_seconds = round(time.perf_counter() - began, 3)
         main_total = extracted_count + failure_count
         if ledger["state"] == "recount" and main_total > ledger["emails"]:
+            # Two passes disagree: at least one stopped early, and nothing says
+            # the main pass did not. No ledger -> completeness unproven (exit 2).
             print(
                 f"[stage] WARNING: recount of {pst_source} found "
                 f"{ledger['emails']} messages but the main pass yielded "
-                f"{main_total}; the recount itself stopped early (an early stop "
-                "in the main pass cannot be ruled out with certainty)"
+                f"{main_total}; the two passes disagree, completeness cannot be "
+                "proven"
+            )
+            ledger = _ledger(
+                "unavailable",
+                None,
+                f"{ledger['note']}; recount {ledger['emails']} < main {main_total}",
             )
     extraction_complete: bool | None = None
     if ledger is not None and ledger["state"] in ("ok", "recount"):
