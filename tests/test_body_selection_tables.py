@@ -166,8 +166,20 @@ def test_table_at_the_cap_is_still_a_grid() -> None:
     assert lines[0].startswith("r0c0 | r0c1 | ")
 
 
-def test_oversize_table_does_not_count_as_data_table_for_selection() -> None:
-    # Green now only because plain always wins today; it guards the cap rule
-    # once selection switches to HTML for data tables.
+def test_oversize_table_in_html_keeps_a_warning_on_the_plain_body() -> None:
+    # Review round 2: a warned table must not be dropped with the HTML. The
+    # oversize table is warned, and this HTML does not cover the plain text,
+    # so the plain body is kept with the plain-part warning.
     body = _body(_alternative("Plain wins\n", _big_table(1001, 101)))
-    assert body == "Plain wins"
+    assert body == f"{parser.PLAIN_TABLE_FIDELITY_WARNING}\nPlain wins"
+
+
+def test_warned_nested_table_survives_a_plain_alternative() -> None:
+    # Review round 2 repro: the plain part flattens the table; the HTML has a
+    # nested table inside a data row (warned, not a data table).
+    html = (
+        "<table><tr><th>Item</th><th>Qty</th></tr>"
+        "<tr><td>PEN</td><td><table><tr><td>5</td></tr></table></td></tr></table>"
+    )
+    body = _body(_alternative("Item\nQty\nPEN\n5\n", html))
+    assert body.splitlines()[0].startswith("[表格失真提示]")

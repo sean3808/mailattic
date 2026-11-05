@@ -1593,7 +1593,10 @@ class _HTMLTextExtractor(HTMLParser):
         table = self._tables.pop()
         table.close_row()
         lines, is_data = _render_table(table)
-        self.has_data_table = self.has_data_table or is_data
+        # A warned table also decides body selection: the plain alternative
+        # flattened it too, so dropping the HTML would drop the warning (#14).
+        warned = bool(lines) and lines[0] == TABLE_FIDELITY_WARNING
+        self.has_data_table = self.has_data_table or is_data or warned
         if self._tables:
             self._tables[-1].tokens.append(_Block(lines))
         else:
