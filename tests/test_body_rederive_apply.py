@@ -74,6 +74,8 @@ def _stage_row(
 STAGE_REPORT = {
     "mode": "pst",
     "counts": {"pst_unreadable": 2, "excluded_marker": 5},
+    # Default stages carry a complete verdict (apply refuses any other).
+    "verdict": {"complete": True, "reasons": [], "missing_sources": []},
 }
 
 
@@ -82,6 +84,7 @@ def _make_stage(
     rows: list[tuple],
     with_meta: bool = True,
     with_report: bool = True,
+    report: dict | None = None,
 ) -> Path:
     con = sqlite3.connect(path)
     try:
@@ -92,7 +95,7 @@ def _make_stage(
             if with_report:
                 con.execute(
                     "INSERT INTO stage_meta VALUES ('report_json', ?)",
-                    (json.dumps(STAGE_REPORT),),
+                    (json.dumps(STAGE_REPORT if report is None else report),),
                 )
         con.commit()
     finally:
@@ -788,3 +791,85 @@ def test_dry_run_report_and_output_carry_the_stage_counts(world, capsys):
     assert report["stage_report"] == STAGE_REPORT
     assert "[stage] pst_unreadable: 2" in out
     assert "[stage] excluded_marker: 5" in out
+
+
+# ---------------------------------------------------------------------------
+# completeness verdict gate
+# ---------------------------------------------------------------------------
+def _without_verdict() -> dict:
+    return {k: v for k, v in STAGE_REPORT.items() if k != "verdict"}
+
+
+def test_stage_without_verdict_is_refused(tmp_path, capsys):
+    db = tmp_path / "c.db"
+    initialize_database(db)
+    stage = _make_stage(tmp_path / "s.db", [], report=_without_verdict())
+    for extra in ((), ("--confirm",)):
+        code = apply_module.main(
+            ["--stage", str(stage), "--canonical", str(db), *extra]
+        )
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "no completeness verdict" in err
+        assert "rebuild the stage" in err
+    assert not (tmp_path / "s-apply-report-dryrun.json").exists()
+
+
+def test_incomplete_verdict_is_refused_with_reasons(tmp_path, capsys):
+    db = tmp_path / "c.db"
+    initialize_database(db)
+    report = {
+        **STAGE_REPORT,
+        "verdict": {
+            "complete": False,
+            "reasons": ["alpha.pst: extraction incomplete", "second reason"],
+            "missing_sources": [],
+        },
+    }
+    stage = _make_stage(tmp_path / "s.db", [], report=report)
+    for extra in ((), ("--confirm",)):
+        code = apply_module.main(
+            ["--stage", str(stage), "--canonical", str(db), *extra]
+        )
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "alpha.pst: extraction incomplete" in err
+        assert "second reason" in err
+        assert "rebuild the stage" in err
+    assert not (tmp_path / "s-apply-report-dryrun.json").exists()
+
+
+@pytest.mark.parametrize(
+    "verdict", [{"complete": "true"}, {"complete": 1}, {}, "complete", None, []]
+)
+def test_non_bool_or_malformed_verdict_is_refused(tmp_path, capsys, verdict):
+    db = tmp_path / "c.db"
+    initialize_database(db)
+    stage = _make_stage(
+        tmp_path / "s.db", [], report={**STAGE_REPORT, "verdict": verdict}
+    )
+    for extra in ((), ("--confirm",)):
+        code = apply_module.main(
+            ["--stage", str(stage), "--canonical", str(db), *extra]
+        )
+        assert code == 1
+        assert "rebuild the stage" in capsys.readouterr().err
+    assert not (tmp_path / "s-apply-report-dryrun.json").exists()
+
+
+def test_dry_run_prints_verdict_and_missing_sources(tmp_path, capsys):
+    db = tmp_path / "c.db"
+    initialize_database(db)
+    report = {
+        **STAGE_REPORT,
+        "verdict": {
+            "complete": True,
+            "reasons": [],
+            "missing_sources": ["gone-archive.pst"],
+        },
+    }
+    stage = _make_stage(tmp_path / "s.db", [], report=report)
+    assert apply_module.main(["--stage", str(stage), "--canonical", str(db)]) == 0
+    out = capsys.readouterr().out
+    assert "stage verdict: complete" in out
+    assert "gone-archive.pst" in out

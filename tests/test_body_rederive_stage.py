@@ -901,7 +901,8 @@ def test_extraction_short_of_the_ledger_exits_two_and_does_not_pool(
     assert entry["extraction_complete"] is False
     assert entry["ledger_emails"] == 4
     out = capsys.readouterr().out
-    assert "INCOMPLETE" in out
+    assert "VERDICT: NOT complete" in out
+    assert "extraction incomplete" in out
     assert str(pst.resolve()) in out
 
 
@@ -925,7 +926,9 @@ def test_ledger_abort_line_is_unavailable_exits_two_and_warns(
     assert entry["ledger_emails"] is None
     assert "message_store" in entry["ledger_note"]
     assert entry["extraction_complete"] is None
-    assert "WARNING" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "VERDICT: NOT complete" in out
+    assert "no completeness ledger" in out
 
 
 def test_lspst_nonzero_exit_is_unavailable(
@@ -1073,7 +1076,10 @@ def test_missing_pst_has_no_ledger_and_no_warning(tmp_path, stub_readpst, capsys
     entry = _report(stage)["per_pst"][0]
     assert entry["ledger"] == "unavailable"
     assert entry["extraction_complete"] is None
-    assert "WARNING" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+    assert "VERDICT: complete" in out
+    assert str(pst) in out  # listed as a missing source
 
 
 # ---------------------------------------------------------------------------
@@ -1129,8 +1135,8 @@ def test_recount_higher_than_main_is_incomplete_exit_two_not_pooled(
     assert entry["extraction_complete"] is False
     assert isinstance(entry["recount_seconds"], float)
     out = capsys.readouterr().out
-    assert "INCOMPLETE" in out
-    assert "recount found 4" in out
+    assert "VERDICT: NOT complete" in out
+    assert "ledger lists 4" in out
     assert len(calls) == 2
 
 
@@ -1151,7 +1157,9 @@ def test_recount_equal_to_main_is_complete_exit_zero(
     assert counts["extraction_incomplete"] == 0
     assert counts["paired_by_message_id"] == 1  # the fallback ran for the row
     assert set(_staged(stage)) == {paired, extra}
-    assert "WARNING" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+    assert "VERDICT: complete" in out
 
 
 def test_recount_lower_than_main_leaves_no_ledger_and_exits_two(
@@ -1197,7 +1205,9 @@ def test_recount_that_fails_leaves_ledger_unavailable_and_warns(
     assert "second message_store" in entry["ledger_note"]
     assert "recount failed" in entry["ledger_note"]
     assert entry["extraction_complete"] is None
-    assert "WARNING" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "VERDICT: NOT complete" in out
+    assert "no completeness ledger" in out
 
 
 def test_ok_ledger_is_not_recounted(tmp_path, stub_readpst, monkeypatch):
@@ -1931,3 +1941,156 @@ def test_imap_degraded_rewrites_are_kept_and_good_rewrite_still_staged(
         {"id": mid1, "reason": "mojibake"},
         {"id": mid3, "reason": "base64"},
     ]
+
+
+# ---------------------------------------------------------------------------
+# Completeness verdict: one whitelist-shaped verdict, persisted, drives exit code
+# ---------------------------------------------------------------------------
+def _pst_entry(**over) -> dict:
+    entry = {
+        "pst_source": "alpha.pst",
+        "ledger": "ok",
+        "ledger_emails": 2,
+        "ledger_note": None,
+        "extraction_complete": True,
+        "extracted_messages": 2,
+    }
+    entry.update(over)
+    return entry
+
+
+def _pst_report(entries=None, **count_over) -> dict:
+    counts = {"pst_unreadable": 0}
+    counts.update(count_over)
+    return {
+        "mode": "pst",
+        "counts": counts,
+        "per_pst": [_pst_entry()] if entries is None else entries,
+    }
+
+
+def _imap_report(**over) -> dict:
+    report = {
+        "mode": "imap",
+        "aborted": False,
+        "counts": {"fetch_error": 0, "select_failed": 0},
+    }
+    report.update(over)
+    return report
+
+
+def test_verdict_complete_pst_and_recount_ledger():
+    verdict = stage_module._verdict(
+        _pst_report([_pst_entry(), _pst_entry(pst_source="b.pst", ledger="recount")])
+    )
+    assert verdict == {"complete": True, "reasons": [], "missing_sources": []}
+
+
+@pytest.mark.parametrize(
+    ("report", "needle"),
+    [
+        (_pst_report(pst_unreadable=1), "pst_unreadable"),
+        (_pst_report(pst_unreadable=None), "pst_unreadable"),
+        (
+            _pst_report([_pst_entry(ledger="unavailable", ledger_note="lspst exited")]),
+            "no completeness ledger",
+        ),
+        (
+            _pst_report([_pst_entry(extraction_complete=False)]),
+            "extraction incomplete",
+        ),
+        (
+            _pst_report([_pst_entry(extraction_complete=None)]),
+            "extraction incomplete",
+        ),
+        (_pst_report([_pst_entry(extraction_complete="yes")]), "extraction incomplete"),
+        (_pst_report([_pst_entry(ledger=None)]), "no completeness ledger"),
+        (_pst_report(["not a dict"]), "malformed per_pst entry"),
+        ({"mode": "pst", "counts": {"pst_unreadable": 0}}, "per_pst"),
+        ({"mode": "pst", "per_pst": []}, "counts"),
+        (_imap_report(aborted=True), "aborted"),
+        (_imap_report(aborted=None), "aborted"),
+        (_imap_report(counts={"fetch_error": 1, "select_failed": 0}), "fetch_error"),
+        (_imap_report(counts={"fetch_error": 0, "select_failed": 3}), "select_failed"),
+        (_imap_report(counts={"select_failed": 0}), "fetch_error"),
+        ({"mode": "ldap", "counts": {}}, "unknown report mode"),
+        ({"counts": {}}, "unknown report mode"),
+    ],
+)
+def test_verdict_each_failing_condition_alone_is_not_complete(report, needle):
+    verdict = stage_module._verdict(report)
+    assert verdict["complete"] is False
+    assert any(needle in reason for reason in verdict["reasons"]), verdict
+
+
+def test_verdict_missing_pst_is_allowed_and_listed_not_a_reason():
+    missing = _pst_entry(
+        pst_source="gone.pst",
+        ledger="unavailable",
+        ledger_note=stage_module._LEDGER_NOTE_PST_MISSING,
+        extraction_complete=None,
+    )
+    verdict = stage_module._verdict(_pst_report([_pst_entry(), missing]))
+    assert verdict == {
+        "complete": True,
+        "reasons": [],
+        "missing_sources": ["gone.pst"],
+    }
+
+
+def test_verdict_missing_pst_does_not_excuse_another_incomplete_pst():
+    missing = _pst_entry(
+        pst_source="gone.pst",
+        ledger="unavailable",
+        ledger_note=stage_module._LEDGER_NOTE_PST_MISSING,
+        extraction_complete=None,
+    )
+    verdict = stage_module._verdict(
+        _pst_report([missing, _pst_entry(extraction_complete=False)])
+    )
+    assert verdict["complete"] is False
+    assert verdict["missing_sources"] == ["gone.pst"]
+
+
+def test_verdict_complete_imap():
+    assert stage_module._verdict(_imap_report())["complete"] is True
+
+
+def test_verdict_is_persisted_in_report_file_and_stage_meta(
+    tmp_path, stub_readpst, capsys
+):
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=2, rows=2)
+    assert _run(db, stage, readpst) == 0
+    expected = {"complete": True, "reasons": [], "missing_sources": []}
+    assert _report(stage)["verdict"] == expected
+    con = sqlite3.connect(stage)
+    try:
+        stored = con.execute(
+            "SELECT value FROM stage_meta WHERE key = 'report_json'"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert json.loads(stored)["verdict"] == expected
+    assert "VERDICT: complete" in capsys.readouterr().out
+
+
+def test_exit_code_comes_from_the_persisted_verdict(
+    tmp_path, stub_readpst, monkeypatch, capsys
+):
+    # Everything else is clean: only the verdict says "not complete", and the
+    # exit code must follow it (and the persisted report must carry it).
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=2, rows=2)
+    monkeypatch.setattr(
+        stage_module,
+        "_verdict",
+        lambda report: {
+            "complete": False,
+            "reasons": ["synthetic reason"],
+            "missing_sources": [],
+        },
+    )
+    assert _run(db, stage, readpst) == 2
+    assert _report(stage)["verdict"]["reasons"] == ["synthetic reason"]
+    out = capsys.readouterr().out
+    assert "VERDICT: NOT complete" in out
+    assert "synthetic reason" in out

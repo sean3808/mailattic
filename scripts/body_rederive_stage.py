@@ -126,18 +126,25 @@ removed afterwards) and a JSON report ``<stage stem>-report.json`` next to the
 stage. A stage that already exists is refused unless ``--overwrite`` is given.
 A stage holds one source kind (``stage_meta.source_kind``).
 
+Completeness verdict: ``_verdict(report)`` computes ONE whitelist-shaped verdict
+(``{"complete": bool, "reasons": [...], "missing_sources": [...]}``), stored as
+``report["verdict"]`` (in ``stage_meta.report_json`` and the sidecar report).
+``complete`` is True only when: pst -- no ``pst_unreadable`` and every PST has a
+proven ledger (``ok`` / ``recount``) with ``extraction_complete`` True (a
+missing PST file is allowed and listed in ``missing_sources``); imap -- not
+aborted, no ``fetch_error``, no ``select_failed``. Unknown mode / missing keys
+-> not complete. The exit code derives from it alone, and apply refuses any
+stage whose verdict is not exactly ``complete: True``.
+
 Exit codes:
-    0 — stage built, report written
+    0 — stage built, report written, verdict complete
     1 — refused (stage exists without --overwrite, stage is the canonical DB,
         canonical DB missing), readpst could not be located, lspst could not
         be located (pst; refused before the previous stage is cleared), or the
         IMAP settings / connection could not be established
-    2 — imap run stopped part-way (connection lost) or had fetch errors; pst
-        run with an unreadable PST (``pst_unreadable``) or an incomplete
-        extraction (``extraction_incomplete``: rerun; the ledger may be lspst's
-        or the recount's). A PST whose ledger stays ``unavailable`` (lspst and
-        recount both failed) also exits 2: completeness unknown is not success
-        (a missing PST file is reported as ``pst_missing`` and keeps exit 0)
+    2 — stage built but the verdict is NOT complete (connection lost, fetch /
+        select errors, unreadable PST, incomplete extraction, or no
+        completeness ledger): rerun the stage; apply will refuse it
 """
 
 from __future__ import annotations
@@ -921,6 +928,7 @@ def build_pst_stage(
                 "degraded_sample_ids": samples.items,
                 "per_pst": per_pst,
             }
+            report["verdict"] = _verdict(report)
             # The report travels with the stage (same commit as the other
             # stage_meta keys) so apply can show the exclusion counts even if
             # the sidecar report file is lost.
@@ -1170,6 +1178,7 @@ def _build_imap_stage(
                 "degraded_sample_ids": samples.items,
                 "per_folder": per_folder,
             }
+            report["verdict"] = _verdict(report)
             stage_con.executemany(
                 "INSERT INTO stage_meta (key, value) VALUES (?, ?)",
                 [
@@ -1186,6 +1195,67 @@ def _build_imap_stage(
         client.close()
 
     return report
+
+
+def _verdict(report: dict) -> dict:
+    """The ONE completeness verdict of a stage (whitelist: ``complete`` is True
+    only when every condition holds; anything unexpected is NOT complete).
+
+    pst: no unreadable PST, and every per-PST entry has a proven ledger
+    (``ok`` / ``recount``) with ``extraction_complete`` exactly True -- or is a
+    missing PST file (informational, listed in ``missing_sources``).
+    imap: not aborted, no ``fetch_error``, no ``select_failed``.
+
+    Persisted in the report, drives the exit code, and apply refuses a stage
+    whose verdict is not exactly ``complete: True``."""
+    reasons: list[str] = []
+    missing_sources: list[str] = []
+    mode = report.get("mode")
+    counts = report.get("counts")
+    if not isinstance(counts, dict):
+        reasons.append("report has no counts")
+        counts = {}
+    if mode == "pst":
+        if counts.get("pst_unreadable") != 0:
+            reasons.append(
+                f"pst_unreadable is {counts.get('pst_unreadable')!r}, expected 0: "
+                "a PST could not be read and its rows were not examined"
+            )
+        entries = report.get("per_pst")
+        if not isinstance(entries, list):
+            reasons.append("report has no per_pst list")
+            entries = []
+        for entry in entries:
+            name = entry.get("pst_source") if isinstance(entry, dict) else None
+            if not isinstance(entry, dict):
+                reasons.append(f"malformed per_pst entry: {entry!r}")
+            elif entry.get("ledger_note") == _LEDGER_NOTE_PST_MISSING:
+                missing_sources.append(str(name))
+            elif entry.get("ledger") not in ("ok", "recount"):
+                reasons.append(
+                    f"{name}: no completeness ledger (ledger={entry.get('ledger')!r}, "
+                    f"note={entry.get('ledger_note')!r}); completeness cannot be proven"
+                )
+            elif entry.get("extraction_complete") is not True:
+                reasons.append(
+                    f"{name}: extraction incomplete (extracted "
+                    f"{entry.get('extracted_messages')!r}, ledger lists "
+                    f"{entry.get('ledger_emails')!r}, "
+                    f"extraction_complete={entry.get('extraction_complete')!r})"
+                )
+    elif mode == "imap":
+        if report.get("aborted") is not False:
+            reasons.append("imap run aborted (connection lost)")
+        for key in ("fetch_error", "select_failed"):
+            if counts.get(key) != 0:
+                reasons.append(f"{key} is {counts.get(key)!r}, expected 0")
+    else:
+        reasons.append(f"unknown report mode {mode!r}")
+    return {
+        "complete": not reasons,
+        "reasons": reasons,
+        "missing_sources": missing_sources,
+    }
 
 
 def _print_summary(report: dict, report_path: Path) -> None:
@@ -1211,33 +1281,15 @@ def _print_summary(report: dict, report_path: Path) -> None:
             f"  gone_from_server (not_on_server + folder_missing): "
             f"{report['gone_from_server']}"
         )
-        if report["aborted"]:
-            print("[stage] ABORTED: connection lost; remaining rows are fetch_error")
-    if report["mode"] == "pst":
-        for entry in report["per_pst"]:
-            if entry["counts"]["pst_unreadable"]:
-                print(
-                    f"[stage] UNREADABLE: {entry['pst_source']}; its rows were "
-                    "not examined"
-                )
-            elif entry["extraction_complete"] is False:
-                source_word = (
-                    "recount found" if entry["ledger"] == "recount" else "lspst lists"
-                )
-                print(
-                    f"[stage] INCOMPLETE extraction: {entry['pst_source']} "
-                    f"(extracted {entry['extracted_messages']}, "
-                    f"{source_word} {entry['ledger_emails']}); rerun the stage"
-                )
-            elif (
-                entry["ledger"] == "unavailable"
-                and entry["ledger_note"] != _LEDGER_NOTE_PST_MISSING
-            ):
-                print(
-                    f"[stage] WARNING: no completeness ledger for "
-                    f"{entry['pst_source']} ({entry['ledger_note']}); "
-                    "completeness cannot be proven, rerun the stage"
-                )
+    verdict = report["verdict"]
+    if verdict["complete"]:
+        print("[stage] VERDICT: complete")
+    else:
+        print("[stage] VERDICT: NOT complete — rerun the stage")
+        for reason in verdict["reasons"]:
+            print(f"[stage]   reason: {reason}")
+    for source in verdict["missing_sources"]:
+        print(f"[stage]   missing source (file not found): {source}")
     print(f"[stage] stage database: {report['stage']}")
     print(f"[stage] report: {report_path}")
 
@@ -1362,25 +1414,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     _print_summary(report, report_path)
-    if report["mode"] == "imap":
-        counts = report["counts"]
-        if report["aborted"] or counts["fetch_error"] or counts["select_failed"]:
-            return 2
-    elif report["counts"]["pst_unreadable"] or any(
-        e["extraction_complete"] is False
-        # No ledger at all (lspst and the recount both failed): completeness is
-        # unknown, which is not success either. A missing PST file has nothing
-        # to extract and is reported as pst_missing instead.
-        or (
-            e["ledger"] == "unavailable"
-            and e["ledger_note"] != _LEDGER_NOTE_PST_MISSING
-        )
-        for e in report["per_pst"]
-    ):
-        # An unreadable, incompletely extracted or unverifiable PST leaves rows
-        # unexamined or unproven; never report success.
-        return 2
-    return 0
+    # The persisted verdict is the only source of the exit code.
+    return 0 if report["verdict"]["complete"] else 2
 
 
 if __name__ == "__main__":

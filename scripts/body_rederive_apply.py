@@ -24,6 +24,13 @@ stage's ``pre_image_sha256``. Rows failing a check are excluded and counted
 ``drifted``, ``not_rewrite``) and are never written. A stage built before the
 ``expected_message_id`` column existed is refused: rebuild it.
 
+Completeness verdict: the stage builder persists ``verdict`` in the stage's
+report (``stage_meta.report_json``). Dry-run and ``--confirm`` both refuse a
+stage whose report lacks it or whose ``verdict.complete`` is not exactly
+``True`` (missing / malformed / non-bool fail closed; the message lists the
+reasons) -- rebuild the stage. There is no override. ``--restore`` reads a
+sidecar, not a stage, and is unaffected.
+
 Usage:
     uv run python scripts/body_rederive_apply.py --stage <stage.db>
         [--canonical <path>]                       # dry-run (default)
@@ -66,8 +73,8 @@ Exit codes:
          restore completed and reconciled (a confirm / restore report that
          cannot be written only warns: the canonical write is already done and
          the sidecar is the record, so exit 1 would falsely claim a rollback)
-    1 -- refused (preflight, dry-run binding, dry-run report not writable,
-         sidecar, bad arguments) or rolled
+    1 -- refused (preflight incl. a stage without a complete verdict, dry-run
+         binding, dry-run report not writable, sidecar, bad arguments) or rolled
          back (drift, reconciliation mismatch, any exception), or the dry-run
          saw the canonical file change while reading. Exit 1 from a confirmed
          run always means the canonical database was NOT left modified.
@@ -210,14 +217,32 @@ def _check_stage(stage: Path) -> None:
                 "-- rebuild it (its excluded/failed counts would be unreviewable)"
             )
         try:
-            json.loads(stored[0])
+            stage_report = json.loads(stored[0])
         except ValueError as exc:
             raise ApplyRefused(
                 f"stage {stage} has an unreadable stage_meta.report_json "
                 f"({exc!r}); stage incomplete -- rebuild it"
             ) from exc
+        _require_complete_verdict(stage, stage_report)
     finally:
         con.close()
+
+
+def _require_complete_verdict(stage: Path, report: object) -> None:
+    """Fail closed: the stage's persisted verdict must be exactly
+    ``complete: True``; missing / malformed / non-bool all refuse."""
+    verdict = report.get("verdict") if isinstance(report, dict) else None
+    if not isinstance(verdict, dict) or verdict.get("complete") is not True:
+        reasons = verdict.get("reasons") if isinstance(verdict, dict) else None
+        if isinstance(reasons, list) and reasons:
+            detail = "; ".join(str(r) for r in reasons)
+        elif verdict is None:
+            detail = "the stage report carries no completeness verdict"
+        else:
+            detail = f"the completeness verdict is not a valid one: {verdict!r}"
+        raise ApplyRefused(
+            f"stage {stage} is not proven complete ({detail}); rebuild the stage"
+        )
 
 
 def _stage_report(stage: Path) -> dict:
@@ -392,6 +417,10 @@ def run_dry_run(canonical: Path, stage: Path) -> int:
         )
         return 1
     print(f"[dry-run] plan_digest: {report['plan_digest']}")
+    # _check_stage already refused anything but a complete verdict.
+    print("[dry-run] stage verdict: complete")
+    for source in report["stage_report"]["verdict"].get("missing_sources", []):
+        print(f"[dry-run] stage missing source (file not found): {source}")
     _print_counts("dry-run", report["counts"])
     stage_counts = report["stage_report"].get("counts", {})
     print(
