@@ -575,7 +575,7 @@ def test_restore_refuses_sidecar_of_another_canonical(world, capsys, tmp_path):
         ["--restore", str(world.sidecar), "--canonical", str(other), "--confirm"]
     )
     assert code == 1
-    assert "not" in capsys.readouterr().err
+    assert "sidecar was written for canonical" in capsys.readouterr().err
 
 
 def test_restore_failure_rolls_back(world, capsys, monkeypatch):
