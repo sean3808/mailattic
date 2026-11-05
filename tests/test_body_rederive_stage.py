@@ -16,6 +16,7 @@ All data is synthetic (example.test).
 from __future__ import annotations
 
 import hashlib
+import imaplib
 import json
 import mailbox
 import sqlite3
@@ -32,6 +33,8 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import body_rederive_stage as stage_module  # noqa: E402
 
+from mailattic.imap_native import NativeImapClient  # noqa: E402
+from mailattic.mutf7 import encode_mutf7  # noqa: E402
 from mailattic.parser import ReadpstParser  # noqa: E402
 from mailattic.storage import connect_database, initialize_database  # noqa: E402
 
@@ -350,3 +353,455 @@ def test_locator_not_found_and_pst_filter(tmp_path, stub_readpst):
     assert report["rows_in_scope"] == 2
     assert report["counts"]["locator_not_found"] == 1
     assert report["counts"]["rewrite"] == 1
+
+
+# ---------------------------------------------------------------------------
+# imap subcommand. The IMAP connection is a recording fake injected under
+# ``NativeImapClient``; everything after the wire (LIST parsing, wire-name
+# mapping, ``fetch_rfc822``, MIME parse, ``_extract_body_text``) is production
+# code. No network. Data is synthetic (example.test).
+# ---------------------------------------------------------------------------
+
+_READ_ONLY_COMMANDS = {"LIST", "STATUS", "SELECT", "UID FETCH", "CLOSE", "LOGOUT"}
+
+
+class FakeImapConnection:
+    """imaplib-shaped fake. ``folders`` maps wire name -> {uid: rfc822 bytes}."""
+
+    def __init__(
+        self,
+        folders: dict[str, dict[int, bytes]],
+        uidvalidity: int = 7,
+        drop_on_fetch_number: int | None = None,
+    ) -> None:
+        self.folders = folders
+        self.uidvalidity = uidvalidity
+        self.drop_on_fetch_number = drop_on_fetch_number
+        self.commands: list[tuple] = []
+        self.selected: str | None = None
+        self.fetches = 0
+
+    def list(self):
+        self.commands.append(("LIST",))
+        return "OK", [f'() "/" "{wire}"'.encode() for wire in self.folders]
+
+    def status(self, quoted, what):
+        self.commands.append(("STATUS", quoted, what))
+        return "OK", [f"{quoted} (UIDVALIDITY {self.uidvalidity})".encode()]
+
+    def select(self, quoted, readonly=False):
+        self.commands.append(("SELECT", quoted, readonly))
+        self.selected = quoted.strip('"')
+        return "OK", [b"1"]
+
+    def uid(self, command, uid, what):
+        self.commands.append((f"UID {command}", uid, what))
+        self.fetches += 1
+        if self.drop_on_fetch_number == self.fetches:
+            raise imaplib.IMAP4.abort("connection dropped")
+        assert self.selected is not None
+        body = self.folders[self.selected].get(int(uid))
+        if body is None:
+            return "OK", [None]
+        return "OK", [(f"1 (UID {uid} BODY[] {{{len(body)}}}".encode(), body), b")"]
+
+    def close(self):
+        self.commands.append(("CLOSE",))
+
+    def logout(self):
+        self.commands.append(("LOGOUT",))
+
+    def names(self) -> list[str]:
+        return [c[0] for c in self.commands]
+
+
+def _eml(message: EmailMessage) -> bytes:
+    return message.as_bytes()
+
+
+def _maildir_row(locator: str, message_id: str | None, body: str, mode="maildir"):
+    return {
+        "locator": locator,
+        "message_id": message_id,
+        "body": body,
+        "mode": mode,
+    }
+
+
+def _imap_canonical(tmp_path: Path, rows: list[dict]) -> tuple[Path, list[int]]:
+    db = initialize_database(tmp_path / "canonical.db")
+    con = connect_database(db)
+    ids = []
+    try:
+        for index, row in enumerate(rows):
+            cur = con.execute(
+                "INSERT INTO messages (subject, body_text, message_id, pst_source, "
+                "folder_path, logical_locator, source_input_mode, dedup_key) "
+                "VALUES ('s', ?, ?, 'maildir-placeholder', 'f', ?, ?, ?)",
+                (
+                    row["body"],
+                    row["message_id"],
+                    row["locator"],
+                    row["mode"],
+                    f"imap-test:{index}",
+                ),
+            )
+            assert cur.lastrowid is not None
+            ids.append(cur.lastrowid)
+        con.commit()
+    finally:
+        con.close()
+    return db, ids
+
+
+@pytest.fixture
+def fake_imap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Returns (env_file, install) where install(fake) routes the script's
+    client construction to a NativeImapClient wrapping *fake*."""
+    env_file = tmp_path / "placeholder.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "IMAP_HOST=imap.example.test",
+                "IMAP_PORT=993",
+                "IMAP_USER=user@example.test",
+                "IMAP_PASSWORD=placeholder",
+                "IMAP_ACCOUNT_NAME=example-account",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def install(fake: FakeImapConnection) -> None:
+        monkeypatch.setattr(
+            stage_module,
+            "NativeImapClient",
+            lambda env: NativeImapClient(env, _connection=fake),
+        )
+
+    return env_file, install
+
+
+def _run_imap(db: Path, stage: Path, env_file: Path, *extra: str) -> int:
+    return stage_module.main(
+        [
+            "imap",
+            "--database",
+            str(db),
+            "--stage",
+            str(stage),
+            "--env-file",
+            str(env_file),
+            *extra,
+        ]
+    )
+
+
+def test_imap_table_row_is_refetched_and_staged_as_rewrite(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    fake = FakeImapConnection(
+        {"INBOX": {11: _eml(_table_message("<i1@example.test>"))}}
+    )
+    install(fake)
+    db, (mid,) = _imap_canonical(
+        tmp_path,
+        [_maildir_row("INBOX/new/uid-11.eml", "<i1@example.test>", PLAIN_FLAT)],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    staged = _staged(stage)
+    assert set(staged) == {mid}
+    assert staged[mid]["new_body_text"] == TABLE_BODY
+    assert staged[mid]["status"] == "rewrite"
+    assert staged[mid]["source_kind"] == "imap"
+    assert (
+        staged[mid]["pre_image_sha256"]
+        == hashlib.sha256(PLAIN_FLAT.encode("utf-8")).hexdigest()
+    )
+    con = sqlite3.connect(stage)
+    try:
+        meta = dict(con.execute("SELECT key, value FROM stage_meta"))
+    finally:
+        con.close()
+    assert meta["source_kind"] == "imap"
+    report = _report(stage)
+    assert report["counts"]["rewrite"] == 1
+    assert report["per_folder"][0]["folder"] == "INBOX"
+
+
+def test_imap_identical_body_is_unchanged_and_not_staged(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    install(
+        FakeImapConnection({"INBOX": {5: _eml(_plain_message("<i1@example.test>"))}})
+    )
+    db, _ = _imap_canonical(
+        tmp_path,
+        [_maildir_row("INBOX/new/uid-5.eml", "<i1@example.test>", "Hello there")],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    assert _staged(stage) == {}
+    counts = _report(stage)["counts"]
+    assert counts["unchanged"] == 1
+    assert counts["rewrite"] == 0
+
+
+def test_imap_message_id_mismatch_from_uid_reuse_is_not_staged(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    # The server's UID 5 now holds a different message (UIDVALIDITY reuse).
+    install(
+        FakeImapConnection({"INBOX": {5: _eml(_table_message("<other@example.test>"))}})
+    )
+    db, _ = _imap_canonical(
+        tmp_path,
+        [_maildir_row("INBOX/new/uid-5.eml", "<i1@example.test>", PLAIN_FLAT)],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    assert _staged(stage) == {}
+    counts = _report(stage)["counts"]
+    assert counts["message_id_mismatch"] == 1
+    assert counts["rewrite"] == 0
+
+
+def test_imap_uid_gone_from_server_is_not_on_server(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    install(FakeImapConnection({"INBOX": {}}))
+    db, _ = _imap_canonical(
+        tmp_path,
+        [_maildir_row("INBOX/new/uid-5.eml", "<i1@example.test>", PLAIN_FLAT)],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    assert _staged(stage) == {}
+    report = _report(stage)
+    assert report["counts"]["not_on_server"] == 1
+    assert report["gone_from_server"] == 1
+
+
+def test_imap_folder_gone_from_server_counts_all_its_rows(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    fake = FakeImapConnection({"INBOX": {}})
+    install(fake)
+    db, _ = _imap_canonical(
+        tmp_path,
+        [
+            _maildir_row("Old/new/uid-1.eml", "<a@example.test>", "x"),
+            _maildir_row("Old/new/uid-2.eml", "<b@example.test>", "y"),
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    report = _report(stage)
+    assert report["counts"]["folder_missing"] == 2
+    assert report["gone_from_server"] == 2
+    assert "SELECT" not in fake.names()
+    assert "UID FETCH" not in fake.names()
+
+
+def test_imap_old_mbsync_locator_is_unparsable_and_never_fetched(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    fake = FakeImapConnection({"INBOX": {1: _eml(_table_message("<i1@example.test>"))}})
+    install(fake)
+    db, _ = _imap_canonical(
+        tmp_path,
+        [
+            _maildir_row(
+                "INBOX/new/1700000000.M1P2.host,U=1:2,S", "<i1@example.test>", "x"
+            )
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    assert _report(stage)["counts"]["locator_unparsable"] == 1
+    assert _staged(stage) == {}
+    assert "UID FETCH" not in fake.names()
+    assert "SELECT" not in fake.names()
+
+
+def test_imap_non_ascii_folder_resolved_through_list_wire_name(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    display = "客戶"
+    wire = encode_mutf7(display)
+    assert wire != display
+    fake = FakeImapConnection({wire: {3: _eml(_table_message("<c1@example.test>"))}})
+    install(fake)
+    db, (mid,) = _imap_canonical(
+        tmp_path,
+        [_maildir_row(f"{display}/new/uid-3.eml", "<c1@example.test>", PLAIN_FLAT)],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    assert set(_staged(stage)) == {mid}
+    selects = [c for c in fake.commands if c[0] == "SELECT"]
+    assert selects == [("SELECT", f'"{wire}"', True)]
+    assert _report(stage)["per_folder"][0]["wire_name"] == wire
+
+
+def test_imap_only_read_only_commands_are_sent(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    fake = FakeImapConnection(
+        {
+            "INBOX": {1: _eml(_table_message("<i1@example.test>"))},
+            "Sent": {2: _eml(_plain_message("<i2@example.test>"))},
+        }
+    )
+    install(fake)
+    db, _ = _imap_canonical(
+        tmp_path,
+        [
+            _maildir_row("INBOX/new/uid-1.eml", "<i1@example.test>", PLAIN_FLAT),
+            _maildir_row("Sent/new/uid-2.v7.eml", "<i2@example.test>", "Hello there"),
+            _maildir_row("Sent/new/uid-9.eml", "<i9@example.test>", "gone"),
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    assert set(fake.names()) <= _READ_ONLY_COMMANDS
+    selects = [c for c in fake.commands if c[0] == "SELECT"]
+    assert len(selects) == 2
+    assert all(c[2] is True for c in selects)
+    fetches = [c for c in fake.commands if c[0] == "UID FETCH"]
+    assert len(fetches) == 3
+    assert all(c[2] == "(BODY.PEEK[])" for c in fetches)
+    assert fake.names()[-2:] == ["CLOSE", "LOGOUT"]
+
+
+def test_imap_canonical_bytes_unchanged_and_other_modes_out_of_scope(
+    tmp_path, fake_imap
+):
+    env_file, install = fake_imap
+    install(
+        FakeImapConnection({"INBOX": {1: _eml(_table_message("<i1@example.test>"))}})
+    )
+    db, _ = _imap_canonical(
+        tmp_path,
+        [
+            _maildir_row("INBOX/new/uid-1.eml", "<i1@example.test>", PLAIN_FLAT),
+            _maildir_row(
+                "INBOX/new/uid-1.eml", "<a@example.test>", "a", mode="archive"
+            ),
+            _maildir_row("Out/new/uid-2.eml", "<o@example.test>", "o", mode="outbound"),
+            _maildir_row("Inbox/mbox#1", "<p@example.test>", "p", mode="file"),
+        ],
+    )
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    report = _report(stage)
+    assert report["rows_in_scope"] == 1
+    assert report["counts"]["rewrite"] == 1
+
+
+def test_imap_uidvalidity_change_is_counted_but_message_id_decides(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    fake = FakeImapConnection(
+        {"INBOX": {4: _eml(_table_message("<i1@example.test>"))}}, uidvalidity=99
+    )
+    install(fake)
+    db, (mid,) = _imap_canonical(
+        tmp_path,
+        [_maildir_row("INBOX/new/uid-4.v7.eml", "<i1@example.test>", PLAIN_FLAT)],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    counts = _report(stage)["counts"]
+    assert counts["uidvalidity_changed"] == 1
+    assert counts["rewrite"] == 1
+    assert set(_staged(stage)) == {mid}
+
+
+def test_imap_row_without_message_id_is_never_fetched_or_staged(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    fake = FakeImapConnection({"INBOX": {1: _eml(_table_message(None))}})
+    install(fake)
+    db, _ = _imap_canonical(
+        tmp_path, [_maildir_row("INBOX/new/uid-1.eml", None, PLAIN_FLAT)]
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    assert _staged(stage) == {}
+    assert _report(stage)["counts"]["no_message_id"] == 1
+    assert "UID FETCH" not in fake.names()
+
+
+def test_imap_lost_connection_commits_staged_rows_and_exits_nonzero(
+    tmp_path, fake_imap
+):
+    env_file, install = fake_imap
+    messages = {
+        uid: _eml(_table_message(f"<i{uid}@example.test>")) for uid in (1, 2, 3)
+    }
+    fake = FakeImapConnection({"INBOX": messages}, drop_on_fetch_number=2)
+    install(fake)
+    db, ids = _imap_canonical(
+        tmp_path,
+        [
+            _maildir_row(
+                f"INBOX/new/uid-{uid}.eml", f"<i{uid}@example.test>", PLAIN_FLAT
+            )
+            for uid in (1, 2, 3)
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 2
+
+    assert set(_staged(stage)) == {ids[0]}
+    report = _report(stage)
+    assert report["aborted"] is True
+    assert report["counts"]["fetch_error"] == 2
+    assert "LOGOUT" in fake.names()
+
+
+def test_imap_existing_stage_refused_and_limit_applies(tmp_path, fake_imap):
+    env_file, install = fake_imap
+    install(
+        FakeImapConnection(
+            {
+                "INBOX": {
+                    1: _eml(_table_message("<i1@example.test>")),
+                    2: _eml(_table_message("<i2@example.test>")),
+                }
+            }
+        )
+    )
+    db, _ = _imap_canonical(
+        tmp_path,
+        [
+            _maildir_row("INBOX/new/uid-1.eml", "<i1@example.test>", PLAIN_FLAT),
+            _maildir_row("INBOX/new/uid-2.eml", "<i2@example.test>", PLAIN_FLAT),
+        ],
+    )
+    stage = tmp_path / "stage.db"
+    stage.write_bytes(b"precious")
+
+    assert _run_imap(db, stage, env_file) == 1
+    assert stage.read_bytes() == b"precious"
+
+    assert _run_imap(db, stage, env_file, "--overwrite", "--limit", "1") == 0
+    assert len(_staged(stage)) == 1
+    assert _report(stage)["rows_in_scope"] == 1
