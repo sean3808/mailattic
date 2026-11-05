@@ -1369,6 +1369,7 @@ class _Row:
         self.start = start
         self.end = start
         self.cells: list[_Cell] = []
+        self.group_start = False  # first row of a thead/tbody/tfoot
 
 
 class _Table:
@@ -1382,6 +1383,7 @@ class _Table:
         self.has_nested = False
         self.clamped = False  # a colspan/rowspan above the limit was cut
         self.max_row_width = 0  # widest row by summed colspans, for the slot cap
+        self.new_group = False  # the next row opens a new row group
 
     def close_cell(self) -> None:
         if self.cell is not None:
@@ -1401,6 +1403,13 @@ class _Table:
     def open_row(self) -> None:
         self.close_row()
         self.row = _Row(len(self.tokens))
+        self.row.group_start = self.new_group
+        self.new_group = False
+
+    def start_group(self) -> None:
+        """A thead/tbody/tfoot boundary: rowspans do not cross it."""
+        self.close_row()
+        self.new_group = True
 
     def open_cell(self, attrs: Any) -> None:
         if self.row is None:
@@ -1476,7 +1485,9 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
         if _nested_container_reads_as_columns(table):
             return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
         return _plain_lines(tokens), False
-    if len(table.rows) * table.max_row_width > _HTML_GRID_SLOT_LIMIT:
+    if sum(1 for row in table.rows if row.cells) * table.max_row_width > (
+        _HTML_GRID_SLOT_LIMIT
+    ):
         # Cheap pre-check; the running count below covers rowspan carry-over.
         return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
 
@@ -1491,6 +1502,8 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
     width = 0
     total_slots = 0  # running grid size; stops the layout at the cap
     for row in table.rows:
+        if row.group_start:
+            pending = {}  # a rowspan ends with its row group
         slots: dict[int, str] = {}
         carried: dict[int, tuple[str, int]] = {}
         for column, (text, remaining) in pending.items():
@@ -1637,8 +1650,10 @@ class _HTMLTextExtractor(HTMLParser):
         if self._tables:
             if tag == "table":
                 self._tables[-1].has_nested = True
-            elif tag == "tr" or tag in _HTML_ROW_GROUP_TAGS:
+            elif tag == "tr":
                 self._tables[-1].close_row()
+            elif tag in _HTML_ROW_GROUP_TAGS:
+                self._tables[-1].start_group()
         if tag in _HTML_BLOCK_TAGS:
             self._end_line()
         if tag == "table":
@@ -1660,9 +1675,12 @@ class _HTMLTextExtractor(HTMLParser):
         if tag in _HTML_CELL_TAGS:
             if self._tables:
                 self._tables[-1].close_cell()
-        elif tag == "tr" or tag in _HTML_ROW_GROUP_TAGS:
+        elif tag == "tr":
             if self._tables:
                 self._tables[-1].close_row()
+        elif tag in _HTML_ROW_GROUP_TAGS:
+            if self._tables:
+                self._tables[-1].start_group()
         elif tag == "table" and self._tables:
             self._finish_table()
         if tag in _HTML_BLOCK_TAGS:

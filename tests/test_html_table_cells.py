@@ -474,3 +474,17 @@ def test_only_inline_tags_join_text_nodes() -> None:
     # center / img are not inline text formatting: the words stay apart.
     assert "Total500" not in _html_to_text("<center>Total</center><center>500</center>")
     assert _lines('x<img src="cid:a">5') == ["x 5"]
+
+
+def test_rowspan_does_not_cross_a_row_group() -> None:
+    # Review: a rowspan in <thead> ends with the thead.
+    html = (
+        "<table><thead><tr><th rowspan=2>Item</th><th>Qty</th></tr></thead>"
+        "<tbody><tr><td>PEN</td><td>5</td></tr></tbody></table>"
+    )
+    assert _lines(html) == ["Item | Qty", "PEN | 5"]
+
+
+def test_empty_rows_do_not_count_toward_the_slot_cap() -> None:
+    html = "<table><tr><td>A</td><td>B</td></tr>" + "<tr></tr>" * 100_000 + "</table>"
+    assert _lines(html) == ["A | B"]
