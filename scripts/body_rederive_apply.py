@@ -88,6 +88,12 @@ from mailattic.cjk_segmentation import segment_cjk  # noqa: E402
 from mailattic.models import _normalize_body_text  # noqa: E402
 from mailattic.storage import connect_database, resolve_database_default  # noqa: E402
 
+SCRIPTS_ROOT = Path(__file__).resolve().parent
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+
+from body_rederive_stage import _sha256_text as _stage_sha256_text  # noqa: E402
+
 # source_kind written by the stage builder -> messages.source_input_mode.
 _MODE_FOR_KIND = {"pst": "file", "imap": "maildir"}
 
@@ -119,8 +125,9 @@ class Entry(NamedTuple):
     new_fts: str
 
 
-def _sha(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+# The pre-image fingerprint must be computed exactly as the stage builder
+# computed it, so reuse its helper rather than keeping a second copy.
+_sha = _stage_sha256_text
 
 
 def _file_sha256(path: Path) -> str:
