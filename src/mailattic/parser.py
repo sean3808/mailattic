@@ -1473,6 +1473,7 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
     solo_spans: list[int] = []  # slots a row's only cell wrote; 0 if several cells
     pending: dict[int, tuple[str, int]] = {}
     prose = False
+    overlap = False
     is_data = False
     width = 0
     total_slots = 0  # running grid size; stops the layout at the cap
@@ -1503,6 +1504,10 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
                         return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
                     if cell.rowspan > 1:
                         carried[target] = (text, cell.rowspan - 1)
+                else:
+                    # Spans that cross each other: the cell cannot hold all
+                    # the columns it claims, so the mapping is uncertain.
+                    overlap = True
             column += cell.colspan
         pending = carried
         grid.append(slots)
@@ -1516,7 +1521,7 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
     if prose:
         return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], True
 
-    warn = table.clamped
+    warn = table.clamped or overlap
     lines: list[str] = []
     position = 0
     for row, slots, solo in zip(table.rows, grid, solo_spans, strict=True):

@@ -448,3 +448,16 @@ def test_whitespace_or_block_tags_still_separate_words() -> None:
     ]
     assert _lines("a<br>b") == ["a", "b"]
     assert _lines("<table><tr><td>A</td><td>B</td></tr></table>") == ["A | B"]
+
+
+def test_colspan_crossing_a_carried_rowspan_warns() -> None:
+    # Review: D claims two columns but B (rowspan) already holds one of them.
+    html = (
+        "<table>"
+        '<tr><td>A</td><td rowspan="2">B</td><td>C</td></tr>'
+        '<tr><td colspan="2">D</td></tr>'
+        "</table>"
+    )
+    lines = _lines(html)
+    assert lines[0] == _warning()
+    assert lines.count(_warning()) == 1
