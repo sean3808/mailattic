@@ -349,7 +349,7 @@ def _recount_ledger(
         output_root.mkdir()
         parser._extract_pst(pst, output_root)
         return _ledger("recount", _count_extraction(output_root), lspst_note)
-    except (OSError, RuntimeError, mailbox.Error) as exc:
+    except (OSError, RuntimeError, ValueError, mailbox.Error) as exc:
         return _ledger("unavailable", None, f"{lspst_note}; recount failed: {exc}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -866,7 +866,8 @@ def build_pst_stage(
                         work_root,
                     )
                 )
-                assert ledger is not None
+                if ledger is None:  # _process_pst echoes the ledger it was given
+                    raise RuntimeError(f"no ledger for {pst_source}")
                 stage_con.commit()
                 store.commit()
                 per_pst.append(
