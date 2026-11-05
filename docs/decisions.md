@@ -47,4 +47,5 @@
 | [D-20261013-1](decisions/D-20261013-1-mcp-draft-from-follows-smtp-account.md) | 2026-10-13 | 擬稿的寄件人跟著寄件設定的帳號走，程式不再內建擁有者地址 | accepted |
 | [D-20261018-1](decisions/D-20261018-1-internal-working-notes-stay-local.md) | 2026-10-18 | 內部工作筆記只留本機，不進版控、不隨公開版帶出 | accepted |
 | [D-20261018-2](decisions/D-20261018-2-public-tree-scrub-criteria-and-accepted-residuals.md) | 2026-10-18 | 公開樹的去識別判準：先問誰會驗這個值，量級與作息資訊列為已接受殘留 | accepted |
+| [D-20261105-1](decisions/D-20261105-1-table-fidelity-without-storing-html.md) | 2026-11-05 | 表格保真不靠存 HTML：轉換器轉對、轉不對就標提示、需要時匯出原信 | accepted |
 <!-- END GENERATED ADR-INDEX -->
