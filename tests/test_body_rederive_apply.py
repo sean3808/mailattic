@@ -60,16 +60,22 @@ def _add_message(
 
 
 def _stage_row(
-    mid: int, kind: str, pre_body: str, new_body: str, status: str = "rewrite"
+    mid: int,
+    kind: str,
+    pre_body: str,
+    new_body: str,
+    status: str = "rewrite",
+    key: str = "ghost",
 ) -> tuple:
-    return (mid, kind, _sha(pre_body), new_body, status)
+    # expected_message_id is the *normalized* form of <key@example.test>
+    return (mid, kind, _sha(pre_body), new_body, status, f"{key}@example.test")
 
 
 def _make_stage(path: Path, rows: list[tuple], with_meta: bool = True) -> Path:
     con = sqlite3.connect(path)
     try:
         con.executescript(_STAGE_SCHEMA)
-        con.executemany("INSERT INTO body_rederive VALUES (?, ?, ?, ?, ?)", rows)
+        con.executemany("INSERT INTO body_rederive VALUES (?, ?, ?, ?, ?, ?)", rows)
         if with_meta:
             con.execute("INSERT INTO stage_meta VALUES ('source_kind', 'pst')")
         con.commit()
@@ -171,17 +177,19 @@ class World:
             con.close()
         i = self.ids
         rows = [
-            _stage_row(i["A"], "pst", self.OLD["A"], self.NEW_A),
-            _stage_row(i["B"], "pst", self.OLD["B"], self.NEW_B),
-            _stage_row(i["C"], "imap", self.OLD["C"], self.NEW_C),
+            _stage_row(i["A"], "pst", self.OLD["A"], self.NEW_A, key="A"),
+            _stage_row(i["B"], "pst", self.OLD["B"], self.NEW_B, key="B"),
+            _stage_row(i["C"], "imap", self.OLD["C"], self.NEW_C, key="C"),
             # drifted: stage was built from a different pre-image
-            _stage_row(i["E"], "pst", "some other body", "echo new"),
+            _stage_row(i["E"], "pst", "some other body", "echo new", key="E"),
             # mode mismatch: imap row pointing at a 'file' message
-            _stage_row(i["F"], "imap", self.OLD["F"], "foxtrot new"),
+            _stage_row(i["F"], "imap", self.OLD["F"], "foxtrot new", key="F"),
             # canonical row missing
             _stage_row(9999, "pst", "x", "y"),
             # not a rewrite
-            _stage_row(i["D"], "pst", self.OLD["D"], "delta new", status="skip"),
+            _stage_row(
+                i["D"], "pst", self.OLD["D"], "delta new", status="skip", key="D"
+            ),
         ]
         self.stage = _make_stage(tmp_path / "stage.db", rows)
         self.tmp = tmp_path
@@ -234,6 +242,7 @@ def test_dry_run_writes_nothing_and_reports_counts(world, capsys):
         "missing_row": 1,
         "missing_fts": 0,
         "mode_mismatch": 1,
+        "message_id_changed": 0,
         "drifted": 1,
         "planned": 3,
     }
@@ -485,6 +494,129 @@ def test_fts_drift_inside_transaction_rolls_back_whole_run(world, capsys, monkey
     assert "message_fts row" in capsys.readouterr().err
     assert _body(world.db, world.ids["A"]) == World.OLD["A"]
     assert _fts_body(world.db, world.ids["B"]) == "drifted index"
+
+
+def _set_message_id(db: Path, mid: int, value: str) -> None:
+    con = connect_database(db)
+    try:
+        con.execute("UPDATE messages SET message_id=? WHERE id=?", (value, mid))
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_row_whose_message_id_changed_since_stage_is_excluded(world, capsys):
+    # same id, same body, different message: a rebuilt canonical DB
+    _set_message_id(world.db, world.ids["A"], "<someone-else@example.test>")
+    before = _snapshot(world.db)
+    assert apply_module.main(world.args()) == 0
+    capsys.readouterr()
+    report = json.loads(world.dryrun_report.read_text(encoding="utf-8"))
+    assert report["counts"]["message_id_changed"] == 1
+    assert report["counts"]["planned"] == 2
+    assert apply_module.main(world.args("--confirm")) == 0
+    capsys.readouterr()
+    after = _snapshot(world.db)
+    mid = world.ids["A"]
+    assert [r for r in after["messages"] if r[0] == mid] == [
+        r for r in before["messages"] if r[0] == mid
+    ]
+    assert [r for r in after["fts"] if r[0] == mid] == [
+        r for r in before["fts"] if r[0] == mid
+    ]
+    assert _body(world.db, world.ids["B"]) == World.NEW_B
+    assert _body(world.db, world.ids["C"]) == World.NEW_C
+
+
+def test_equivalent_message_id_spelling_still_matches(world, capsys):
+    # outer angle brackets / whitespace are not a different identity
+    _set_message_id(world.db, world.ids["A"], "  <A@example.test>  ")
+    assert apply_module.main(world.args()) == 0
+    capsys.readouterr()
+    report = json.loads(world.dryrun_report.read_text(encoding="utf-8"))
+    assert report["counts"]["message_id_changed"] == 0
+    assert report["counts"]["planned"] == 3
+
+
+def test_confirm_refused_when_message_id_changed_after_dry_run(world, capsys):
+    assert world.dry_run(capsys) == 0
+    _set_message_id(world.db, world.ids["A"], "<someone-else@example.test>")
+    before = _snapshot(world.db)
+    assert apply_module.main(world.args("--confirm")) == 1
+    assert "does not match" in capsys.readouterr().err
+    assert _snapshot(world.db) == before
+    assert not world.sidecar.exists()
+
+
+def test_plan_digest_binds_the_stage_expected_message_id(world, capsys):
+    # Canonical id and the stage's expectation are changed together: bodies,
+    # shas and planned ids are identical, only expected_message_id differs.
+    assert world.dry_run(capsys) == 0
+    _set_message_id(world.db, world.ids["A"], "<swapped@example.test>")
+    con = sqlite3.connect(world.stage)
+    con.execute(
+        "UPDATE body_rederive SET expected_message_id = 'swapped@example.test' "
+        "WHERE message_id = ?",
+        (world.ids["A"],),
+    )
+    con.commit()
+    con.close()
+    before = _snapshot(world.db)
+    assert apply_module.main(world.args("--confirm")) == 1
+    assert "plan_digest" in capsys.readouterr().err
+    assert _snapshot(world.db) == before
+
+
+def test_message_id_change_inside_transaction_rolls_back_whole_run(
+    world, capsys, monkeypatch
+):
+    assert world.dry_run(capsys) == 0
+    real = apply_module._write_pre_image_sidecar
+
+    def reassign_after_sidecar(*a, **kw):
+        result = real(*a, **kw)
+        _set_message_id(world.db, world.ids["B"], "<reassigned@example.test>")
+        return result
+
+    monkeypatch.setattr(
+        apply_module, "_write_pre_image_sidecar", reassign_after_sidecar
+    )
+    assert apply_module.main(world.args("--confirm")) == 1
+    assert "Message-ID changed" in capsys.readouterr().err
+    assert _body(world.db, world.ids["A"]) == World.OLD["A"]
+    assert _body(world.db, world.ids["B"]) == World.OLD["B"]
+    assert _body(world.db, world.ids["C"]) == World.OLD["C"]
+
+
+def test_stage_without_expected_message_id_column_is_refused(tmp_path, capsys):
+    db = tmp_path / "c.db"
+    initialize_database(db)
+    stage = tmp_path / "old-stage.db"
+    con = sqlite3.connect(stage)
+    con.executescript(
+        "CREATE TABLE body_rederive (message_id INTEGER PRIMARY KEY, "
+        "source_kind TEXT NOT NULL, pre_image_sha256 TEXT NOT NULL, "
+        "new_body_text TEXT NOT NULL, status TEXT NOT NULL);"
+        "CREATE TABLE stage_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        "INSERT INTO stage_meta VALUES ('source_kind', 'pst');"
+    )
+    con.commit()
+    con.close()
+    for extra in ((), ("--confirm",)):
+        code = apply_module.main(
+            ["--stage", str(stage), "--canonical", str(db), *extra]
+        )
+        assert code == 1
+        assert "rebuild the stage" in capsys.readouterr().err
+    assert not (tmp_path / "old-stage-apply-report-dryrun.json").exists()
+
+
+def test_unwritable_dry_run_report_exits_nonzero(world, capsys):
+    # a directory squatting on the report path: write_text raises OSError
+    world.dryrun_report.mkdir()
+    assert apply_module.main(world.args()) == 1
+    err = capsys.readouterr().err
+    assert "could not be written" in err
 
 
 def test_write_outside_the_plan_is_caught_and_rolled_back(world, capsys, monkeypatch):

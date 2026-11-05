@@ -16,9 +16,13 @@ ingest indexes). ``message_fts`` is a plain FTS5 table keyed by
 Plan: every stage row with ``status='rewrite'`` whose canonical row exists,
 has a ``message_fts`` row at the same rowid, belongs to the ``source_input_mode``
 its ``source_kind`` implies (``pst`` -> ``file``, ``imap`` -> ``maildir``), and
-whose current ``sha256(body_text)`` equals the stage's ``pre_image_sha256``.
-Rows failing a check are excluded and counted (``missing_row``, ``missing_fts``,
-``mode_mismatch``, ``drifted``, ``not_rewrite``) and are never written.
+whose current normalized ``message_id`` equals the stage's
+``expected_message_id`` (the pairing the stage verified; a rebuilt canonical DB
+may have reassigned ids), and whose current ``sha256(body_text)`` equals the
+stage's ``pre_image_sha256``. Rows failing a check are excluded and counted
+(``missing_row``, ``missing_fts``, ``mode_mismatch``, ``message_id_changed``,
+``drifted``, ``not_rewrite``) and are never written. A stage built before the
+``expected_message_id`` column existed is refused: rebuild it.
 
 Usage:
     uv run python scripts/body_rederive_apply.py --stage <stage.db>
@@ -59,8 +63,11 @@ an operator deliberately constructing colliding inputs.
 
 Exit codes:
     0 -- dry-run report written (canonical untouched), or a confirmed apply /
-         restore completed and reconciled
-    1 -- refused (preflight, dry-run binding, sidecar, bad arguments) or rolled
+         restore completed and reconciled (a confirm / restore report that
+         cannot be written only warns: the canonical write is already done and
+         the sidecar is the record, so exit 1 would falsely claim a rollback)
+    1 -- refused (preflight, dry-run binding, dry-run report not writable,
+         sidecar, bad arguments) or rolled
          back (drift, reconciliation mismatch, any exception), or the dry-run
          saw the canonical file change while reading. Exit 1 from a confirmed
          run always means the canonical database was NOT left modified.
@@ -86,6 +93,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from mailattic.cjk_segmentation import segment_cjk  # noqa: E402
 from mailattic.models import _normalize_body_text  # noqa: E402
+from mailattic.query import normalize_message_id  # noqa: E402
 from mailattic.storage import connect_database, resolve_database_default  # noqa: E402
 
 SCRIPTS_ROOT = Path(__file__).resolve().parent
@@ -123,6 +131,9 @@ class Entry(NamedTuple):
     expected_fts: str | None
     new_body: str
     new_fts: str
+    # Normalized Message-ID the row must still carry; None skips the check
+    # (restore: its guard is the post-apply body sha).
+    expected_message_id: str | None = None
 
 
 # The pre-image fingerprint must be computed exactly as the stage builder
@@ -176,6 +187,12 @@ def _check_stage(stage: Path) -> None:
                 f"{stage} is not a body re-derivation stage "
                 "(body_rederive / stage_meta table missing)"
             )
+        columns = {row[1] for row in con.execute("PRAGMA table_info(body_rederive)")}
+        if "expected_message_id" not in columns:
+            raise ApplyRefused(
+                f"stage {stage} predates the expected_message_id column (it "
+                "cannot prove which message each row belongs to); rebuild the stage"
+            )
         kind = con.execute(
             "SELECT value FROM stage_meta WHERE key = 'source_kind'"
         ).fetchone()
@@ -199,12 +216,20 @@ def _preflight(canonical: Path, stage: Path) -> None:
     _check_stage(stage)
 
 
-def _digest_plan(rows: list[tuple[int, str, str]]) -> str:
+def _digest_plan(
+    rows: list[tuple[int, str, str]], expected_message_ids: dict[int, str]
+) -> str:
     hasher = hashlib.sha256()
     hasher.update(b"BODY-REDERIVE-PLAN\x00")
     for mid, pre_sha, post_sha in sorted(rows):
-        hasher.update(f"{mid}\x00{pre_sha}\x00{post_sha}\x00".encode())
+        hasher.update(
+            f"{mid}\x00{pre_sha}\x00{post_sha}\x00{expected_message_ids[mid]}\x00".encode()
+        )
     return hasher.hexdigest()
+
+
+def _current_message_id(raw: str | None) -> str:
+    return normalize_message_id(raw)
 
 
 def build_plan(canonical: Path, stage: Path) -> tuple[dict, dict]:
@@ -217,15 +242,17 @@ def build_plan(canonical: Path, stage: Path) -> tuple[dict, dict]:
         "missing_row": 0,
         "missing_fts": 0,
         "mode_mismatch": 0,
+        "message_id_changed": 0,
         "drifted": 0,
         "planned": 0,
     }
     planned: list[tuple[int, str, str]] = []
+    expected_ids: dict[int, str] = {}
     lengths: dict[int, tuple[int, int]] = {}
     try:
         cursor = con_s.execute(
-            "SELECT message_id, source_kind, pre_image_sha256, new_body_text, status "
-            "FROM body_rederive ORDER BY message_id"
+            "SELECT message_id, source_kind, pre_image_sha256, new_body_text, status, "
+            "expected_message_id FROM body_rederive ORDER BY message_id"
         )
         for row in cursor:
             counts["stage_rows"] += 1
@@ -234,7 +261,8 @@ def build_plan(canonical: Path, stage: Path) -> tuple[dict, dict]:
                 continue
             mid = row["message_id"]
             current = con_c.execute(
-                "SELECT source_input_mode, body_text FROM messages WHERE id = ?",
+                "SELECT source_input_mode, body_text, message_id "
+                "FROM messages WHERE id = ?",
                 (mid,),
             ).fetchone()
             if current is None:
@@ -242,6 +270,16 @@ def build_plan(canonical: Path, stage: Path) -> tuple[dict, dict]:
                 continue
             if _MODE_FOR_KIND.get(row["source_kind"]) != current["source_input_mode"]:
                 counts["mode_mismatch"] += 1
+                continue
+            # The stage verified this id -> Message-ID pairing; ids can be
+            # reassigned if the canonical DB was rebuilt since, and bodies
+            # alone cannot tell (all empty bodies share one sha).
+            expected_message_id = row["expected_message_id"]
+            if (
+                not expected_message_id
+                or _current_message_id(current["message_id"]) != expected_message_id
+            ):
+                counts["message_id_changed"] += 1
                 continue
             if _sha(current["body_text"]) != row["pre_image_sha256"]:
                 counts["drifted"] += 1
@@ -254,14 +292,15 @@ def build_plan(canonical: Path, stage: Path) -> tuple[dict, dict]:
                 continue
             stored = _normalize_body_text(row["new_body_text"])
             planned.append((mid, row["pre_image_sha256"], _sha(stored)))
+            expected_ids[mid] = expected_message_id
             lengths[mid] = (len(current["body_text"]), len(stored))
     finally:
         con_c.close()
         con_s.close()
     counts["planned"] = len(planned)
-    plan_digest = _digest_plan(planned)
+    plan_digest = _digest_plan(planned, expected_ids)
     sample_ids = sorted(lengths)[:_SAMPLE_SIZE]
-    plan = {"rows": sorted(planned)}
+    plan = {"rows": sorted(planned), "expected_message_ids": expected_ids}
     report = {
         "plan_digest": plan_digest,
         "canonical": str(canonical),
@@ -276,14 +315,17 @@ def build_plan(canonical: Path, stage: Path) -> tuple[dict, dict]:
     return plan, report
 
 
-def _write_json(path: Path, payload: dict, label: str) -> None:
+def _write_json(path: Path, payload: dict, label: str) -> bool:
+    """True when the report landed. A failure is reported, never raised: the
+    caller decides whether it may be survived."""
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     try:
         path.write_text(text, encoding="utf-8")
     except OSError as exc:
         print(f"[{label}] WARNING: could not write {path} ({exc!r})", file=sys.stderr)
-        return
+        return False
     print(f"[{label}] wrote {path}")
+    return True
 
 
 def _print_counts(label: str, counts: dict[str, int]) -> None:
@@ -310,9 +352,17 @@ def run_dry_run(canonical: Path, stage: Path) -> int:
             file=sys.stderr,
         )
         return 1
-    _write_json(
+    # --confirm binds to this report: without it the dry-run produced no
+    # reviewable artifact, so a "successful" exit would be false.
+    if not _write_json(
         stage.parent / _DRYRUN_REPORT.format(stem=stage.stem), report, "dry-run"
-    )
+    ):
+        print(
+            "[abort] the dry-run report could not be written; --confirm cannot "
+            "bind to it. Fix the path and re-run the dry-run.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"[dry-run] plan_digest: {report['plan_digest']}")
     _print_counts("dry-run", report["counts"])
     return 0
@@ -508,11 +558,19 @@ def _run_transaction(
             written = 0
             for entry in entries():
                 row = con.execute(
-                    "SELECT body_text FROM messages WHERE id = ?", (entry.id,)
+                    "SELECT body_text, message_id FROM messages WHERE id = ?",
+                    (entry.id,),
                 ).fetchone()
                 if row is None or _sha(row[0]) != entry.expected_sha:
                     raise ReconciliationError(
                         f"row {entry.id} changed since the plan was built"
+                    )
+                if (
+                    entry.expected_message_id is not None
+                    and _current_message_id(row[1]) != entry.expected_message_id
+                ):
+                    raise ReconciliationError(
+                        f"row {entry.id} Message-ID changed since the plan was built"
                     )
                 fts = con.execute(
                     "SELECT body_text FROM message_fts WHERE rowid = ?", (entry.id,)
@@ -561,7 +619,9 @@ def _run_transaction(
 # ---------------------------------------------------------------------------
 # Apply
 # ---------------------------------------------------------------------------
-def _apply_entries(sidecar: Path, stage: Path) -> Callable[[], Iterator[Entry]]:
+def _apply_entries(
+    sidecar: Path, stage: Path, expected_message_ids: dict[int, str]
+) -> Callable[[], Iterator[Entry]]:
     def generate() -> Iterator[Entry]:
         side = sqlite3.connect(f"file:{sidecar.as_posix()}?mode=ro", uri=True)
         stg = sqlite3.connect(f"file:{stage.as_posix()}?mode=ro", uri=True)
@@ -581,7 +641,14 @@ def _apply_entries(sidecar: Path, stage: Path) -> Callable[[], Iterator[Entry]]:
                     raise ReconciliationError(
                         f"stage body for {mid} changed since the plan was built"
                     )
-                yield Entry(mid, pre_sha, old_fts, stored, segment_cjk(stored))
+                yield Entry(
+                    mid,
+                    pre_sha,
+                    old_fts,
+                    stored,
+                    segment_cjk(stored),
+                    expected_message_ids[mid],
+                )
         finally:
             side.close()
             stg.close()
@@ -613,7 +680,11 @@ def run_confirm(canonical: Path, stage: Path) -> int:
 
     plan_ids = {mid for mid, _pre, _post in plan["rows"]}
     try:
-        written = _run_transaction(canonical, plan_ids, _apply_entries(sidecar, stage))
+        written = _run_transaction(
+            canonical,
+            plan_ids,
+            _apply_entries(sidecar, stage, plan["expected_message_ids"]),
+        )
     except Exception as exc:
         print(
             f"[abort] rolled back, canonical database not modified: {exc}",

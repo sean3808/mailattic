@@ -28,11 +28,12 @@ expose it, so this script wraps the function for the duration of a run to
 observe what the unchanged phase-1 code decided (no second heuristic).
 
 Stage DB (``body_rederive`` table): canonical ``messages.id``, ``source_kind``
-(``pst``), ``pre_image_sha256`` (SHA-256 of the canonical ``body_text`` encoded
-as UTF-8, at extraction time -- the pre-image fingerprint the apply step must
-re-check), ``new_body_text`` and ``status`` (``rewrite``). Rows whose
-re-derived body equals the canonical one are counted as ``unchanged`` and not
-staged.
+(``pst``), ``expected_message_id`` (the normalized Message-ID the pairing was
+verified against; apply re-checks it), ``pre_image_sha256`` (SHA-256 of the
+canonical ``body_text`` encoded as UTF-8, at extraction time -- the pre-image
+fingerprint the apply step must re-check), ``new_body_text`` and ``status``
+(``rewrite``). Rows whose re-derived body equals the canonical one are counted
+as ``unchanged`` and not staged.
 
 How IMAP rows are re-derived (``imap`` subcommand):
   * scope is ``source_input_mode='maildir'``; ``archive`` / ``outbound`` rows
@@ -116,7 +117,8 @@ CREATE TABLE body_rederive (
     source_kind TEXT NOT NULL,
     pre_image_sha256 TEXT NOT NULL,
     new_body_text TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    expected_message_id TEXT NOT NULL
 );
 CREATE TABLE stage_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
@@ -251,23 +253,36 @@ def _stage_rewrite(
 ) -> None:
     stage_con.execute(
         "INSERT INTO body_rederive "
-        "(message_id, source_kind, pre_image_sha256, new_body_text, status) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (row["id"], source_kind, row["body_sha256"], new_body, STATUS_REWRITE),
+        "(message_id, source_kind, pre_image_sha256, new_body_text, status, "
+        "expected_message_id) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            row["id"],
+            source_kind,
+            row["body_sha256"],
+            new_body,
+            STATUS_REWRITE,
+            # The normalized Message-ID the pairing was verified against; the
+            # apply step re-checks it against the canonical row.
+            row["message_id"],
+        ),
     )
 
 
-def _prepare_stage(database: Path, stage: Path, overwrite: bool) -> None:
+def _check_stage_target(database: Path, stage: Path, overwrite: bool) -> None:
+    """Every refusal that can be decided without touching the stage."""
     if database.resolve() == stage.resolve():
         raise StageRefused(f"--stage resolves to the canonical database ({database})")
     if not database.exists():
         raise StageRefused(f"canonical database not found: {database}")
-    if stage.exists():
-        if not overwrite:
-            raise StageRefused(
-                f"stage already exists: {stage} (use --overwrite to replace it)"
-            )
-        _remove_stage_files(stage)
+    if stage.exists() and not overwrite:
+        raise StageRefused(
+            f"stage already exists: {stage} (use --overwrite to replace it)"
+        )
+
+
+def _clear_stage_target(stage: Path) -> None:
+    """The destructive half: call only after every refusal has been decided."""
+    _remove_stage_files(stage)
     stage.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -372,7 +387,7 @@ def build_pst_stage(
     pst_map: dict[str, Path] | None = None,
 ) -> dict:
     pst_map = pst_map or {}
-    _prepare_stage(database, stage, overwrite)
+    _check_stage_target(database, stage, overwrite)
     work_root = stage.parent / f"{stage.stem}-work"
     started = datetime.now(UTC)
 
@@ -384,6 +399,8 @@ def build_pst_stage(
             raise StageRefused(
                 f"--pst-map names a pst_source not in the canonical DB: {unknown_keys}"
             )
+        # Every refusal is decided; only now may a previous stage be removed.
+        _clear_stage_target(stage)
         not_in_canonical: list[str] = []
         if pst_filter:
             wanted = [str(p) for p in pst_filter]
@@ -572,7 +589,7 @@ def build_imap_stage(
     limit: int | None,
     client_factory: Callable[[dict[str, str]], NativeImapClient] | None = None,
 ) -> dict:
-    _prepare_stage(database, stage, overwrite)
+    _check_stage_target(database, stage, overwrite)
     factory = client_factory or (lambda e: NativeImapClient(e))
     started = datetime.now(UTC)
 
@@ -610,6 +627,8 @@ def build_imap_stage(
         for folder in client.list_folders():
             listed.setdefault(folder.display_name, folder)
 
+        # Connection and LIST succeeded: only now may a previous stage go.
+        _clear_stage_target(stage)
         stage_con = sqlite3.connect(stage)
         try:
             stage_con.executescript(_STAGE_SCHEMA)

@@ -190,6 +190,7 @@ def test_table_row_is_staged_as_rewrite_with_pre_image_fingerprint(
     assert staged[mid]["new_body_text"] != PLAIN_FLAT
     assert staged[mid]["status"] == "rewrite"
     assert staged[mid]["source_kind"] == "pst"
+    assert staged[mid]["expected_message_id"] == "m1@example.test"
     assert (
         staged[mid]["pre_image_sha256"]
         == hashlib.sha256(PLAIN_FLAT.encode("utf-8")).hexdigest()
@@ -356,6 +357,52 @@ def test_pst_map_key_not_in_canonical_is_refused_before_any_stage(
 
     assert _run(db, stage, readpst, "--pst-map", f"{tmp_path / 'typo.pst'}={pst}") == 1
     assert not stage.exists()
+
+
+def test_overwrite_with_bad_pst_map_keeps_the_previous_stage(tmp_path, stub_readpst):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [_table_message("<m1@example.test>")]
+    db, _ = _canonical(
+        tmp_path,
+        [_row(pst=pst, index=1, message_id="<m1@example.test>", body=PLAIN_FLAT)],
+    )
+    stage = tmp_path / "stage.db"
+    assert _run(db, stage, readpst) == 0
+    before = stage.read_bytes()
+
+    code = _run(
+        db,
+        stage,
+        readpst,
+        "--overwrite",
+        "--pst-map",
+        f"{tmp_path / 'typo.pst'}={pst}",
+    )
+
+    assert code == 1
+    assert stage.exists()
+    assert stage.read_bytes() == before
+
+
+def test_imap_overwrite_keeps_previous_stage_when_connection_fails(
+    tmp_path, fake_imap, monkeypatch
+):
+    env_file, _install = fake_imap
+    db, _ = _imap_canonical(
+        tmp_path,
+        [_maildir_row("INBOX/new/uid-11.eml", "<i1@example.test>", PLAIN_FLAT)],
+    )
+    stage = tmp_path / "stage.db"
+    stage.write_bytes(b"precious")
+
+    def refuse(env):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(stage_module, "NativeImapClient", refuse)
+
+    assert _run_imap(db, stage, env_file, "--overwrite") == 1
+    assert stage.read_bytes() == b"precious"
 
 
 def test_existing_stage_refused_without_overwrite(tmp_path, stub_readpst):
@@ -589,6 +636,7 @@ def test_imap_table_row_is_refetched_and_staged_as_rewrite(tmp_path, fake_imap):
     assert staged[mid]["new_body_text"] == TABLE_BODY
     assert staged[mid]["status"] == "rewrite"
     assert staged[mid]["source_kind"] == "imap"
+    assert staged[mid]["expected_message_id"] == "i1@example.test"
     assert (
         staged[mid]["pre_image_sha256"]
         == hashlib.sha256(PLAIN_FLAT.encode("utf-8")).hexdigest()
