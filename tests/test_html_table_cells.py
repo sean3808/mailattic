@@ -417,3 +417,34 @@ def test_rowspan_carry_over_beyond_slot_limit_warns_and_stays_fast() -> None:
     assert lines[0] == _warning()
     assert " | " not in "\n".join(lines)  # plain fallback, no grid
     assert elapsed < 2.0
+
+
+def test_cells_without_a_row_tag_open_an_implicit_row_and_keep_slots() -> None:
+    # spec-1e rule 6 (new behaviour): a td/th opened inside a table with no
+    # open row opens a row, as browsers do, so the empty slot is kept.
+    html = "<table><td>A</td><td></td><td>5</td></table>"
+    assert _lines(html) == ["A |  | 5"]
+
+
+# --- inline tags do not split words (#14) ------------------------------------
+
+
+def test_inline_tags_inside_a_number_do_not_split_it() -> None:
+    assert _lines("<p>Price NTD<b>8</b>5 or <span>12</span><span>50</span></p>") == [
+        "Price NTD85 or 1250"
+    ]
+
+
+def test_inline_tag_inside_a_table_cell_keeps_the_value_whole() -> None:
+    html = "<table><tr><td>Qty</td><td>1<span>20</span></td></tr></table>"
+    assert _lines(html) == ["Qty | 120"]
+
+
+def test_whitespace_or_block_tags_still_separate_words() -> None:
+    # pins unchanged behaviour
+    assert _lines("<p>Hello <b>big</b>\n world</p><p>next</p>") == [
+        "Hello big world",
+        "next",
+    ]
+    assert _lines("a<br>b") == ["a", "b"]
+    assert _lines("<table><tr><td>A</td><td>B</td></tr></table>") == ["A | B"]

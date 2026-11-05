@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from email import policy
@@ -1054,6 +1055,7 @@ def _fallback_attachment_name(mime_type: str | None, sequence_number: int) -> st
 def _extract_body_text(message: Any) -> str:
     plain_parts: list[str] = []
     html_parts: list[str] = []
+    html_attribute_values: list[str] = []
     has_data_table = False
 
     for part, in_alt in _walk_own_parts_with_context(message):
@@ -1071,8 +1073,11 @@ def _extract_body_text(message: Any) -> str:
         if part.get_content_subtype() == "plain":
             plain_parts.append(content)
         elif part.get_content_subtype() == "html":
-            html_text, html_has_data_table = _html_to_text_and_table_flag(content)
+            html_text, html_has_data_table, attribute_values = (
+                _html_to_text_and_table_flag(content)
+            )
             html_parts.append(html_text)
+            html_attribute_values.extend(attribute_values)
             has_data_table = has_data_table or html_has_data_table
 
     plain_body = "\n\n".join(
@@ -1090,8 +1095,8 @@ def _extract_body_text(message: Any) -> str:
         return html_body
 
     # Switch to the HTML text only when it still carries what the plain body
-    # had (#14, addendum 1c); otherwise keep plain and flag the flattened table.
-    if _html_covers_plain(plain_body, html_body):
+    # had (#14, addendum 1e); otherwise keep plain and flag the flattened table.
+    if _html_covers_plain(plain_body, html_body, html_attribute_values):
         return html_body
     return f"{PLAIN_TABLE_FIDELITY_WARNING}\n{plain_body}"
 
@@ -1103,64 +1108,42 @@ PLAIN_TABLE_FIDELITY_WARNING = (
     f"{_TABLE_FIDELITY_PREFIX} 本信的表格在純文字版中可能已經攤平，"
     f"{_TABLE_FIDELITY_ADVICE}"
 )
-_COVERAGE_MIN_PERCENT = 95
-_COVERAGE_NOISE_PREFIXES = ("mailto:", "cid:", "[cid:")
+# Disjoint alternatives, so linear. Letters and digits are separate runs:
+# the HTML text splits "NTD210" / "27<sup>th</sup>" at inline tags.
+_COVERAGE_TOKEN = re.compile(r"[a-z]+|[0-9]+|[^\W_]")
 
 
-_URL_SCHEME_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
-)
-_EMAIL_LOCAL_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._%+-"
-)
+def _coverage_tokens(text: str) -> Counter[str]:
+    """Words for the coverage check: an ASCII letter run or digit run is one
+    token, every other alphanumeric character (CJK etc.) its own token."""
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    return Counter(_COVERAGE_TOKEN.findall(folded))
 
 
-def _strip_before(token: str, end: int, allowed: frozenset[str]) -> str:
-    """``token[:end]`` minus the maximal run of ``allowed`` characters at its end."""
-    start = end
-    while start > 0 and token[start - 1] in allowed:
-        start -= 1
-    return token[:start]
+def _html_covers_plain(
+    plain: str, html_text: str, html_attribute_values: Iterable[str] = ()
+) -> bool:
+    """Whether the HTML side still carries the plain body's tokens (#14, 1e).
 
-
-def _coverage_text(token: str) -> str:
-    """The part of a whitespace token that counts for coverage.
-
-    URLs, cid references and e-mail addresses: plain parts spell them out,
-    HTML keeps them in attributes. Only the address/URL part is removed; text
-    glued in front of it still counts. Index scans, not a regex, so a long
-    near-miss run stays linear (PC-231)."""
-    if token.startswith(_COVERAGE_NOISE_PREFIXES):
-        return ""
-    index = token.find("://")
-    if index >= 0:
-        token = _strip_before(token, index, _URL_SCHEME_CHARS)
-    index = token.find("@")
-    if index >= 0:
-        token = _strip_before(token, index, _EMAIL_LOCAL_CHARS)
-    # Outlook writes "Name [mailto:x@y]" / "x@y<mailto:x@y>": the scheme left
-    # in front of a removed address is part of the address, not text.
-    for scheme in ("mailto:", "cid:"):
-        if token.endswith(scheme):
-            token = token[: -len(scheme)]
-    return token
-
-
-def _coverage_bag(text: str) -> Counter[str]:
-    bag: Counter[str] = Counter()
-    for token in text.lower().split():
-        bag.update(filter(str.isalnum, _coverage_text(token)))
-    return bag
-
-
-def _html_covers_plain(plain: str, html_text: str) -> bool:
-    """Whether the HTML text keeps at least 95% of the plain alnum characters."""
-    plain_bag = _coverage_bag(plain)
-    total = sum(plain_bag.values())
+    The HTML side is its text plus the href / img src / img alt values it holds
+    (plain parts spell URLs and addresses out). Any missing number token fails;
+    missing non-number tokens are tolerated up to max(2, 1% of the plain tokens),
+    never more than 10% of them (a short plain body cannot be dropped whole).
+    """
+    plain_tokens = _coverage_tokens(plain)
+    total = sum(plain_tokens.values())
     if total == 0:
         return True
-    lost = sum((plain_bag - _coverage_bag(html_text)).values())
-    return lost * 100 <= total * (100 - _COVERAGE_MIN_PERCENT)
+    html_tokens = _coverage_tokens(html_text)
+    for value in html_attribute_values:
+        html_tokens.update(_coverage_tokens(value))
+    missing = plain_tokens - html_tokens
+    missing_words = 0
+    for token, count in missing.items():
+        if any(char.isdigit() for char in token):
+            return False
+        missing_words += count
+    return missing_words <= min(max(2, total // 100), total // 10)
 
 
 def _extract_attachments(
@@ -1265,13 +1248,14 @@ def _is_attachment_part(
     return not in_alternative
 
 
-def _html_to_text_and_table_flag(html: str) -> tuple[str, bool]:
-    """The HTML as text, and whether it rendered a data table (one parse)."""
+def _html_to_text_and_table_flag(html: str) -> tuple[str, bool, list[str]]:
+    """The HTML as text, whether it rendered a data table, and the attribute
+    values (href / img src / img alt) the coverage check counts (one parse)."""
     parser = _HTMLTextExtractor()
     parser.feed(html)
     parser.close()
     text = parser.get_text()
-    return text, parser.has_data_table
+    return text, parser.has_data_table, parser.attribute_values
 
 
 def _html_to_text(html: str) -> str:
@@ -1289,6 +1273,8 @@ _HTML_BLOCK_TAGS = frozenset(
 
 
 _HTML_CELL_TAGS = frozenset({"td", "th"})
+# Tags that separate the text nodes around them; inline tags do not (#14).
+_HTML_SEPARATING_TAGS = _HTML_BLOCK_TAGS | _HTML_CELL_TAGS
 _HTML_CELL_SEPARATOR = " | "
 _HTML_SPAN_LIMIT = 100
 _HTML_PROSE_MAX_LINES = 5
@@ -1405,7 +1391,8 @@ class _Table:
 
     def open_cell(self, attrs: Any) -> None:
         if self.row is None:
-            return
+            self.open_row()  # a cell with no <tr>: browsers open the row
+        assert self.row is not None
         self.close_cell()
         colspan, colspan_clamped = _span(attrs, "colspan")
         rowspan, rowspan_clamped = _span(attrs, "rowspan")
@@ -1574,10 +1561,22 @@ class _HTMLTextExtractor(HTMLParser):
         self._lines: list[str] = []
         self._words: list[str] = []
         self._skipped: list[str] = []
+        self._glue = False  # the last text node ended without whitespace
         self._skip_depth = 0
         # One entry per open <table>; words go to the innermost one.
         self._tables: list[_Table] = []
         self.has_data_table = False  # set while rendering; read after get_text()
+        # href (any tag) / img src / img alt values, for the coverage check;
+        # HTMLParser has already unescaped them.
+        self.attribute_values: list[str] = []
+
+    def _collect_attribute_values(self, tag: str, attrs: Any) -> None:
+        for name, value in attrs:
+            if not value:
+                continue
+            counted = name == "href" or (tag == "img" and name in ("src", "alt"))
+            if counted and not value.lstrip().lower().startswith("data:"):
+                self.attribute_values.append(value)
 
     def _end_line(self) -> None:
         if self._tables:
@@ -1606,6 +1605,10 @@ class _HTMLTextExtractor(HTMLParser):
         if tag in _HTML_SKIPPED_TAGS:
             self._skip_depth += 1
             return
+        if tag in _HTML_SEPARATING_TAGS:
+            self._glue = False
+        if not self._skip_depth:
+            self._collect_attribute_values(tag, attrs)
         if self._tables:
             if tag == "table":
                 self._tables[-1].has_nested = True
@@ -1627,6 +1630,8 @@ class _HTMLTextExtractor(HTMLParser):
             if not self._skip_depth:
                 self._skipped = []
             return
+        if tag in _HTML_SEPARATING_TAGS:
+            self._glue = False
         if tag in _HTML_CELL_TAGS:
             if self._tables:
                 self._tables[-1].close_cell()
@@ -1640,14 +1645,25 @@ class _HTMLTextExtractor(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         if not data.strip():
+            self._glue = False
             return
         if self._skip_depth:
             self._skipped.append(data.strip())
             return
-        if self._tables:
-            self._tables[-1].tokens.append(data.strip())
+        text = data.strip()
+        target = self._tables[-1].tokens if self._tables else self._words
+        # Text nodes split only by inline tags ("NTD<b>85</b>") are one word,
+        # as a browser shows them; whitespace or a block/cell tag separates.
+        if (
+            self._glue
+            and not data[0].isspace()
+            and target
+            and isinstance(target[-1], str)
+        ):
+            target[-1] += text
         else:
-            self._words.append(data.strip())
+            target.append(text)
+        self._glue = not data[-1].isspace()
 
     def get_text(self) -> str:
         while self._tables:  # tables left open by malformed HTML
