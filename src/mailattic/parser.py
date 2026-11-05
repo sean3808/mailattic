@@ -1075,33 +1075,33 @@ def _extract_body_text(message: Any) -> str:
             html_parts.append(html_text)
             has_data_table = has_data_table or html_has_data_table
 
-    cleaned_plain_parts = [
+    plain_body = "\n\n".join(
         candidate.strip() for candidate in plain_parts if candidate.strip()
-    ]
+    )
     # A data table in the HTML wins over a plain part: sender clients flatten
     # tables in the plain alternative (#14, D-20261105-1).
-    if cleaned_plain_parts and not has_data_table:
-        return "\n\n".join(cleaned_plain_parts)
+    if plain_body and not has_data_table:
+        return plain_body
 
-    cleaned_html_parts = [
+    html_body = "\n\n".join(
         candidate.strip() for candidate in html_parts if candidate.strip()
-    ]
-    html_body = "\n\n".join(cleaned_html_parts)
-    if not cleaned_plain_parts:
+    )
+    if not plain_body:
         return html_body
 
     # Switch to the HTML text only when it still carries what the plain body
     # had (#14, addendum 1c); otherwise keep plain and flag the flattened table.
-    plain_body = "\n\n".join(cleaned_plain_parts)
     if _html_covers_plain(plain_body, html_body):
         return html_body
     return f"{PLAIN_TABLE_FIDELITY_WARNING}\n{plain_body}"
 
 
 # Placed as the first line of a plain body kept despite an HTML data table.
+_TABLE_FIDELITY_PREFIX = "[表格失真提示]"  # agents match on this prefix
+_TABLE_FIDELITY_ADVICE = "欄位對應無法確定，請勿依文字判斷數值，請對照原信"
 PLAIN_TABLE_FIDELITY_WARNING = (
-    "[表格失真提示] 本信的表格在純文字版中可能已經攤平，"
-    "欄位對應無法確定，請勿依文字判斷數值，請對照原信"
+    f"{_TABLE_FIDELITY_PREFIX} 本信的表格在純文字版中可能已經攤平，"
+    f"{_TABLE_FIDELITY_ADVICE}"
 )
 _COVERAGE_MIN_PERCENT = 95
 _COVERAGE_NOISE_PREFIXES = ("mailto:", "cid:", "[cid:")
@@ -1115,13 +1115,11 @@ def _is_coverage_noise(token: str) -> bool:
 
 
 def _coverage_bag(text: str) -> Counter[str]:
-    return Counter(
-        ch
-        for token in text.lower().split()
-        if not _is_coverage_noise(token)
-        for ch in token
-        if ch.isalnum()
-    )
+    bag: Counter[str] = Counter()
+    for token in text.lower().split():
+        if not _is_coverage_noise(token):
+            bag.update(filter(str.isalnum, token))
+    return bag
 
 
 def _html_covers_plain(plain: str, html_text: str) -> bool:
@@ -1267,9 +1265,7 @@ _HTML_PROSE_MAX_CHARS = 200
 _HTML_GRID_SLOT_LIMIT = 100_000
 
 # Placed on its own line right before a table whose columns cannot be trusted.
-TABLE_FIDELITY_WARNING = (
-    "[表格失真提示] 以下表格的欄位對應無法確定，請勿依文字判斷數值，請對照原信"
-)
+TABLE_FIDELITY_WARNING = f"{_TABLE_FIDELITY_PREFIX} 以下表格的{_TABLE_FIDELITY_ADVICE}"
 
 
 class _LineBreak:
@@ -1432,6 +1428,8 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
     solo_spans: list[int] = []  # slots a row's only cell wrote; 0 if several cells
     pending: dict[int, tuple[str, int]] = {}
     prose = False
+    is_data = False
+    width = 0
     for row in table.rows:
         slots: dict[int, str] = {}
         carried: dict[int, tuple[str, int]] = {}
@@ -1457,14 +1455,15 @@ def _render_table(table: _Table) -> tuple[list[str], bool]:
         pending = carried
         grid.append(slots)
         solo_spans.append(written if len(row.cells) == 1 else 0)
+        if slots:
+            width = max(width, max(slots) + 1)
+            is_data = is_data or sum(1 for text in slots.values() if text) >= 2
 
-    is_data = any(sum(1 for text in slots.values() if text) >= 2 for slots in grid)
     if not is_data:
         return _plain_lines(tokens), False
     if prose:
         return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], True
 
-    width = max((max(slots) + 1 for slots in grid if slots), default=0)
     warn = table.clamped
     lines: list[str] = []
     position = 0
