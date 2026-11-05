@@ -251,6 +251,9 @@ Cautions for extracting prices by hand:
 - Amounts inside invoice numbers and bare numbers inside specs are not quotes.
 - Always attach the original snippet and its db_id to the report.
 - A doubled dot inside a value copied from the body (`example..com`, `user@example..com`, `1..5`) is usually dot-stuffing residue (the upstream mail server did not undo SMTP dot-stuffing, so a line starting with `.` was stored with an extra dot), not what the sender wrote: report the value with one dot and say the body shows two. Searching is unaffected (FTS splits on `.`, so `"example.com"` finds `example..com`); only copied values carry it.
+- Tables in a body: a row like `item |  | 5` keeps one slot per column, empty slots included; a merged cell repeats its value in every column it covers. Read values by position against the header row.
+- A line starting with `[表格失真提示]` (table fidelity warning) means column correspondence could not be determined: either for the table right below it, or (as the body's first line) for every table in the mail, because only a flattened plain-text version was usable. Do not read a value's column from that text. Report the message (subject, sender, sent_at, db_id) and ask the user to check the original in Outlook.
+- Mail stored before the table-fidelity change (#14) may hold a flattened table with no warning: one cell per line, blank cells dropped. When a body looks like a table broken into single lines, treat column assignment as unknown and say so.
 
 Report format:
 
@@ -406,6 +409,7 @@ Without this the user does not know which candidates you already visited, and th
 - HTML cleaning is regex-based and may leave a few inline styles
 - Quotes are extracted by hand from the original text (easy to miss currency-less wording; do not take invoice numbers for quotes)
 - (When it applies) values shown with a doubled dot in the body were reported with one dot (dot-stuffing residue)
+- (When it applies) values from a table under `[表格失真提示]`, or from a table flattened to one cell per line, were not assigned to a column; check the original
 - DB cutoff is `SELECT MAX(sent_at) FROM messages`
 ```
 
