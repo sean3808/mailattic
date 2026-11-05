@@ -12,6 +12,7 @@
 | [triage-labels.md](agents/triage-labels.md) | Triage Labels |
 | [trigger-resolution-detail.md](agents/trigger-resolution-detail.md) | Trigger→Resolution 完整紀錄 |
 | [trigger-resolution.md](agents/trigger-resolution.md) | Trigger→Resolution hot |
+| [body-rederive-runbook.md](body-rederive-runbook.md) | 舊信內文重做（#14 階段二）— 正式庫執行手冊 |
 | [ci-runner-feasibility-spike.md](ci-runner-feasibility-spike.md) | GitHub hosted windows runner 上 canonical pytest launcher 的實測紀錄（issue #60） |
 | [cli-reference.md](cli-reference.md) | `bes` CLI 參考（穩定面） |
 | [db-schema.md](db-schema.md) | DB schema |

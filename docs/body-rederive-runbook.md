@@ -1,0 +1,80 @@
+# 舊信內文重做（#14 階段二）— 正式庫執行手冊
+
+> **給誰**：Sean 親跑正式庫的那一次（2026-10-09 拍板：資料回補由 Sean 執行）。agent 只在複本上試跑。
+> **做什麼**：用今天的內文轉換（表格保真，[D-20261105-1](decisions/D-20261105-1-table-fidelity-without-storing-html.md)）重算舊信的 `body_text`，讓表格欄位對得回去。只改內文與搜尋索引，不動 Message-ID、寄件人、`dedup_key` 等任何其他欄位。
+> **兩支工具**：`scripts/body_rederive_stage.py`（產生暫存庫，從不寫正式庫）、`scripts/body_rederive_apply.py`（預設試算；`--confirm` 才寫；`--restore` 還原）。用法與計數的定義以兩支腳本開頭的說明為準。
+
+## 範圍（Sean 拍板，#14）
+
+- 重做：PST 匯入且有 Message-ID 的信（readpst 重新解包）、IMAP 同步的信（向伺服器重抓）。
+- 不重做：沒有 Message-ID 的 PST 信（`dedup_key` 含內文雜湊，改內文會讓日後重匯對不上）、`archive`、`outbound`。
+- 重做後內文變差（中文變亂碼、內文變 base64，#57）的信保留原內文，計為 `degraded_kept`。
+
+## 前置
+
+1. **Outlook 關閉**時，把三個 PST 複製成副本（Outlook 開著會獨佔鎖住）。目前的對照（正式庫 `pst_source` → 檔案）：
+   - `.../archive_2020-2023.pst`、`.../archive_2024-2025.pst`：封存檔
+   - `.../sean3808@<domain>.pst`：Outlook 本機檔（`%LOCALAPPDATA%\Microsoft\Outlook\`）
+   - `.../archive.pst`（36 封）已無原檔，會計為 `pst_missing`，正常。
+2. WSL（Ubuntu-24.04）已裝 `pst-utils`（readpst、lspst）：`wsl -d Ubuntu-24.04 -u root -- apt-get install -y pst-utils`。WSL 操作前讀 [`wsl-environment.md`](wsl-environment.md)：**WSL 不得寫 `/mnt/c`**（D-20260525-1）。
+3. 程式取已合併的 main（或本分支）clone 到 WSL 的 `/root/projects/...`，在那裡 `uv sync`。
+
+## 步驟
+
+### 1. 備份正式庫（Windows）
+
+```powershell
+bes db backup
+```
+
+### 2. PST 暫存（WSL）
+
+把 PST 副本與正式庫的一份快照都**複製進 WSL 磁碟**（只讀 `/mnt/c`、寫 WSL 磁碟），再在 WSL 跑：
+
+```bash
+uv run python scripts/body_rederive_stage.py pst \
+  --database <WSL 上的正式庫快照> --stage <WSL>/stage-pst.db \
+  --pst-map '<pst_source 原路徑>=<WSL 上的 PST 副本>' ...（每個 PST 一個）\
+  --overwrite
+```
+
+- **結束碼必須是 0**。2 = 某個 PST 解包不完整（readpst 偶發中途停止、仍回報成功，#56）或讀不到 → 直接重跑同一行。
+- 摘要出現 `WARNING: no completeness ledger` 而且沒有「recount」字樣時，表示那個 PST 沒有可比對的封數帳本，重跑一次比對 `extracted_messages` 是否一致。
+- 跑完以 Windows 端 `robocopy "\\wsl$\Ubuntu-24.04\<路徑>" "<Windows 目的地>" stage-pst.db stage-pst-report.json /Z /R:2 /W:2` 搬回。
+
+### 3. IMAP 暫存（Windows）
+
+```powershell
+uv run python scripts/body_rederive_stage.py imap --database mailattic.db --stage <路徑>\stage-imap.db --env-file <寄件設定檔>
+```
+
+唯讀開正式庫；向伺服器只做唯讀抓信。約 16–20 分鐘。
+
+### 4. 試算 → 寫入（Windows，每個暫存庫各做一次）
+
+```powershell
+uv run python scripts/body_rederive_apply.py --canonical mailattic.db --stage <暫存庫>            # 試算，看計數
+uv run python scripts/body_rederive_apply.py --canonical mailattic.db --stage <暫存庫> --confirm  # 寫入
+```
+
+試算印出暫存時的排除計數（`[stage] ...`）與套用計數。`drifted`（暫存後正式庫內文又變了）與 `message_id_changed` 會被排除、不寫。寫入在單一交易內完成，並在暫存庫旁留一份逐封原內文（`*-apply-preimage.db`）。
+
+### 5. 抽查
+
+`bes show <db_id>` 看幾封含報價表格的信，欄位應以 `|` 分隔對齊。
+
+## 還原
+
+```powershell
+uv run python scripts/body_rederive_apply.py --canonical mailattic.db --restore <暫存庫>-apply-preimage.db            # 試算
+uv run python scripts/body_rederive_apply.py --canonical mailattic.db --restore <暫存庫>-apply-preimage.db --confirm  # 還原
+```
+
+套用後又被改過的信會被排除（`drifted_since_apply`）。整份退回則用步驟 1 的備份。
+
+## 2026-11-05/06 試跑結果（正式庫的唯讀複本）
+
+- IMAP：範圍 7,900 封；改寫 2,236、不變 4,256、伺服器已刪 1,301、舊 mbsync 檔名 107、內文變差 0。
+- PST：範圍 57,357 封；改寫約 4.6 萬、內文變差而保留約 260；有 Message-ID 的信除 1 封（同一 Message-ID 內文不一致）外全部配對成功；無 Message-ID 7,790 封不重做。
+- 還原實測：PST 47,533 封寫入後以 `--restore` 還原，內文與搜尋索引逐封與原值相同（0 不符）。
+- 精確數字與過程記在 #14 留言。
