@@ -47,7 +47,7 @@ uv run python scripts/body_rederive_stage.py pst \
 uv run python scripts/body_rederive_stage.py imap --database mailattic.db --stage <路徑>\stage-imap.db --env-file <寄件設定檔>
 ```
 
-唯讀開正式庫；向伺服器只做唯讀抓信。約 16–20 分鐘。
+唯讀開正式庫；向伺服器只做唯讀抓信。約 16–20 分鐘。**結束碼必須是 0**；2 = 連線中斷或抓信失敗 → 重跑同一行（加 `--overwrite`）。
 
 ### 4. 試算 → 寫入（Windows，每個暫存庫各做一次）
 
@@ -56,7 +56,7 @@ uv run python scripts/body_rederive_apply.py --canonical mailattic.db --stage <�
 uv run python scripts/body_rederive_apply.py --canonical mailattic.db --stage <暫存庫> --confirm  # 寫入
 ```
 
-試算印出暫存時的排除計數（`[stage] ...`）與套用計數。`drifted`（暫存後正式庫內文又變了）與 `message_id_changed` 會被排除、不寫。寫入在單一交易內完成，並在暫存庫旁留一份逐封原內文（`*-apply-preimage.db`）。
+套用工具只接受「已證明完整」的暫存庫（暫存時的判定存在暫存庫裡；暫存結束碼是 2 的，試算與寫入都會被拒，訊息列出原因，請重建暫存庫）。試算印出暫存時的排除計數（`[stage] ...`）與套用計數。`drifted`（暫存後正式庫內文又變了）與 `message_id_changed` 會被排除、不寫。寫入在單一交易內完成，並在暫存庫旁留一份逐封原內文（`*-apply-preimage.db`）。
 
 ### 5. 抽查
 
