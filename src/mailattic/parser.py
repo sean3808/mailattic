@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from email import policy
 from email.errors import InvalidHeaderDefect
@@ -18,7 +20,7 @@ from email.utils import getaddresses, parsedate_to_datetime
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import charset_normalizer
 
@@ -1053,6 +1055,8 @@ def _fallback_attachment_name(mime_type: str | None, sequence_number: int) -> st
 def _extract_body_text(message: Any) -> str:
     plain_parts: list[str] = []
     html_parts: list[str] = []
+    html_attribute_values: list[str] = []
+    has_data_table = False
 
     for part, in_alt in _walk_own_parts_with_context(message):
         if part.is_multipart():
@@ -1069,18 +1073,80 @@ def _extract_body_text(message: Any) -> str:
         if part.get_content_subtype() == "plain":
             plain_parts.append(content)
         elif part.get_content_subtype() == "html":
-            html_parts.append(_html_to_text(content))
+            html_text, html_has_data_table, attribute_values = (
+                _html_to_text_and_table_flag(content)
+            )
+            html_parts.append(html_text)
+            html_attribute_values.extend(attribute_values)
+            has_data_table = has_data_table or html_has_data_table
 
-    cleaned_plain_parts = [
+    plain_body = "\n\n".join(
         candidate.strip() for candidate in plain_parts if candidate.strip()
-    ]
-    if cleaned_plain_parts:
-        return "\n\n".join(cleaned_plain_parts)
+    )
+    # A data table in the HTML wins over a plain part: sender clients flatten
+    # tables in the plain alternative (#14, D-20261105-1).
+    if plain_body and not has_data_table:
+        return plain_body
 
-    cleaned_html_parts = [
+    html_body = "\n\n".join(
         candidate.strip() for candidate in html_parts if candidate.strip()
-    ]
-    return "\n\n".join(cleaned_html_parts)
+    )
+    if not plain_body:
+        return html_body
+
+    # Switch to the HTML text only when it still carries what the plain body
+    # had (#14, addendum 1e); otherwise keep plain and flag the flattened table.
+    if _html_covers_plain(plain_body, html_body, html_attribute_values):
+        return html_body
+    return f"{PLAIN_TABLE_FIDELITY_WARNING}\n{plain_body}"
+
+
+# Placed as the first line of a plain body kept despite an HTML data table.
+_TABLE_FIDELITY_PREFIX = "[表格失真提示]"  # agents match on this prefix
+_TABLE_FIDELITY_ADVICE = "欄位對應無法確定，請勿依文字判斷數值，請對照原信"
+PLAIN_TABLE_FIDELITY_WARNING = (
+    f"{_TABLE_FIDELITY_PREFIX} 本信的表格在純文字版中可能已經攤平，"
+    f"{_TABLE_FIDELITY_ADVICE}"
+)
+# CJK scripts have no spaces between words, so each character is a token;
+# any other run of letters/digits ("AB12", "Café") is one token, so swapped
+# identifiers cannot cover each other (#14 comment 5). The two alternatives
+# are disjoint character classes, so matching is linear.
+_CJK_CHARS = "぀-ヿ㐀-䶿一-鿿豈-﫿가-힯"
+_COVERAGE_TOKEN = re.compile(rf"[{_CJK_CHARS}]|[^\W_{_CJK_CHARS}]+")
+
+
+def _coverage_tokens(text: str) -> Counter[str]:
+    """Words for the coverage check: a CJK character is one token, every other
+    run of letters/digits is one token."""
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    return Counter(_COVERAGE_TOKEN.findall(folded))
+
+
+def _html_covers_plain(
+    plain: str, html_text: str, html_attribute_values: Iterable[str] = ()
+) -> bool:
+    """Whether the HTML side still carries the plain body's tokens (#14, 1e).
+
+    The HTML side is its text plus the href / img src / img alt values it holds
+    (plain parts spell URLs and addresses out). Any missing number token fails;
+    missing non-number tokens are tolerated up to max(2, 1% of the plain tokens),
+    never more than 10% of them (a short plain body cannot be dropped whole).
+    """
+    plain_tokens = _coverage_tokens(plain)
+    total = sum(plain_tokens.values())
+    if total == 0:
+        return True
+    html_tokens = _coverage_tokens(html_text)
+    for value in html_attribute_values:
+        html_tokens.update(_coverage_tokens(value))
+    missing = plain_tokens - html_tokens
+    missing_words = 0
+    for token, count in missing.items():
+        if any(char.isdigit() for char in token):
+            return False
+        missing_words += count
+    return missing_words <= min(max(2, total // 100), total // 10)
 
 
 def _extract_attachments(
@@ -1185,11 +1251,18 @@ def _is_attachment_part(
     return not in_alternative
 
 
-def _html_to_text(html: str) -> str:
+def _html_to_text_and_table_flag(html: str) -> tuple[str, bool, list[str]]:
+    """The HTML as text, whether it rendered a data table, and the attribute
+    values (href / img src / img alt) the coverage check counts (one parse)."""
     parser = _HTMLTextExtractor()
     parser.feed(html)
     parser.close()
-    return parser.get_text()
+    text = parser.get_text()
+    return text, parser.has_data_table, parser.attribute_values
+
+
+def _html_to_text(html: str) -> str:
+    return _html_to_text_and_table_flag(html)[0]
 
 
 _HTML_SKIPPED_TAGS = frozenset({"style", "script", "title"})
@@ -1203,43 +1276,296 @@ _HTML_BLOCK_TAGS = frozenset(
 
 
 _HTML_CELL_TAGS = frozenset({"td", "th"})
+# Text nodes on either side of these tags are one word when no whitespace
+# separates them ("NTD<b>8</b>5" -> "NTD85"); any other tag separates (#14).
+_HTML_GLUE_TAGS = frozenset(
+    {
+        "a", "abbr", "b", "big", "cite", "code", "del", "dfn", "em", "font", "i",
+        "ins", "kbd", "mark", "o:p", "q", "s", "samp", "small", "span", "strike",
+        "strong", "sub", "sup", "time", "u", "var",
+    }
+)  # fmt: skip
+# Row groups end the open row, the same as a new <tr> does in a browser.
+_HTML_ROW_GROUP_TAGS = frozenset({"thead", "tbody", "tfoot"})
+_URL_LEADING_JUNK = "".join(chr(code) for code in range(0x21))
 _HTML_CELL_SEPARATOR = " | "
+_HTML_SPAN_LIMIT = 100
+_HTML_PROSE_MAX_LINES = 5
+_HTML_PROSE_MAX_CHARS = 200
+_HTML_GRID_SLOT_LIMIT = 100_000
+
+# Placed on its own line right before a table whose columns cannot be trusted.
+TABLE_FIDELITY_WARNING = f"{_TABLE_FIDELITY_PREFIX} 以下表格的{_TABLE_FIDELITY_ADVICE}"
 
 
 class _LineBreak:
-    """Marks, inside a buffered table row, where a block tag ended a line."""
+    """Marks, inside a buffered table, where a block tag ended a line."""
 
 
 _LINE_BREAK = _LineBreak()
 
 
-class _TableRow:
-    """One ``<tr>`` being read: where its words start and its cells so far.
+class _Block:
+    """The finished lines of a nested table, placed in the outer table's stream."""
 
-    While the row is open, block tags inside it record ``_LINE_BREAK`` instead
-    of ending the line, so the row can still be laid out as columns when it
-    closes; ``_HTMLTextExtractor._replay`` turns it back into the plain output
-    otherwise.
+    def __init__(self, lines: list[str]) -> None:
+        self.lines = lines
+
+
+_Token = str | _LineBreak | _Block
+
+
+def _plain_lines(tokens: list[_Token]) -> list[str]:
+    """Plain output of a token stream: words joined per line, blocks verbatim."""
+    lines: list[str] = []
+    words: list[str] = []
+    for token in tokens:
+        if isinstance(token, str):
+            words.append(token)
+            continue
+        if words:
+            lines.append(" ".join(words))
+            words = []
+        if isinstance(token, _Block):
+            lines.extend(token.lines)
+    if words:
+        lines.append(" ".join(words))
+    return lines
+
+
+def _span(attrs: Any, name: str) -> tuple[int, bool]:
+    """A colspan/rowspan value as (span, clamped); invalid values count as 1."""
+    for key, value in attrs:
+        if key != name or value is None:
+            continue
+        try:
+            span = int(value)
+        except ValueError:
+            return 1, False
+        if span < 1:
+            return 1, False
+        if span > _HTML_SPAN_LIMIT:
+            return _HTML_SPAN_LIMIT, True
+        return span, False
+    return 1, False
+
+
+class _Cell:
+    """One ``<td>`` / ``<th>``: its token range in the table and its spans."""
+
+    __slots__ = ("colspan", "end", "rowspan", "start")
+
+    def __init__(self, start: int, colspan: int, rowspan: int) -> None:
+        self.start = start
+        self.end = start
+        self.colspan = colspan
+        self.rowspan = rowspan
+
+
+class _Row:
+    """One ``<tr>``: its token range in the table and its cells."""
+
+    def __init__(self, start: int) -> None:
+        self.start = start
+        self.end = start
+        self.cells: list[_Cell] = []
+        self.group_start = False  # first row of a thead/tbody/tfoot
+
+
+class _Table:
+    """One open ``<table>``: everything inside it, kept until it closes."""
+
+    def __init__(self) -> None:
+        self.tokens: list[_Token] = []
+        self.rows: list[_Row] = []
+        self.row: _Row | None = None
+        self.cell: _Cell | None = None
+        self.has_nested = False
+        self.clamped = False  # a colspan/rowspan above the limit was cut
+        self.max_row_width = 0  # widest row by summed colspans, for the slot cap
+        self.new_group = False  # the next row opens a new row group
+
+    def close_cell(self) -> None:
+        if self.cell is not None:
+            self.cell.end = len(self.tokens)
+            self.cell = None
+
+    def close_row(self) -> None:
+        self.close_cell()
+        if self.row is not None:
+            self.row.end = len(self.tokens)
+            self.max_row_width = max(
+                self.max_row_width, sum(cell.colspan for cell in self.row.cells)
+            )
+            self.rows.append(self.row)
+            self.row = None
+
+    def open_row(self) -> None:
+        self.close_row()
+        self.row = _Row(len(self.tokens))
+        self.row.group_start = self.new_group
+        self.new_group = False
+
+    def start_group(self) -> None:
+        """A thead/tbody/tfoot boundary: rowspans do not cross it."""
+        self.close_row()
+        self.new_group = True
+
+    def open_cell(self, attrs: Any) -> None:
+        if self.row is None:
+            self.open_row()  # a cell with no <tr>: browsers open the row
+        assert self.row is not None
+        self.close_cell()
+        colspan, colspan_clamped = _span(attrs, "colspan")
+        rowspan, rowspan_clamped = _span(attrs, "rowspan")
+        self.clamped = self.clamped or colspan_clamped or rowspan_clamped
+        self.cell = _Cell(len(self.tokens), colspan, rowspan)
+        self.row.cells.append(self.cell)
+
+
+def _cell_text(tokens: list[_Token], cell: _Cell) -> tuple[str, int]:
+    """The cell's words as one whitespace-collapsed line, and its source lines."""
+    groups: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens[cell.start : cell.end]:
+        if isinstance(token, str):
+            current.append(token)
+        elif current:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    text = " ".join(" ".join(" ".join(group) for group in groups).split())
+    return text, len(groups)
+
+
+def _row_strays(tokens: list[_Token], row: _Row) -> list[_Token]:
+    """The row's tokens that sit outside every cell."""
+    strays: list[_Token] = []
+    position = row.start
+    for cell in row.cells:
+        strays.extend(tokens[position : cell.start])
+        position = cell.end
+    strays.extend(tokens[position : row.end])
+    return strays
+
+
+def _nested_container_reads_as_columns(table: _Table) -> bool:
+    """Whether a table holding nested tables may hide a column mapping.
+
+    True when some row has two or more cells with own text (it reads as
+    columns) and some row has two or more filled cells (own text or a nested
+    table) of which one holds a nested table. Layout shapes stay plain."""
+    tokens = table.tokens
+    text_columns = False
+    nested_columns = False
+    for row in table.rows:
+        texted = 0
+        filled = 0
+        has_block = False
+        for cell in row.cells:
+            span = tokens[cell.start : cell.end]
+            has_text = any(isinstance(token, str) for token in span)
+            has_inner = any(isinstance(token, _Block) for token in span)
+            texted += has_text
+            filled += has_text or has_inner
+            has_block = has_block or has_inner
+        text_columns = text_columns or texted >= 2
+        nested_columns = nested_columns or (filled >= 2 and has_block)
+    return text_columns and nested_columns
+
+
+def _render_table(table: _Table) -> tuple[list[str], bool]:
+    """The table's output lines and whether it is a data table.
+
+    The caller has already closed the last row.
     """
+    tokens = table.tokens
+    if table.has_nested:
+        if _nested_container_reads_as_columns(table):
+            return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
+        return _plain_lines(tokens), False
+    if sum(1 for row in table.rows if row.cells) * table.max_row_width > (
+        _HTML_GRID_SLOT_LIMIT
+    ):
+        # Cheap pre-check; the running count below covers rowspan carry-over.
+        return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
 
-    def __init__(self, word_mark: int) -> None:
-        self.word_mark = word_mark  # len(_words) when the row opened
-        self.cells: list[list[str | _LineBreak]] = []
-        self.cell_start: int | None = None  # index into _words of the open cell
-        self.stray_text = False  # text seen outside any cell
+    # Lay the table out on the HTML grid. ``pending`` carries rowspan cells
+    # into the rows below as column -> (text, rows still to cover).
+    grid: list[dict[int, str]] = []
+    solo_spans: list[int] = []  # slots a row's only cell wrote; 0 if several cells
+    pending: dict[int, tuple[str, int]] = {}
+    prose = False
+    overlap = False
+    is_data = False
+    width = 0
+    total_slots = 0  # running grid size; stops the layout at the cap
+    for row in table.rows:
+        if row.group_start:
+            pending = {}  # a rowspan ends with its row group
+        slots: dict[int, str] = {}
+        carried: dict[int, tuple[str, int]] = {}
+        for column, (text, remaining) in pending.items():
+            slots[column] = text
+            if remaining > 1:
+                carried[column] = (text, remaining - 1)
+        total_slots += len(slots)
+        if total_slots > _HTML_GRID_SLOT_LIMIT:
+            return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
+        column = 0
+        written = 0
+        for cell in row.cells:
+            text, line_count = _cell_text(tokens, cell)
+            if line_count > _HTML_PROSE_MAX_LINES or len(text) > _HTML_PROSE_MAX_CHARS:
+                prose = True
+            while column in slots:
+                column += 1
+            for target in range(column, column + cell.colspan):
+                if target not in slots:
+                    slots[target] = text
+                    written += 1
+                    total_slots += 1
+                    if total_slots > _HTML_GRID_SLOT_LIMIT:
+                        return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], False
+                    if cell.rowspan > 1:
+                        carried[target] = (text, cell.rowspan - 1)
+                else:
+                    # Spans that cross each other: the cell cannot hold all
+                    # the columns it claims, so the mapping is uncertain.
+                    overlap = True
+            column += cell.colspan
+        pending = carried
+        grid.append(slots)
+        solo_spans.append(written if len(row.cells) == 1 else 0)
+        if slots:
+            width = max(width, max(slots) + 1)
+            is_data = is_data or sum(1 for text in slots.values() if text) >= 2
 
+    if not is_data:
+        return _plain_lines(tokens), False
+    if prose:
+        return [TABLE_FIDELITY_WARNING, *_plain_lines(tokens)], True
 
-def _cell_text(cell: list[str | _LineBreak]) -> str | None:
-    """The cell as one line, or None when it holds more than one line."""
-    start, end = 0, len(cell)
-    while start < end and cell[start] is _LINE_BREAK:
-        start += 1
-    while end > start and cell[end - 1] is _LINE_BREAK:
-        end -= 1
-    words = cell[start:end]
-    if any(word is _LINE_BREAK for word in words):
-        return None
-    return " ".join(" ".join(str(word) for word in words).split())
+    warn = table.clamped or overlap
+    lines: list[str] = []
+    position = 0
+    for row, slots, solo in zip(table.rows, grid, solo_spans, strict=True):
+        lines.extend(_plain_lines(tokens[position : row.start]))
+        values = [slots.get(index, "") for index in range(width)]
+        if not any(values):
+            pass
+        elif width > 1 and solo == width and len(slots) == width:
+            lines.append(values[0])  # a title row spanning the whole grid
+        else:
+            lines.append(_HTML_CELL_SEPARATOR.join(values))
+        strays = _row_strays(tokens, row)
+        if any(isinstance(token, str) for token in strays):
+            warn = True
+            lines.extend(_plain_lines(strays))
+        position = row.end
+    lines.extend(_plain_lines(tokens[position:]))
+    return ([TABLE_FIDELITY_WARNING, *lines] if warn and lines else lines), True
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -1248,100 +1574,95 @@ class _HTMLTextExtractor(HTMLParser):
     ``style`` / ``script`` / ``title`` content is dropped (#294). One pass over
     the parser's events, no regex.
 
-    Table rows with two or more filled cells become one line with
-    ``_HTML_CELL_SEPARATOR`` between cells, an empty cell keeping its slot, so
-    values do not shift columns (#14). A row the converter cannot map to
-    columns (more than one line inside a cell, a nested table, text outside any
-    cell, a single filled cell) keeps the plain space-joined output.
+    A table is buffered until it closes, then laid out on the HTML grid:
+    ``colspan`` / ``rowspan`` repeat the cell text in every slot they cover (#14).
+    A data table (no nested table, at least one row with two or more filled
+    slots) writes one line per non-empty row with ``_HTML_CELL_SEPARATOR``
+    between slots, empty slots kept; a row holding one cell spanning the whole
+    grid is plain text. Any other table (a layout table) keeps the plain
+    space-joined output, its nested tables laid out on their own.
+    ``TABLE_FIDELITY_WARNING`` precedes a data table whose columns cannot be
+    trusted: text outside any cell, a span clamped to ``_HTML_SPAN_LIMIT``, or
+    a cell of prose (more than ``_HTML_PROSE_MAX_LINES`` lines or
+    ``_HTML_PROSE_MAX_CHARS`` characters; such a table is then rendered plain).
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._lines: list[str] = []
-        # Holds _LINE_BREAK only while a row is buffering; plain str otherwise.
-        self._words: list[str | _LineBreak] = []
+        self._words: list[str] = []
         self._skipped: list[str] = []
+        self._glue = False  # the last text node ended without whitespace
         self._skip_depth = 0
-        # One entry per open <table>: its buffering row, or None between rows
-        # and once a row has been given up as columns.
-        self._tables: list[_TableRow | None] = []
+        # One entry per open <table>; words go to the innermost one.
+        self._tables: list[_Table] = []
+        self.has_data_table = False  # set while rendering; read after get_text()
+        # <a href> / <img src> / <img alt> values, for the coverage check;
+        # HTMLParser has already unescaped them.
+        self.attribute_values: list[str] = []
 
-    def _open_row(self) -> _TableRow | None:
-        return self._tables[-1] if self._tables else None
+    def _collect_attribute_values(self, tag: str, attrs: Any) -> None:
+        for name, value in attrs:
+            if not value:
+                continue
+            # Only what the reader of the HTML sees as a link or image: a
+            # <link>/<base> href is not content and must not cover plain text.
+            # A data: URI (browsers ignore leading control characters and
+            # spaces) is an inline payload, not a link anyone reads.
+            is_link = (tag == "a" and name == "href") or (
+                tag == "img" and name == "src"
+            )
+            is_data_uri = value.lstrip(_URL_LEADING_JUNK).lower().startswith("data:")
+            if (tag == "img" and name == "alt") or (is_link and not is_data_uri):
+                self.attribute_values.append(value)
 
     def _end_line(self) -> None:
-        if self._open_row() is not None:
-            if self._words and self._words[-1] is not _LINE_BREAK:
-                self._words.append(_LINE_BREAK)
+        if self._tables:
+            tokens = self._tables[-1].tokens
+            if tokens and tokens[-1] is not _LINE_BREAK:
+                tokens.append(_LINE_BREAK)
             return
         if self._words:
-            self._lines.append(" ".join(cast("list[str]", self._words)))
+            self._lines.append(" ".join(self._words))
             self._words = []
 
-    def _replay(self, row: _TableRow) -> None:
-        """Give ``row`` up as columns and emit its words as plain output.
-
-        The caller has already cleared the row's slot in ``_tables``.
-        """
-        buffered = self._words[row.word_mark :]
-        del self._words[row.word_mark :]
-        for word in buffered:
-            if word is _LINE_BREAK:
-                self._end_line()
-            else:
-                self._words.append(word)
-
-    def _close_cell(self, row: _TableRow) -> None:
-        if row.cell_start is not None:
-            row.cells.append(self._words[row.cell_start :])
-            row.cell_start = None
-
-    def _close_row(self) -> None:
-        row = self._open_row()
-        if row is None:
-            return
-        self._tables[-1] = None
-        self._close_cell(row)
-        cell_texts = [_cell_text(cell) for cell in row.cells]
-        if (
-            not row.stray_text
-            and None not in cell_texts
-            and sum(1 for text in cell_texts if text) >= 2
-        ):
-            del self._words[row.word_mark :]
-            self._words.append(
-                _HTML_CELL_SEPARATOR.join(str(text) for text in cell_texts)
-            )
+    def _finish_table(self) -> None:
+        table = self._tables.pop()
+        table.close_row()
+        lines, is_data = _render_table(table)
+        # A warned table also decides body selection: the plain alternative
+        # flattened it too, so dropping the HTML would drop the warning (#14).
+        warned = bool(lines) and lines[0] == TABLE_FIDELITY_WARNING
+        self.has_data_table = self.has_data_table or is_data or warned
+        if self._tables:
+            self._tables[-1].tokens.append(_Block(lines))
         else:
-            self._replay(row)
-        self._end_line()
-
-    def _close_table(self) -> None:
-        self._close_row()
-        self._tables.pop()
+            self._lines.extend(lines)
 
     def handle_starttag(self, tag: str, attrs: Any) -> None:
         if tag in _HTML_SKIPPED_TAGS:
             self._skip_depth += 1
             return
-        if tag == "table":
-            outer = self._open_row()
-            if outer is not None:  # a nested table: the outer row is not columns
-                self._tables[-1] = None
-                self._replay(outer)
-        elif tag == "tr":
-            self._close_row()
+        if tag not in _HTML_GLUE_TAGS:
+            self._glue = False
+        if not self._skip_depth:
+            self._collect_attribute_values(tag, attrs)
+        if self._tables:
+            if tag == "table":
+                self._tables[-1].has_nested = True
+            elif tag == "tr":
+                self._tables[-1].close_row()
+            elif tag in _HTML_ROW_GROUP_TAGS:
+                self._tables[-1].start_group()
         if tag in _HTML_BLOCK_TAGS:
             self._end_line()
         if tag == "table":
-            self._tables.append(None)
-        elif tag == "tr" and self._tables:
-            self._tables[-1] = _TableRow(len(self._words))
-        elif tag in _HTML_CELL_TAGS:
-            row = self._open_row()
-            if row is not None:
-                self._close_cell(row)
-                row.cell_start = len(self._words)
+            self._tables.append(_Table())
+        elif self._tables:
+            if tag == "tr":
+                self._tables[-1].open_row()
+            elif tag in _HTML_CELL_TAGS:
+                self._tables[-1].open_cell(attrs)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in _HTML_SKIPPED_TAGS:
@@ -1349,31 +1670,47 @@ class _HTMLTextExtractor(HTMLParser):
             if not self._skip_depth:
                 self._skipped = []
             return
+        if tag not in _HTML_GLUE_TAGS:
+            self._glue = False
         if tag in _HTML_CELL_TAGS:
-            row = self._open_row()
-            if row is not None:
-                self._close_cell(row)
+            if self._tables:
+                self._tables[-1].close_cell()
         elif tag == "tr":
-            self._close_row()
+            if self._tables:
+                self._tables[-1].close_row()
+        elif tag in _HTML_ROW_GROUP_TAGS:
+            if self._tables:
+                self._tables[-1].start_group()
         elif tag == "table" and self._tables:
-            self._close_table()
+            self._finish_table()
         if tag in _HTML_BLOCK_TAGS:
             self._end_line()
 
     def handle_data(self, data: str) -> None:
         if not data.strip():
+            self._glue = False
             return
         if self._skip_depth:
             self._skipped.append(data.strip())
             return
-        row = self._open_row()
-        if row is not None and row.cell_start is None:
-            row.stray_text = True
-        self._words.append(data.strip())
+        text = data.strip()
+        target = self._tables[-1].tokens if self._tables else self._words
+        # Text nodes split only by inline tags ("NTD<b>85</b>") are one word,
+        # as a browser shows them; whitespace or a block/cell tag separates.
+        if (
+            self._glue
+            and not data[0].isspace()
+            and target
+            and isinstance(target[-1], str)
+        ):
+            target[-1] += text
+        else:
+            target.append(text)
+        self._glue = not data[-1].isspace()
 
     def get_text(self) -> str:
         while self._tables:  # tables left open by malformed HTML
-            self._close_table()
+            self._finish_table()
         if self._skip_depth:
             # The skipped element never closed (malformed HTML), so "skipped"
             # swallowed the rest of the mail. Keep that text rather than store

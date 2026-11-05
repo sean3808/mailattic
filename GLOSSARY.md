@@ -144,6 +144,24 @@
 - **Avoid**: auto-abandon, 自動放棄, 自動結案（不分原因）, resolved by any route
 - **Why**: Contract #5 retries a failed UID until it is stored, but nothing closed the record afterwards, so every healed failure stayed open forever and `bes db doctor` could never reach zero. It is not abandonment: abandonment concedes the data is lost, self-healing proves it is present, so "the system never abandons on its own" still holds. Strict on purpose: the same message arriving through another route (matched by Message-ID) does not heal the record, because another route's copy cannot prove this source's copy lost nothing, and many failure records carry no Message-ID at all. Owner: Sean (settled in #31 grilling, 2026-10-30); source: #31.
 
+### Table fidelity (表格保真)
+
+- **Definition**: The guarantee that a table in a stored message body is either rendered so every value stays in its own column position, or carries a [[table fidelity warning]]. A table that reads as normal text while its column correspondence is lost is the defect this guarantee rules out.
+- **Avoid**: 排版保留, 保留格式 (fidelity is about which value belongs to which column, not looks), 100% 轉對 (not promised: some shapes cannot be expressed as one line of text)
+- **Why**: The worry is an AI misreading a customer's quote or order table (a value read as the wrong column), not appearance. Converting every shape correctly is impossible without storing HTML; "correct or flagged" makes misreading possible only through a silent failure, which tests can pin down. Owner: Sean (settled in #14 grilling, 2026-11-05); source: [#14](https://github.com/sean3808/mailattic/issues/14).
+
+### Table fidelity warning (表格失真提示)
+
+- **Definition**: A line in a stored message body marking a table whose column correspondence could not be determined. A reader seeing it must not judge values from that table's text, and must check the [[original export]] or ask Sean instead.
+- **Avoid**: 錯誤, 解析失敗 (the message was stored; only that table is uncertain)
+- **Why**: It is the "flagged" half of [[table fidelity]]. Owner: Sean (2026-11-05); source: #14.
+
+### Original export (匯出原信)
+
+- **Definition**: Retrieving one stored message's original from its source (the PST it was imported from, or the mail server) and writing it as a file Sean opens in Outlook, so it shows exactly as the sender sent it. When neither source still holds it, the fallback is giving Sean the subject, sender and date.
+- **Avoid**: 存 HTML, 原始格式保留 (nothing is stored in the DB; the original is fetched on demand)
+- **Why**: It is the most accurate check for a [[table fidelity warning]], and it avoids keeping HTML in the store. Owner: Sean (2026-11-05, #14 grilling; tracked as its own ticket after #14).
+
 ---
 
 ## Maintenance principles
