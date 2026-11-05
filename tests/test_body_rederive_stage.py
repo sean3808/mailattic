@@ -1546,3 +1546,144 @@ def test_stage_and_report_paths_with_uri_special_characters(tmp_path, stub_readp
     db, stage, readpst = _one_row_world(tmp_path, stub_readpst, "a#b%20c#d")
     assert _run(db, stage, readpst) == 0
     assert _report(stage)["counts"]["rewrite"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Degradation guard: keep the stored body when the re-derived one is worse
+# ---------------------------------------------------------------------------
+
+OLD_CJK = "測試範例備貨出口通知單請查收附件內容" * 2
+# Big5 bytes decoded as Latin-1: the exact shape the parser defect produces.
+MOJIBAKE_NEW = OLD_CJK.encode("big5").decode("latin-1")
+B64_LINES = "\n".join(
+    ["QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2"] * 4
+)
+OLD_TEXT = "Delivery status: the message could not be delivered.\nPlease retry later."
+M3 = "<m3@example.test>"
+
+
+def test_degradation_reason_flags_big5_as_latin1_mojibake():
+    assert stage_module._degradation_reason(OLD_CJK, MOJIBAKE_NEW) == "mojibake"
+
+
+def test_degradation_reason_ignores_accented_text_without_cjk_in_old():
+    old = "Bonjour, voici la facture."
+    new = "Bonjour, voici la facture. Résumé: déjà vu, café, façade, élève, über, ñandú"
+    assert sum(1 for c in new if 0xA1 <= ord(c) <= 0xFF) >= 10
+    assert stage_module._degradation_reason(old, new) is None
+    vietnamese = "Xin chào, đây là hóa đơn của bạn. Cảm ơn quý khách rất nhiều ạ."
+    assert stage_module._degradation_reason(vietnamese, vietnamese + " ớ ờ ở") is None
+
+
+def test_degradation_reason_ignores_cjk_reduction_without_latin1_high_chars():
+    assert stage_module._degradation_reason(OLD_CJK, "Plain English body only") is None
+    # Enough Latin-1 high chars but CJK kept: not mojibake.
+    assert stage_module._degradation_reason(OLD_CJK, OLD_CJK + "é" * 30) is None
+    # Old has < 10 CJK chars: the signature does not apply.
+    assert stage_module._degradation_reason("測試範例", "é" * 30) is None
+
+
+def test_degradation_reason_flags_base64_new_over_text_old():
+    assert stage_module._degradation_reason(OLD_TEXT, B64_LINES) == "base64"
+
+
+def test_degradation_reason_ignores_base64_in_both():
+    assert stage_module._degradation_reason(B64_LINES, B64_LINES + "\nmore") is None
+    # Half base64 is not "more than half".
+    half = B64_LINES.splitlines()[0] + "\nshort text"
+    assert stage_module._degradation_reason(OLD_TEXT, half) is None
+
+
+def test_pst_degraded_rewrites_are_kept_and_good_rewrite_still_staged(
+    tmp_path, stub_readpst
+):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [
+        _plain_message(M1, MOJIBAKE_NEW),  # locator-paired, mojibake
+        _table_message(M2),  # locator-paired, good rewrite
+        _plain_message(M3, B64_LINES),  # row says #9: fallback-paired, base64
+    ]
+    db, (mid1, mid2, mid3) = _canonical(
+        tmp_path,
+        [
+            _row(pst=pst, index=1, message_id=M1, body=OLD_CJK),
+            _row(pst=pst, index=2, message_id=M2, body=PLAIN_FLAT),
+            _row(pst=pst, index=9, message_id=M3, body=OLD_TEXT),
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    assert set(_staged(stage)) == {mid2}
+    report = _report(stage)
+    assert report["counts"]["degraded_kept"] == 2
+    assert report["counts"]["rewrite"] == 1
+    assert report["counts"]["paired_by_message_id"] == 1
+    entry_counts = report["per_pst"][0]["counts"]
+    assert entry_counts["degraded_kept"] == 2
+    assert report["degraded_sample_ids"] == [
+        {"id": mid1, "reason": "mojibake"},
+        {"id": mid3, "reason": "base64"},
+    ]
+
+
+def test_degraded_sample_ids_are_capped_at_twenty(tmp_path, stub_readpst):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    count = 25
+    mboxes["a.pst"] = [
+        _plain_message(f"<d{i}@example.test>", MOJIBAKE_NEW) for i in range(count)
+    ]
+    db, _ids = _canonical(
+        tmp_path,
+        [
+            _row(pst=pst, index=i + 1, message_id=f"<d{i}@example.test>", body=OLD_CJK)
+            for i in range(count)
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 0
+
+    report = _report(stage)
+    assert report["counts"]["degraded_kept"] == count
+    assert len(report["degraded_sample_ids"]) == 20
+
+
+def test_imap_degraded_rewrites_are_kept_and_good_rewrite_still_staged(
+    tmp_path, fake_imap
+):
+    env_file, install = fake_imap
+    fake = FakeImapConnection(
+        {
+            "INBOX": {
+                11: _eml(_plain_message("<i1@example.test>", MOJIBAKE_NEW)),
+                12: _eml(_table_message("<i2@example.test>")),
+                13: _eml(_plain_message("<i3@example.test>", B64_LINES)),
+            }
+        }
+    )
+    install(fake)
+    db, (mid1, mid2, mid3) = _imap_canonical(
+        tmp_path,
+        [
+            _maildir_row("INBOX/new/uid-11.eml", "<i1@example.test>", OLD_CJK),
+            _maildir_row("INBOX/new/uid-12.eml", "<i2@example.test>", PLAIN_FLAT),
+            _maildir_row("INBOX/new/uid-13.eml", "<i3@example.test>", OLD_TEXT),
+        ],
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run_imap(db, stage, env_file) == 0
+
+    assert set(_staged(stage)) == {mid2}
+    report = _report(stage)
+    assert report["counts"]["degraded_kept"] == 2
+    assert report["counts"]["rewrite"] == 1
+    assert report["per_folder"][0]["counts"]["degraded_kept"] == 2
+    assert report["degraded_sample_ids"] == [
+        {"id": mid1, "reason": "mojibake"},
+        {"id": mid3, "reason": "base64"},
+    ]

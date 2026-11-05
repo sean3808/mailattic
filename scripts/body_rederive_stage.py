@@ -71,6 +71,17 @@ fingerprint the apply step must re-check), ``new_body_text`` and ``status``
 (``rewrite``). Rows whose re-derived body equals the canonical one are counted
 as ``unchanged`` and not staged.
 
+Degradation guard (both subcommands): before a rewrite is staged the stored
+body is compared with the re-derived one (``_degradation_reason``). A rewrite
+that turns CJK text into Latin-1 mojibake (stored has >= 10 CJK chars, new
+keeps < half of them and has >= 20 chars in U+00A1-U+00FF), or turns readable
+text into mostly raw base64 lines (> 50% of new's non-empty lines vs < 20% of
+old's), is NOT staged: it is counted ``degraded_kept`` (pst: in the row's own
+per-PST counts, also for Message-ID-fallback rows; imap: per folder) and the
+first 20 such canonical ids with their reason are listed in the report's
+``degraded_sample_ids``. The stored body is read by id only when a rewrite is
+about to be staged. The parser defect behind these bodies is a separate issue.
+
 How IMAP rows are re-derived (``imap`` subcommand):
   * scope is ``source_input_mode='maildir'``; ``archive`` / ``outbound`` rows
     are out of scope and not counted;
@@ -154,6 +165,15 @@ SOURCE_KIND_PST = "pst"
 SOURCE_KIND_IMAP = "imap"
 STATUS_REWRITE = "rewrite"
 
+# Degradation guard thresholds (see _degradation_reason).
+_MOJIBAKE_OLD_CJK_MIN = 10
+_MOJIBAKE_CJK_KEEP_RATIO = 0.5
+_MOJIBAKE_LATIN1_MIN = 20
+_BASE64_LINE_RE = re.compile(r"^[A-Za-z0-9+/=]{40,}$")
+_BASE64_NEW_MIN_SHARE = 0.5
+_BASE64_OLD_MAX_SHARE = 0.2
+_DEGRADED_SAMPLE_CAP = 20
+
 _STAGE_SCHEMA = """
 CREATE TABLE body_rederive (
     message_id INTEGER PRIMARY KEY,
@@ -169,6 +189,9 @@ CREATE TABLE stage_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 _OUTCOMES = (
     "rewrite",
     "unchanged",
+    # degraded_kept: the re-derived body is visibly worse (mojibake / base64);
+    # the stored body is kept and nothing is staged.
+    "degraded_kept",
     "no_message_id",
     "no_message_id_with_table",
     "no_message_id_unpaired",
@@ -190,6 +213,7 @@ _OUTCOMES = (
 _IMAP_OUTCOMES = (
     "rewrite",
     "unchanged",
+    "degraded_kept",
     "no_message_id",
     "message_id_mismatch",
     "locator_unparsable",
@@ -364,6 +388,77 @@ def _empty_counts(outcomes: tuple[str, ...] = _OUTCOMES) -> dict[str, int]:
     return dict.fromkeys(outcomes, 0)
 
 
+def _count_range(text: str, low: int, high: int) -> int:
+    return sum(1 for ch in text if low <= ord(ch) <= high)
+
+
+def _base64_line_share(text: str) -> float:
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return 0.0
+    return sum(1 for line in lines if _BASE64_LINE_RE.match(line)) / len(lines)
+
+
+def _degradation_reason(old: str, new: str) -> str | None:
+    """Why *new* is visibly worse than *old*: ``"mojibake"`` (CJK text turned
+    into Latin-1 high characters), ``"base64"`` (readable text turned into
+    mostly raw base64 lines), or None. When it cannot be told, None (keep the
+    rewrite decision to the caller; PC-230)."""
+    old_cjk = _count_range(old, 0x4E00, 0x9FFF)
+    if (
+        old_cjk >= _MOJIBAKE_OLD_CJK_MIN
+        and _count_range(new, 0x4E00, 0x9FFF) < _MOJIBAKE_CJK_KEEP_RATIO * old_cjk
+        and _count_range(new, 0x00A1, 0x00FF) >= _MOJIBAKE_LATIN1_MIN
+    ):
+        return "mojibake"
+    if (
+        _base64_line_share(new) > _BASE64_NEW_MIN_SHARE
+        and _base64_line_share(old) < _BASE64_OLD_MAX_SHARE
+    ):
+        return "base64"
+    return None
+
+
+class _DegradedSamples:
+    """First ``_DEGRADED_SAMPLE_CAP`` degraded canonical ids, with reason."""
+
+    def __init__(self) -> None:
+        self.items: list[dict] = []
+
+    def add(self, row_id: int, reason: str) -> None:
+        if len(self.items) < _DEGRADED_SAMPLE_CAP:
+            self.items.append({"id": row_id, "reason": reason})
+
+
+def _stored_body(canonical: sqlite3.Connection, row_id: int) -> str:
+    """The stored body, fetched only when a rewrite is about to be staged."""
+    found = canonical.execute(
+        "SELECT body_text FROM messages WHERE id = ?", (row_id,)
+    ).fetchone()
+    return found[0] if found and found[0] is not None else ""
+
+
+def _stage_or_keep(
+    stage_con: sqlite3.Connection,
+    canonical: sqlite3.Connection,
+    row: dict,
+    new_body: str,
+    source_kind: str,
+    counts: dict[str, int],
+    samples: _DegradedSamples,
+) -> None:
+    """Stage the rewrite unless the re-derived body is visibly worse than the
+    stored one (then keep the old body and count ``degraded_kept``)."""
+    reason = _degradation_reason(_stored_body(canonical, row["id"]), new_body)
+    if reason is not None:
+        counts["degraded_kept"] += 1
+        samples.add(row["id"], reason)
+        return
+    _stage_rewrite(stage_con, row, new_body, source_kind)
+    counts["rewrite"] += 1
+
+
 def _stage_rewrite(
     stage_con: sqlite3.Connection,
     row: dict,
@@ -474,6 +569,8 @@ def _resolve_fallback(
     store: _FallbackStore,
     stage_con: sqlite3.Connection,
     counts_by_pst: dict[str, dict[str, int]],
+    canonical: sqlite3.Connection,
+    samples: _DegradedSamples,
 ) -> None:
     for pst_source, row, reason, bodies in store.resolve():
         counts = counts_by_pst[pst_source]
@@ -485,8 +582,9 @@ def _resolve_fallback(
             counts["unchanged"] += 1
             counts["paired_by_message_id"] += 1
         else:
-            _stage_rewrite(stage_con, row, bodies[0], SOURCE_KIND_PST)
-            counts["rewrite"] += 1
+            _stage_or_keep(
+                stage_con, canonical, row, bodies[0], SOURCE_KIND_PST, counts, samples
+            )
             counts["paired_by_message_id"] += 1
 
 
@@ -499,6 +597,8 @@ def _classify_pair(
     stage_con: sqlite3.Connection,
     pst_source: str,
     store: _FallbackStore,
+    canonical: sqlite3.Connection,
+    samples: _DegradedSamples,
 ) -> None:
     if not row["message_id"]:
         # Never staged. Only count a table when the re-unpacked message is
@@ -516,8 +616,9 @@ def _classify_pair(
     if _sha256_text(new_body) == row["body_sha256"]:
         counts["unchanged"] += 1
         return
-    _stage_rewrite(stage_con, row, new_body, SOURCE_KIND_PST)
-    counts["rewrite"] += 1
+    _stage_or_keep(
+        stage_con, canonical, row, new_body, SOURCE_KIND_PST, counts, samples
+    )
 
 
 def _process_pst(
@@ -527,6 +628,8 @@ def _process_pst(
     stage_con: sqlite3.Connection,
     read_from: Path,
     store: _FallbackStore,
+    canonical: sqlite3.Connection,
+    samples: _DegradedSamples,
     ledger: dict | None = None,
 ) -> tuple[dict[str, int], int, bool | None]:
     """``pst_source`` keys the canonical rows; ``read_from`` is the file read.
@@ -584,6 +687,8 @@ def _process_pst(
                     stage_con,
                     pst_source,
                     store,
+                    canonical,
+                    samples,
                 )
 
     extraction_complete: bool | None = None
@@ -665,6 +770,7 @@ def build_pst_stage(
             store.discard()
             raise
         per_pst: list[dict] = []
+        samples = _DegradedSamples()
         try:
             stage_con.executescript(_STAGE_SCHEMA)
             for pst_source in pst_sources:
@@ -683,6 +789,8 @@ def build_pst_stage(
                     stage_con,
                     read_from,
                     store,
+                    canonical,
+                    samples,
                     ledger,
                 )
                 stage_con.commit()
@@ -704,7 +812,11 @@ def build_pst_stage(
             # Every PST is unpacked: resolve the fallback pool across all of
             # them (a row of PST A may live in PST B now).
             _resolve_fallback(
-                store, stage_con, {p["pst_source"]: p["counts"] for p in per_pst}
+                store,
+                stage_con,
+                {p["pst_source"]: p["counts"] for p in per_pst},
+                canonical,
+                samples,
             )
             stage_con.commit()
             totals = _empty_counts()
@@ -722,6 +834,7 @@ def build_pst_stage(
                 "rows_in_scope": sum(p["rows"] for p in per_pst),
                 "counts": totals,
                 "requested_psts_not_in_canonical": not_in_canonical,
+                "degraded_sample_ids": samples.items,
                 "per_pst": per_pst,
             }
             # The report travels with the stage (same commit as the other
@@ -784,6 +897,8 @@ def _process_imap_folder(
     items: list[tuple[int, int | None, dict]],
     stage_con: sqlite3.Connection,
     counts: dict[str, int],
+    canonical: sqlite3.Connection,
+    samples: _DegradedSamples,
 ) -> bool:
     """Re-fetch *items* (uid, locator uidvalidity, row) of one folder.
 
@@ -844,8 +959,9 @@ def _process_imap_folder(
         if _sha256_text(new_body) == row["body_sha256"]:
             counts["unchanged"] += 1
             continue
-        _stage_rewrite(stage_con, row, new_body, SOURCE_KIND_IMAP)
-        counts["rewrite"] += 1
+        _stage_or_keep(
+            stage_con, canonical, row, new_body, SOURCE_KIND_IMAP, counts, samples
+        )
     return False
 
 
@@ -863,11 +979,38 @@ def build_imap_stage(
     factory = client_factory or (lambda e: NativeImapClient(e))
     started = datetime.now(UTC)
 
+    # Stays open for the run: stored bodies are looked up by id, only for the
+    # rows about to be staged (the row list carries hashes, not bodies).
     canonical = connect_database(database, read_only=True)
     try:
-        rows = _canonical_maildir_rows(canonical)
+        return _build_imap_stage(
+            canonical,
+            database=database,
+            stage=stage,
+            env=env,
+            folder_filter=folder_filter,
+            overwrite=overwrite,
+            limit=limit,
+            factory=factory,
+            started=started,
+        )
     finally:
         canonical.close()
+
+
+def _build_imap_stage(
+    canonical: sqlite3.Connection,
+    *,
+    database: Path,
+    stage: Path,
+    env: dict[str, str],
+    folder_filter: list[str],
+    overwrite: bool,
+    limit: int | None,
+    factory: Callable[[dict[str, str]], NativeImapClient],
+    started: datetime,
+) -> dict:
+    rows = _canonical_maildir_rows(canonical)
     if folder_filter:
         rows = [
             r
@@ -890,6 +1033,7 @@ def build_imap_stage(
         )
 
     per_folder: list[dict] = []
+    samples = _DegradedSamples()
     aborted = False
     client = factory(env)
     try:
@@ -913,7 +1057,7 @@ def build_imap_stage(
                 else:
                     items.sort(key=lambda item: item[0])
                     aborted = _process_imap_folder(
-                        client, folder, items, stage_con, counts
+                        client, folder, items, stage_con, counts, canonical, samples
                     )
                 stage_con.commit()
                 for key, value in counts.items():
@@ -939,6 +1083,7 @@ def build_imap_stage(
                 "aborted": aborted,
                 "gone_from_server": totals["not_on_server"] + totals["folder_missing"],
                 "counts": totals,
+                "degraded_sample_ids": samples.items,
                 "per_folder": per_folder,
             }
             stage_con.executemany(
