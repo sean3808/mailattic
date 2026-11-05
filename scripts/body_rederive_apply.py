@@ -176,7 +176,7 @@ def _same_file(left: Path, right: Path) -> bool:
 def _check_stage(stage: Path) -> None:
     if not stage.exists():
         raise ApplyRefused(f"stage not found: {stage}")
-    con = sqlite3.connect(f"file:{stage.as_posix()}?mode=ro", uri=True)
+    con = connect_database(stage, read_only=True)
     try:
         tables = {
             row[0]
@@ -201,8 +201,35 @@ def _check_stage(stage: Path) -> None:
                 f"stage {stage} has no stage_meta.source_kind; the stage build "
                 "did not finish"
             )
+        stored = con.execute(
+            "SELECT value FROM stage_meta WHERE key = 'report_json'"
+        ).fetchone()
+        if stored is None:
+            raise ApplyRefused(
+                f"stage {stage} has no stage_meta.report_json; stage incomplete "
+                "-- rebuild it (its excluded/failed counts would be unreviewable)"
+            )
+        try:
+            json.loads(stored[0])
+        except ValueError as exc:
+            raise ApplyRefused(
+                f"stage {stage} has an unreadable stage_meta.report_json "
+                f"({exc!r}); stage incomplete -- rebuild it"
+            ) from exc
     finally:
         con.close()
+
+
+def _stage_report(stage: Path) -> dict:
+    """The stage builder's own report (counts of excluded / failed rows)."""
+    con = connect_database(stage, read_only=True)
+    try:
+        row = con.execute(
+            "SELECT value FROM stage_meta WHERE key = 'report_json'"
+        ).fetchone()
+    finally:
+        con.close()
+    return json.loads(row[0])
 
 
 def _preflight(canonical: Path, stage: Path) -> None:
@@ -307,6 +334,7 @@ def build_plan(canonical: Path, stage: Path) -> tuple[dict, dict]:
         "stage": str(stage),
         "stage_sha256": _file_sha256(stage),
         "counts": counts,
+        "stage_report": _stage_report(stage),
         "sample": [
             {"id": mid, "before_len": lengths[mid][0], "after_len": lengths[mid][1]}
             for mid in sample_ids
@@ -365,6 +393,12 @@ def run_dry_run(canonical: Path, stage: Path) -> int:
         return 1
     print(f"[dry-run] plan_digest: {report['plan_digest']}")
     _print_counts("dry-run", report["counts"])
+    stage_counts = report["stage_report"].get("counts", {})
+    print(
+        f"[dry-run] stage build counts ({report['stage_report'].get('mode')}): "
+        "review the exclusions before --confirm"
+    )
+    _print_counts("stage", stage_counts)
     return 0
 
 
@@ -623,8 +657,8 @@ def _apply_entries(
     sidecar: Path, stage: Path, expected_message_ids: dict[int, str]
 ) -> Callable[[], Iterator[Entry]]:
     def generate() -> Iterator[Entry]:
-        side = sqlite3.connect(f"file:{sidecar.as_posix()}?mode=ro", uri=True)
-        stg = sqlite3.connect(f"file:{stage.as_posix()}?mode=ro", uri=True)
+        side = connect_database(sidecar, read_only=True)
+        stg = connect_database(stage, read_only=True)
         try:
             for mid, old_fts, pre_sha, post_sha in side.execute(
                 "SELECT id, old_fts_body_text, pre_sha256, post_sha256 "
@@ -709,7 +743,7 @@ def run_confirm(canonical: Path, stage: Path) -> int:
 # ---------------------------------------------------------------------------
 def _restore_entries(sidecar: Path, ids: list[int]) -> Callable[[], Iterator[Entry]]:
     def generate() -> Iterator[Entry]:
-        side = sqlite3.connect(f"file:{sidecar.as_posix()}?mode=ro", uri=True)
+        side = connect_database(sidecar, read_only=True)
         try:
             for mid in ids:
                 old_body, old_fts, post_sha = side.execute(
@@ -729,7 +763,7 @@ def _check_sidecar(sidecar: Path, canonical: Path) -> None:
         raise ApplyRefused(f"sidecar not found: {sidecar}")
     if not canonical.exists():
         raise ApplyRefused(f"canonical database not found: {canonical}")
-    con = sqlite3.connect(f"file:{sidecar.as_posix()}?mode=ro", uri=True)
+    con = connect_database(sidecar, read_only=True)
     try:
         tables = {
             row[0]
@@ -757,7 +791,7 @@ def run_restore(canonical: Path, sidecar: Path, confirm: bool) -> int:
         return 1
     counts = {"sidecar_rows": 0, "missing_row": 0, "drifted_since_apply": 0}
     ids: list[int] = []
-    side = sqlite3.connect(f"file:{sidecar.as_posix()}?mode=ro", uri=True)
+    side = connect_database(sidecar, read_only=True)
     con = connect_database(canonical, read_only=True)
     try:
         for mid, post_sha in side.execute(

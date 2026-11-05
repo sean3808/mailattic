@@ -449,12 +449,29 @@ def build_pst_stage(
                         "counts": counts,
                     }
                 )
+            report = {
+                "mode": "pst",
+                "canonical": str(database),
+                "stage": str(stage),
+                "started_at": started.isoformat(),
+                "elapsed_seconds": round(
+                    (datetime.now(UTC) - started).total_seconds(), 3
+                ),
+                "rows_in_scope": sum(p["rows"] for p in per_pst),
+                "counts": totals,
+                "requested_psts_not_in_canonical": not_in_canonical,
+                "per_pst": per_pst,
+            }
+            # The report travels with the stage (same commit as the other
+            # stage_meta keys) so apply can show the exclusion counts even if
+            # the sidecar report file is lost.
             stage_con.executemany(
                 "INSERT INTO stage_meta (key, value) VALUES (?, ?)",
                 [
                     ("source_kind", SOURCE_KIND_PST),
                     ("canonical", str(database)),
                     ("created_at", started.isoformat()),
+                    ("report_json", json.dumps(report, ensure_ascii=False)),
                 ],
             )
             stage_con.commit()
@@ -465,17 +482,7 @@ def build_pst_stage(
         with suppress(OSError):
             work_root.rmdir()
 
-    return {
-        "mode": "pst",
-        "canonical": str(database),
-        "stage": str(stage),
-        "started_at": started.isoformat(),
-        "elapsed_seconds": round((datetime.now(UTC) - started).total_seconds(), 3),
-        "rows_in_scope": sum(p["rows"] for p in per_pst),
-        "counts": totals,
-        "requested_psts_not_in_canonical": not_in_canonical,
-        "per_pst": per_pst,
-    }
+    return report
 
 
 def _canonical_maildir_rows(con: sqlite3.Connection) -> list[dict]:
@@ -657,12 +664,27 @@ def build_imap_stage(
                         "counts": counts,
                     }
                 )
+            report = {
+                "mode": "imap",
+                "canonical": str(database),
+                "stage": str(stage),
+                "started_at": started.isoformat(),
+                "elapsed_seconds": round(
+                    (datetime.now(UTC) - started).total_seconds(), 3
+                ),
+                "rows_in_scope": len(rows),
+                "aborted": aborted,
+                "gone_from_server": totals["not_on_server"] + totals["folder_missing"],
+                "counts": totals,
+                "per_folder": per_folder,
+            }
             stage_con.executemany(
                 "INSERT INTO stage_meta (key, value) VALUES (?, ?)",
                 [
                     ("source_kind", SOURCE_KIND_IMAP),
                     ("canonical", str(database)),
                     ("created_at", started.isoformat()),
+                    ("report_json", json.dumps(report, ensure_ascii=False)),
                 ],
             )
             stage_con.commit()
@@ -671,18 +693,7 @@ def build_imap_stage(
     finally:
         client.close()
 
-    return {
-        "mode": "imap",
-        "canonical": str(database),
-        "stage": str(stage),
-        "started_at": started.isoformat(),
-        "elapsed_seconds": round((datetime.now(UTC) - started).total_seconds(), 3),
-        "rows_in_scope": len(rows),
-        "aborted": aborted,
-        "gone_from_server": totals["not_on_server"] + totals["folder_missing"],
-        "counts": totals,
-        "per_folder": per_folder,
-    }
+    return report
 
 
 def _print_summary(report: dict, report_path: Path) -> None:
@@ -813,9 +824,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[abort] {exc}", file=sys.stderr)
         return 1
     report_path = _report_path(stage)
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    try:
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        print(
+            f"[abort] the stage was built but the report file {report_path} could "
+            f"not be written ({exc!r}); the counts are kept in the stage's "
+            "stage_meta.report_json. Fix the path and rebuild with --overwrite.",
+            file=sys.stderr,
+        )
+        return 1
     _print_summary(report, report_path)
     if report["mode"] == "imap":
         counts = report["counts"]

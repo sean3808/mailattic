@@ -926,3 +926,46 @@ def test_imap_existing_stage_refused_and_limit_applies(tmp_path, fake_imap):
     assert _run_imap(db, stage, env_file, "--overwrite", "--limit", "1") == 0
     assert len(_staged(stage)) == 1
     assert _report(stage)["rows_in_scope"] == 1
+
+
+def _stage_meta(stage: Path) -> dict[str, str]:
+    con = sqlite3.connect(stage)
+    try:
+        return dict(con.execute("SELECT key, value FROM stage_meta"))
+    finally:
+        con.close()
+
+
+def _one_row_world(tmp_path: Path, stub_readpst, out_name: str = "out"):
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [_table_message("<m1@example.test>")]
+    db, _ids = _canonical(
+        tmp_path,
+        [_row(pst=pst, index=1, message_id="<m1@example.test>", body=PLAIN_FLAT)],
+    )
+    return db, tmp_path / out_name / "stage.db", readpst
+
+
+def test_stage_meta_carries_the_report_equal_to_the_report_file(tmp_path, stub_readpst):
+    db, stage, readpst = _one_row_world(tmp_path, stub_readpst)
+    assert _run(db, stage, readpst) == 0
+    assert json.loads(_stage_meta(stage)["report_json"]) == _report(stage)
+
+
+def test_unwritable_report_file_exits_nonzero_with_message(
+    tmp_path, stub_readpst, capsys
+):
+    db, stage, readpst = _one_row_world(tmp_path, stub_readpst)
+    # a directory squatting on the sidecar path: write_text raises OSError
+    (stage.parent / "stage-report.json").mkdir(parents=True)
+    assert _run(db, stage, readpst) == 1
+    assert "report file" in capsys.readouterr().err
+    # the counts still travel with the stage
+    assert "report_json" in _stage_meta(stage)
+
+
+def test_stage_and_report_paths_with_uri_special_characters(tmp_path, stub_readpst):
+    db, stage, readpst = _one_row_world(tmp_path, stub_readpst, "a#b%20c#d")
+    assert _run(db, stage, readpst) == 0
+    assert _report(stage)["counts"]["rewrite"] == 1

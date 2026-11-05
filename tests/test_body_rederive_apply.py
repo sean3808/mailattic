@@ -71,13 +71,29 @@ def _stage_row(
     return (mid, kind, _sha(pre_body), new_body, status, f"{key}@example.test")
 
 
-def _make_stage(path: Path, rows: list[tuple], with_meta: bool = True) -> Path:
+STAGE_REPORT = {
+    "mode": "pst",
+    "counts": {"pst_unreadable": 2, "excluded_marker": 5},
+}
+
+
+def _make_stage(
+    path: Path,
+    rows: list[tuple],
+    with_meta: bool = True,
+    with_report: bool = True,
+) -> Path:
     con = sqlite3.connect(path)
     try:
         con.executescript(_STAGE_SCHEMA)
         con.executemany("INSERT INTO body_rederive VALUES (?, ?, ?, ?, ?, ?)", rows)
         if with_meta:
             con.execute("INSERT INTO stage_meta VALUES ('source_kind', 'pst')")
+            if with_report:
+                con.execute(
+                    "INSERT INTO stage_meta VALUES ('report_json', ?)",
+                    (json.dumps(STAGE_REPORT),),
+                )
         con.commit()
     finally:
         con.close()
@@ -733,3 +749,42 @@ def test_restore_failure_rolls_back(world, capsys, monkeypatch):
 def test_cli_requires_exactly_one_of_stage_or_restore(world):
     with pytest.raises(SystemExit):
         apply_module.main(["--canonical", str(world.db)])
+
+
+# ---------------------------------------------------------------------------
+# review round 2: URI-special paths, stage report travels with the stage
+# ---------------------------------------------------------------------------
+def test_uri_special_characters_in_paths_work_end_to_end(tmp_path, capsys):
+    special = tmp_path / "a#b%20c#d"
+    special.mkdir()
+    world = World(special)
+    before = _snapshot(world.db)
+    _apply(world, capsys)
+    assert _snapshot(world.db) != before
+    args = ["--restore", str(world.sidecar), "--canonical", str(world.db)]
+    assert apply_module.main(args) == 0
+    capsys.readouterr()
+    assert apply_module.main([*args, "--confirm"]) == 0
+    assert _snapshot(world.db) == before
+
+
+def test_stage_without_report_json_is_refused(tmp_path, capsys):
+    db = tmp_path / "c.db"
+    initialize_database(db)
+    stage = _make_stage(tmp_path / "s.db", [], with_report=False)
+    for extra in ((), ("--confirm",)):
+        code = apply_module.main(
+            ["--stage", str(stage), "--canonical", str(db), *extra]
+        )
+        assert code == 1
+        assert "stage incomplete" in capsys.readouterr().err
+    assert not (tmp_path / "s-apply-report-dryrun.json").exists()
+
+
+def test_dry_run_report_and_output_carry_the_stage_counts(world, capsys):
+    assert apply_module.main(world.args()) == 0
+    out = capsys.readouterr().out
+    report = json.loads(world.dryrun_report.read_text(encoding="utf-8"))
+    assert report["stage_report"] == STAGE_REPORT
+    assert "[stage] pst_unreadable: 2" in out
+    assert "[stage] excluded_marker: 5" in out
