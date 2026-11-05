@@ -285,6 +285,46 @@ def test_missing_pst_is_counted_and_run_continues(tmp_path, stub_readpst):
     assert set(_staged(stage)) == {mid2}
 
 
+def test_pst_map_reads_a_moved_pst_while_pairing_by_canonical_source(
+    tmp_path, stub_readpst
+):
+    readpst, mboxes = stub_readpst
+    (tmp_path / "old").mkdir()
+    (tmp_path / "new").mkdir()
+    old = _make_pst(tmp_path / "old", "moved.pst")
+    db, (mid,) = _canonical(
+        tmp_path,
+        [_row(pst=old, index=1, message_id="<m1@example.test>", body=PLAIN_FLAT)],
+    )
+    old.unlink()
+    new = _make_pst(tmp_path / "new", "moved-here.pst")
+    mboxes["moved-here.pst"] = [_table_message("<m1@example.test>")]
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst, "--pst-map", f"{old.resolve()}={new}") == 0
+
+    report = _report(stage)
+    assert report["counts"]["pst_missing"] == 0
+    assert report["counts"]["rewrite"] == 1
+    assert report["per_pst"][0]["pst_source"] == str(old.resolve())
+    assert report["per_pst"][0]["read_from"] == str(new)
+    assert set(_staged(stage)) == {mid}
+
+
+def test_pst_map_key_not_in_canonical_is_refused_before_any_stage(
+    tmp_path, stub_readpst
+):
+    readpst, _ = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    db, _ = _canonical(
+        tmp_path, [_row(pst=pst, index=1, message_id="<m1@example.test>", body="x")]
+    )
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst, "--pst-map", f"{tmp_path / 'typo.pst'}={pst}") == 1
+    assert not stage.exists()
+
+
 def test_existing_stage_refused_without_overwrite(tmp_path, stub_readpst):
     readpst, mboxes = stub_readpst
     pst = _make_pst(tmp_path, "a.pst")

@@ -302,15 +302,19 @@ def _process_pst(
     rows: dict[str, list[dict]],
     parser_factory,
     stage_con: sqlite3.Connection,
+    read_from: Path,
 ) -> dict[str, int]:
+    """``pst_source`` keys the canonical rows; ``read_from`` is the file read.
+
+    They differ when the PST moved since import (``--pst-map``). The locator
+    is relative to readpst's output root, so pairing does not depend on it.
+    """
     counts = _empty_counts()
-    if not Path(pst_source).exists():
+    if not read_from.exists():
         counts["pst_missing"] = sum(len(v) for v in rows.values())
         return counts
 
-    source = PstSource(
-        path=Path(pst_source), input_mode="file", requested_from=Path(pst_source)
-    )
+    source = PstSource(path=read_from, input_mode="file", requested_from=read_from)
     failed_locators: set[str] = set()
     pst_level_failure = False
     parser = parser_factory()
@@ -361,7 +365,9 @@ def build_pst_stage(
     readpst_path: Path | None,
     pst_filter: list[Path],
     overwrite: bool,
+    pst_map: dict[str, Path] | None = None,
 ) -> dict:
+    pst_map = pst_map or {}
     _prepare_stage(database, stage, overwrite)
     work_root = stage.parent / f"{stage.stem}-work"
     started = datetime.now(UTC)
@@ -369,6 +375,11 @@ def build_pst_stage(
     canonical = connect_database(database, read_only=True)
     try:
         pst_sources = _canonical_pst_sources(canonical)
+        unknown_keys = sorted(set(pst_map) - set(pst_sources))
+        if unknown_keys:
+            raise StageRefused(
+                f"--pst-map names a pst_source not in the canonical DB: {unknown_keys}"
+            )
         not_in_canonical: list[str] = []
         if pst_filter:
             wanted = [str(p) for p in pst_filter]
@@ -401,13 +412,17 @@ def build_pst_stage(
                 began = time.perf_counter()
                 rows = _canonical_rows_by_locator(canonical, pst_source)
                 row_count = sum(len(v) for v in rows.values())
-                counts = _process_pst(pst_source, rows, parser_factory, stage_con)
+                read_from = pst_map.get(pst_source, Path(pst_source))
+                counts = _process_pst(
+                    pst_source, rows, parser_factory, stage_con, read_from
+                )
                 stage_con.commit()
                 for key, value in counts.items():
                     totals[key] += value
                 per_pst.append(
                     {
                         "pst_source": pst_source,
+                        "read_from": str(read_from),
                         "rows": row_count,
                         "elapsed_seconds": round(time.perf_counter() - began, 3),
                         "counts": counts,
@@ -687,6 +702,14 @@ def _build_parser() -> argparse.ArgumentParser:
     pst.add_argument("--readpst-path", type=Path, default=None)
     pst.add_argument("--pst", type=Path, action="append", default=[])
     pst.add_argument(
+        "--pst-map",
+        action="append",
+        default=[],
+        metavar="CANONICAL=LOCAL",
+        help="Read the PST recorded as CANONICAL pst_source from LOCAL instead "
+        "(the file moved since import). Repeatable.",
+    )
+    pst.add_argument(
         "--overwrite",
         action="store_true",
         help="Replace an existing stage database.",
@@ -717,6 +740,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_pst_map(entries: list[str]) -> dict[str, Path]:
+    mapping: dict[str, Path] = {}
+    for entry in entries:
+        canonical, sep, local = entry.partition("=")
+        if not sep or not canonical or not local:
+            raise StageRefused(f"--pst-map expects CANONICAL=LOCAL, got {entry!r}")
+        mapping[canonical] = Path(local)
+    return mapping
+
+
 def main(argv: list[str] | None = None) -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     args = _build_parser().parse_args(argv)
@@ -741,6 +774,7 @@ def main(argv: list[str] | None = None) -> int:
                 readpst_path=args.readpst_path,
                 pst_filter=list(args.pst),
                 overwrite=args.overwrite,
+                pst_map=_parse_pst_map(args.pst_map),
             )
     except StageRefused as exc:
         print(f"[refuse] {exc}", file=sys.stderr)
