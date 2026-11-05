@@ -903,6 +903,28 @@ def test_lspst_nonzero_exit_is_unavailable(tmp_path, stub_readpst, lspst_overrid
     assert entry["extraction_complete"] is None
 
 
+def test_lspst_listing_no_email_items_is_unavailable(
+    tmp_path, stub_readpst, lspst_overrides
+):
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=1, rows=1)
+    lspst_overrides["a.pst"] = (0, 'Folder "x"\n', "")
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["ledger"] == "unavailable"
+    assert entry["extraction_complete"] is None
+
+
+def test_only_tab_separated_email_lines_count(tmp_path, stub_readpst, lspst_overrides):
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=1, rows=1)
+    lspst_overrides["a.pst"] = (0, "Email\tFrom: a\nEmails about x\nEmail2 y\n", "")
+
+    assert _run(db, stage, readpst) == 0
+
+    assert _report(stage)["per_pst"][0]["ledger_emails"] == 1
+
+
 def test_missing_lspst_refuses_and_keeps_the_previous_stage(
     tmp_path, stub_readpst, monkeypatch
 ):

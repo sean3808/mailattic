@@ -277,7 +277,10 @@ def _lspst_ledger(lspst: Path, pst: Path) -> dict:
     lines = (stdout + "\n" + stderr).splitlines()
     if any(line.startswith(_LSPST_ABORT_PREFIX) for line in lines):
         return _ledger("unavailable", None, "lspst aborted: second message_store")
-    emails = sum(1 for line in stdout.splitlines() if line.startswith("Email"))
+    emails = sum(1 for line in stdout.splitlines() if line.startswith("Email\t"))
+    if emails == 0:
+        # Nothing to compare against: an empty listing proves no completeness.
+        return _ledger("unavailable", None, "lspst listed no Email items")
     return _ledger("ok", emails, None)
 
 
@@ -983,7 +986,12 @@ def _print_summary(report: dict, report_path: Path) -> None:
             print("[stage] ABORTED: connection lost; remaining rows are fetch_error")
     if report["mode"] == "pst":
         for entry in report["per_pst"]:
-            if entry["extraction_complete"] is False:
+            if entry["counts"]["pst_unreadable"]:
+                print(
+                    f"[stage] UNREADABLE: {entry['pst_source']}; its rows were "
+                    "not examined"
+                )
+            elif entry["extraction_complete"] is False:
                 print(
                     f"[stage] INCOMPLETE extraction: {entry['pst_source']} "
                     f"(extracted {entry['extracted_messages']}, lspst lists "
