@@ -131,6 +131,7 @@ _OUTCOMES = (
     "locator_not_found",
     "pst_missing",
     "parse_failure",
+    "pst_unreadable",
 )
 
 _IMAP_OUTCOMES = (
@@ -349,11 +350,14 @@ def _process_pst(
                 )
 
     for locator, leftover in rows.items():
-        key = (
-            "parse_failure"
-            if pst_level_failure or locator in failed_locators
-            else "locator_not_found"
-        )
+        if pst_level_failure:
+            # readpst itself failed (e.g. the file is locked by Outlook): the
+            # rows were never examined, which is not a per-message parse error.
+            key = "pst_unreadable"
+        elif locator in failed_locators:
+            key = "parse_failure"
+        else:
+            key = "locator_not_found"
         counts[key] += len(leftover)
     return counts
 
@@ -798,6 +802,9 @@ def main(argv: list[str] | None = None) -> int:
         counts = report["counts"]
         if report["aborted"] or counts["fetch_error"] or counts["select_failed"]:
             return 2
+    elif report["counts"]["pst_unreadable"]:
+        # An unreadable PST leaves its rows unexamined; never report success.
+        return 2
     return 0
 
 

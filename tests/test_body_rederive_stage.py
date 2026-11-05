@@ -311,6 +311,39 @@ def test_pst_map_reads_a_moved_pst_while_pairing_by_canonical_source(
     assert set(_staged(stage)) == {mid}
 
 
+def test_unreadable_pst_is_counted_separately_and_exits_nonzero(
+    tmp_path, stub_readpst, monkeypatch
+):
+    readpst, mboxes = stub_readpst
+    locked = _make_pst(tmp_path, "locked.pst")
+    ok = _make_pst(tmp_path, "ok.pst")
+    mboxes["ok.pst"] = [_table_message("<m2@example.test>")]
+    db, (_, mid2) = _canonical(
+        tmp_path,
+        [
+            _row(pst=locked, index=1, message_id="<m1@example.test>", body="x"),
+            _row(pst=ok, index=1, message_id="<m2@example.test>", body=PLAIN_FLAT),
+        ],
+    )
+    stubbed = ReadpstParser._extract_pst
+
+    def extract_or_fail(self, source_path: Path, output_root: Path) -> None:
+        if source_path.name == "locked.pst":
+            raise RuntimeError(f"readpst failed for {source_path}: Error opening File")
+        stubbed(self, source_path, output_root)
+
+    monkeypatch.setattr(ReadpstParser, "_extract_pst", extract_or_fail)
+    stage = tmp_path / "stage.db"
+
+    assert _run(db, stage, readpst) == 2
+
+    counts = _report(stage)["counts"]
+    assert counts["pst_unreadable"] == 1
+    assert counts["parse_failure"] == 0
+    assert counts["rewrite"] == 1
+    assert set(_staged(stage)) == {mid2}
+
+
 def test_pst_map_key_not_in_canonical_is_refused_before_any_stage(
     tmp_path, stub_readpst
 ):
