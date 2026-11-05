@@ -39,6 +39,24 @@ How a row is re-derived (``pst`` subcommand):
 The report's per-PST entries also carry ``extracted_messages`` (how many
 messages readpst yielded), for cross-checking extraction completeness.
 
+Extraction completeness ledger: readpst has been seen to stop early on a big
+PST with return code 0 and empty stderr, which would make the missing rows look
+like ``locator_not_found`` in a "successful" run. Before a PST is unpacked,
+``lspst`` (same pst-utils package; ``--lspst-path``, default: next to the
+resolved readpst, then PATH) lists it and the lines starting with ``Email`` are
+counted. Ledger state per PST: ``ok`` (``lspst`` exit 0 and no
+``A second message_store has been found`` abort line; ``ledger_emails`` = the
+count) or ``unavailable`` (non-zero exit or that abort line; ``ledger_note``
+says why -- e.g. the live Outlook PST aborts part-way). With ``ok``, a PST whose
+``extracted_messages`` + failed messages is below ``ledger_emails`` is
+INCOMPLETE (``extraction_complete`` false): its leftover canonical rows (those
+that would be ``locator_not_found`` or pooled for the fallback) are counted as
+``extraction_incomplete`` and are NOT pooled. Rows already paired stay staged
+(each was Message-ID verified) and the PST's extracted messages still feed the
+fallback store. More extracted than listed is fine. Per-PST entries carry
+``ledger``, ``ledger_emails``, ``ledger_note`` and ``extraction_complete``
+(null when the ledger is unavailable).
+
 "Contains a table" is phase 1's own decision: ``_HTMLTextExtractor.
 has_data_table`` as returned by ``parser._html_to_text_and_table_flag`` for the
 message's HTML part(s). ``_extract_body_text`` consumes that flag but does not
@@ -73,7 +91,8 @@ How IMAP rows are re-derived (``imap`` subcommand):
 
 Usage:
     uv run python scripts/body_rederive_stage.py pst --database <canonical.db> \\
-        --stage <stage.db> [--readpst-path P] [--pst <path> ...] [--overwrite]
+        --stage <stage.db> [--readpst-path P] [--lspst-path P] \\
+        [--pst <path> ...] [--overwrite]
     uv run python scripts/body_rederive_stage.py imap --database <canonical.db> \\
         --stage <stage.db> --env-file <mailbox settings> [--folder <display> ...] \\
         [--limit N] [--overwrite]
@@ -87,9 +106,13 @@ A stage holds one source kind (``stage_meta.source_kind``).
 Exit codes:
     0 — stage built, report written
     1 — refused (stage exists without --overwrite, stage is the canonical DB,
-        canonical DB missing), readpst could not be located, or the IMAP
-        settings / connection could not be established
-    2 — imap run stopped part-way (connection lost) or had fetch errors
+        canonical DB missing), readpst could not be located, lspst could not
+        be located (pst; refused before the previous stage is cleared), or the
+        IMAP settings / connection could not be established
+    2 — imap run stopped part-way (connection lost) or had fetch errors; pst
+        run with an unreadable PST (``pst_unreadable``) or an incomplete
+        extraction (``extraction_incomplete``: rerun). A PST whose ledger is
+        ``unavailable`` keeps exit 0 but the summary prints a warning for it
 """
 
 from __future__ import annotations
@@ -100,7 +123,9 @@ import imaplib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -152,6 +177,9 @@ _OUTCOMES = (
     "pst_missing",
     "parse_failure",
     "pst_unreadable",
+    # extraction_incomplete: lspst's ledger says readpst yielded fewer messages
+    # than the PST holds; the PST's leftover rows are not trusted as "gone".
+    "extraction_incomplete",
     # message_id_ambiguous: fallback found the Message-ID with differing bodies.
     # paired_by_message_id: informational; how many of rewrite + unchanged came
     # via the fallback (those two stay the true totals).
@@ -186,6 +214,71 @@ _CONNECTION_ERRORS = (imaplib.IMAP4.abort, OSError, EOFError)
 
 class StageRefused(RuntimeError):
     """The run was refused before any write."""
+
+
+_LSPST_ABORT_PREFIX = "A second message_store has been found"
+_LEDGER_NOTE_PST_MISSING = "pst file missing"
+
+
+def _resolve_lspst(lspst_path: Path | None, readpst_path: Path | None) -> Path:
+    """``--lspst-path``, else next to the resolved readpst, else PATH."""
+    if lspst_path is not None:
+        candidate = lspst_path.expanduser().resolve()
+        if candidate.exists():
+            return candidate
+        raise StageRefused(f"lspst not found at --lspst-path: {lspst_path}")
+    candidates: list[Path] = []
+    try:
+        resolved_readpst = mail_parser.resolve_readpst_path(readpst_path)
+    except mail_parser.ParserUnavailableError:
+        resolved_readpst = None
+    if resolved_readpst is not None:
+        candidates += [
+            resolved_readpst.parent / "lspst.exe",
+            resolved_readpst.parent / "lspst",
+        ]
+    which_result = shutil.which("lspst.exe") or shutil.which("lspst")
+    if which_result is not None:
+        candidates.append(Path(which_result))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    raise StageRefused(
+        "Unable to locate lspst (needed for the extraction completeness "
+        "ledger). Provide --lspst-path or put lspst next to readpst / on PATH."
+    )
+
+
+def _run_lspst(lspst: Path, pst: Path) -> tuple[int, str, str]:
+    """(return code, stdout, stderr) of ``lspst <pst>``; no shell."""
+    completed = subprocess.run(
+        [str(lspst), str(pst)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    return completed.returncode, completed.stdout, completed.stderr
+
+
+def _ledger(state: str, emails: int | None, note: str | None) -> dict:
+    return {"state": state, "emails": emails, "note": note}
+
+
+def _lspst_ledger(lspst: Path, pst: Path) -> dict:
+    """Ledger of one existing PST: count of ``Email`` lines lspst lists."""
+    try:
+        returncode, stdout, stderr = _run_lspst(lspst, pst)
+    except OSError as exc:
+        return _ledger("unavailable", None, f"lspst could not run: {exc}")
+    if returncode != 0:
+        return _ledger("unavailable", None, f"lspst exited with {returncode}")
+    lines = (stdout + "\n" + stderr).splitlines()
+    if any(line.startswith(_LSPST_ABORT_PREFIX) for line in lines):
+        return _ledger("unavailable", None, "lspst aborted: second message_store")
+    emails = sum(1 for line in stdout.splitlines() if line.startswith("Email"))
+    return _ledger("ok", emails, None)
 
 
 def _sha256_text(text: str) -> str:
@@ -431,7 +524,8 @@ def _process_pst(
     stage_con: sqlite3.Connection,
     read_from: Path,
     store: _FallbackStore,
-) -> tuple[dict[str, int], int]:
+    ledger: dict | None = None,
+) -> tuple[dict[str, int], int, bool | None]:
     """``pst_source`` keys the canonical rows; ``read_from`` is the file read.
 
     They differ when the PST moved since import (``--pst-map``). The locator
@@ -440,12 +534,13 @@ def _process_pst(
     counts = _empty_counts()
     if not read_from.exists():
         counts["pst_missing"] = sum(len(v) for v in rows.values())
-        return counts, 0
+        return counts, 0, None
 
     source = PstSource(path=read_from, input_mode="file", requested_from=read_from)
     failed_locators: set[str] = set()
     pst_level_failure = False
     extracted_count = 0
+    failure_count = 0
     parser = parser_factory()
     with _record_table_flag() as recorder:
         iterator = iter(parser.iter_extraction_results(source))
@@ -460,6 +555,7 @@ def _process_pst(
                 pst_level_failure = True
                 break
             if result.failure is not None:
+                failure_count += 1
                 if result.failure.logical_locator:
                     failed_locators.add(result.failure.logical_locator)
                 continue
@@ -487,6 +583,9 @@ def _process_pst(
                     store,
                 )
 
+    extraction_complete: bool | None = None
+    if ledger is not None and ledger["state"] == "ok":
+        extraction_complete = extracted_count + failure_count >= ledger["emails"]
     for locator, leftover in rows.items():
         if pst_level_failure:
             # readpst itself failed (e.g. the file is locked by Outlook): the
@@ -494,13 +593,16 @@ def _process_pst(
             counts["pst_unreadable"] += len(leftover)
         elif locator in failed_locators:
             counts["parse_failure"] += len(leftover)
+        elif extraction_complete is False:
+            # The ledger says readpst stopped early: "not found" proves nothing.
+            counts["extraction_incomplete"] += len(leftover)
         else:
             for row in leftover:
                 if row["message_id"]:
                     store.add_pool(pst_source, row, "locator_not_found")
                 else:
                     counts["locator_not_found"] += 1
-    return counts, extracted_count
+    return counts, extracted_count, extraction_complete
 
 
 def build_pst_stage(
@@ -508,12 +610,14 @@ def build_pst_stage(
     database: Path,
     stage: Path,
     readpst_path: Path | None,
+    lspst_path: Path | None = None,
     pst_filter: list[Path],
     overwrite: bool,
     pst_map: dict[str, Path] | None = None,
 ) -> dict:
     pst_map = pst_map or {}
     _check_stage_target(database, stage, overwrite)
+    lspst = _resolve_lspst(lspst_path, readpst_path)
     work_root = stage.parent / f"{stage.stem}-work"
     started = datetime.now(UTC)
 
@@ -565,8 +669,18 @@ def build_pst_stage(
                 rows = _canonical_rows_by_locator(canonical, pst_source)
                 row_count = sum(len(v) for v in rows.values())
                 read_from = pst_map.get(pst_source, Path(pst_source))
-                counts, extracted_count = _process_pst(
-                    pst_source, rows, parser_factory, stage_con, read_from, store
+                if read_from.exists():
+                    ledger = _lspst_ledger(lspst, read_from)
+                else:
+                    ledger = _ledger("unavailable", None, _LEDGER_NOTE_PST_MISSING)
+                counts, extracted_count, complete = _process_pst(
+                    pst_source,
+                    rows,
+                    parser_factory,
+                    stage_con,
+                    read_from,
+                    store,
+                    ledger,
                 )
                 stage_con.commit()
                 store.commit()
@@ -576,6 +690,10 @@ def build_pst_stage(
                         "read_from": str(read_from),
                         "rows": row_count,
                         "extracted_messages": extracted_count,
+                        "ledger": ledger["state"],
+                        "ledger_emails": ledger["emails"],
+                        "ledger_note": ledger["note"],
+                        "extraction_complete": complete,
                         "elapsed_seconds": round(time.perf_counter() - began, 3),
                         "counts": counts,
                     }
@@ -863,6 +981,23 @@ def _print_summary(report: dict, report_path: Path) -> None:
         )
         if report["aborted"]:
             print("[stage] ABORTED: connection lost; remaining rows are fetch_error")
+    if report["mode"] == "pst":
+        for entry in report["per_pst"]:
+            if entry["extraction_complete"] is False:
+                print(
+                    f"[stage] INCOMPLETE extraction: {entry['pst_source']} "
+                    f"(extracted {entry['extracted_messages']}, lspst lists "
+                    f"{entry['ledger_emails']}); rerun the stage"
+                )
+            elif (
+                entry["ledger"] == "unavailable"
+                and entry["ledger_note"] != _LEDGER_NOTE_PST_MISSING
+            ):
+                print(
+                    f"[stage] WARNING: no completeness ledger for "
+                    f"{entry['pst_source']} ({entry['ledger_note']}); an early "
+                    "readpst stop would not be detected"
+                )
     print(f"[stage] stage database: {report['stage']}")
     print(f"[stage] report: {report_path}")
 
@@ -876,6 +1011,13 @@ def _build_parser() -> argparse.ArgumentParser:
     pst.add_argument("--database", type=Path, default=None)
     pst.add_argument("--stage", type=Path, required=True)
     pst.add_argument("--readpst-path", type=Path, default=None)
+    pst.add_argument(
+        "--lspst-path",
+        type=Path,
+        default=None,
+        help="lspst binary for the completeness ledger (default: next to "
+        "readpst, then PATH).",
+    )
     pst.add_argument("--pst", type=Path, action="append", default=[])
     pst.add_argument(
         "--pst-map",
@@ -948,6 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
                 database=database,
                 stage=stage,
                 readpst_path=args.readpst_path,
+                lspst_path=args.lspst_path,
                 pst_filter=list(args.pst),
                 overwrite=args.overwrite,
                 pst_map=_parse_pst_map(args.pst_map),
@@ -983,8 +1126,11 @@ def main(argv: list[str] | None = None) -> int:
         counts = report["counts"]
         if report["aborted"] or counts["fetch_error"] or counts["select_failed"]:
             return 2
-    elif report["counts"]["pst_unreadable"]:
-        # An unreadable PST leaves its rows unexamined; never report success.
+    elif report["counts"]["pst_unreadable"] or any(
+        e["extraction_complete"] is False for e in report["per_pst"]
+    ):
+        # An unreadable or incompletely extracted PST leaves rows unexamined;
+        # never report success.
         return 2
     return 0
 

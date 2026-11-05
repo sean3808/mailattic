@@ -34,6 +34,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 import body_rederive_stage as stage_module  # noqa: E402
 
 from mailattic.imap_native import NativeImapClient  # noqa: E402
+from mailattic.models import ExtractionResult, IngestFailure  # noqa: E402
 from mailattic.mutf7 import encode_mutf7  # noqa: E402
 from mailattic.parser import ReadpstParser  # noqa: E402
 from mailattic.storage import connect_database, initialize_database  # noqa: E402
@@ -72,12 +73,34 @@ def _plain_message(message_id: str | None, text: str = "Hello there") -> EmailMe
 
 
 @pytest.fixture
-def stub_readpst(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def lspst_overrides() -> dict[str, tuple[int, str, str]]:
+    """PST file name -> (return code, stdout, stderr) the stub lspst answers
+    with. A PST without an entry gets the default: one ``Email`` line per
+    message its fake mbox holds (a complete, truthful ledger)."""
+    return {}
+
+
+@pytest.fixture
+def stub_readpst(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lspst_overrides: dict[str, tuple[int, str, str]],
+):
     """Returns (readpst_path, mboxes): mboxes maps a PST file name to the list
-    of messages its (fake) unpacked ``Inbox/mbox`` holds."""
+    of messages its (fake) unpacked ``Inbox/mbox`` holds. A stub ``lspst`` sits
+    next to the stub readpst (default resolution finds it); ``_run_lspst`` is
+    stubbed through ``lspst_overrides``."""
     readpst = tmp_path / "stub-readpst.exe"
     readpst.write_text("", encoding="utf-8")
+    (tmp_path / "lspst.exe").write_text("", encoding="utf-8")
     mboxes: dict[str, list[EmailMessage]] = {}
+
+    def fake_run_lspst(lspst: Path, pst: Path) -> tuple[int, str, str]:
+        if pst.name in lspst_overrides:
+            return lspst_overrides[pst.name]
+        return _emails(len(mboxes.get(pst.name, [])))
+
+    monkeypatch.setattr(stage_module, "_run_lspst", fake_run_lspst)
 
     def fake_extract(self, source_path: Path, output_root: Path) -> None:
         folder = output_root / "Inbox"
@@ -92,6 +115,12 @@ def stub_readpst(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(ReadpstParser, "_extract_pst", fake_extract)
     return readpst, mboxes
+
+
+def _emails(count: int) -> tuple[int, str, str]:
+    """What ``lspst`` prints for a PST listing ``count`` messages."""
+    body = "".join(f"Email\tFrom: x{i}\n" for i in range(count))
+    return 0, "Folder\tInbox\n" + body, ""
 
 
 def _make_pst(tmp_path: Path, name: str) -> Path:
@@ -763,6 +792,242 @@ def test_extracted_messages_are_reported_per_pst(tmp_path, stub_readpst):
     by_pst = {Path(p["pst_source"]).name: p for p in _report(stage)["per_pst"]}
     assert by_pst["a.pst"]["extracted_messages"] == 3
     assert by_pst["gone.pst"]["extracted_messages"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Extraction completeness ledger (lspst). The stub lspst answers through the
+# ``lspst_overrides`` fixture; everything after it is production code.
+# ---------------------------------------------------------------------------
+
+
+def _ledger_world(tmp_path: Path, stub_readpst, *, in_mbox: int, rows: int):
+    """One PST holding ``in_mbox`` messages (<m0>..); canonical rows #1..#rows
+    carry the ids <m0>.. and an old body."""
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [_plain_message(f"<m{i}@example.test>") for i in range(in_mbox)]
+    db, ids = _canonical(
+        tmp_path,
+        [
+            _row(
+                pst=pst,
+                index=i,
+                message_id=f"<m{i - 1}@example.test>",
+                body="old body",
+            )
+            for i in range(1, rows + 1)
+        ],
+    )
+    return pst, db, ids, readpst, tmp_path / "out" / "stage.db"
+
+
+def test_ledger_ok_and_complete_extraction_exits_zero(tmp_path, stub_readpst):
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=2, rows=2)
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["ledger"] == "ok"
+    assert entry["ledger_emails"] == 2
+    assert entry["ledger_note"] is None
+    assert entry["extraction_complete"] is True
+    assert _report(stage)["counts"]["extraction_incomplete"] == 0
+
+
+def test_extraction_short_of_the_ledger_exits_two_and_does_not_pool(
+    tmp_path, stub_readpst, lspst_overrides, capsys
+):
+    # lspst lists 4 messages, readpst yielded 2 (<m0> at #1, <m1> at #2). Row B
+    # points at a locator (#3) with no message, but its Message-ID <m1> exists
+    # elsewhere in the PST, so the fallback WOULD resolve it if it were pooled.
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [_plain_message(f"<m{i}@example.test>") for i in range(2)]
+    stage = tmp_path / "out" / "stage.db"
+    db, (paired, extra) = _canonical(
+        tmp_path,
+        [
+            _row(pst=pst, index=1, message_id="<m0@example.test>", body="old body"),
+            _row(pst=pst, index=3, message_id="<m1@example.test>", body="old body"),
+        ],
+    )
+    lspst_overrides["a.pst"] = _emails(4)
+
+    assert _run(db, stage, readpst) == 2
+
+    counts = _report(stage)["counts"]
+    assert counts["extraction_incomplete"] == 1
+    assert counts["locator_not_found"] == 0
+    assert counts["paired_by_message_id"] == 0
+    assert extra not in _staged(stage)
+    assert set(_staged(stage)) == {paired}  # already-paired rows stay staged
+    assert counts["rewrite"] == 1
+    entry = _report(stage)["per_pst"][0]
+    assert entry["extraction_complete"] is False
+    assert entry["ledger_emails"] == 4
+    out = capsys.readouterr().out
+    assert "INCOMPLETE" in out
+    assert str(pst.resolve()) in out
+
+
+def test_ledger_abort_line_is_unavailable_exits_zero_and_warns(
+    tmp_path, stub_readpst, lspst_overrides, capsys
+):
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=2, rows=2)
+    lspst_overrides["a.pst"] = (
+        0,
+        "Email\tFrom: x\nA second message_store has been found. Sorry, this "
+        "must be an error.\n",
+        "",
+    )
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["ledger"] == "unavailable"
+    assert entry["ledger_emails"] is None
+    assert "message_store" in entry["ledger_note"]
+    assert entry["extraction_complete"] is None
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_lspst_nonzero_exit_is_unavailable(tmp_path, stub_readpst, lspst_overrides):
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=1, rows=1)
+    lspst_overrides["a.pst"] = (3, "", "boom")
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["ledger"] == "unavailable"
+    assert "3" in entry["ledger_note"]
+    assert entry["extraction_complete"] is None
+
+
+def test_missing_lspst_refuses_and_keeps_the_previous_stage(
+    tmp_path, stub_readpst, monkeypatch
+):
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=1, rows=1)
+    assert _run(db, stage, readpst) == 0
+    before = stage.read_bytes()
+    (tmp_path / "lspst.exe").unlink()
+    monkeypatch.setattr(stage_module.shutil, "which", lambda name: None)
+
+    assert _run(db, stage, readpst, "--overwrite") == 1
+    assert stage.read_bytes() == before
+
+    explicit = tmp_path / "nowhere" / "lspst.exe"
+    assert _run(db, stage, readpst, "--overwrite", "--lspst-path", str(explicit)) == 1
+    assert stage.read_bytes() == before
+
+
+def test_explicit_lspst_path_is_used(tmp_path, stub_readpst, monkeypatch):
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=1, rows=1)
+    chosen = tmp_path / "elsewhere-lspst.exe"
+    chosen.write_text("", encoding="utf-8")
+    used: list[Path] = []
+    original = stage_module._run_lspst
+
+    def spy(lspst: Path, pst: Path):
+        used.append(lspst)
+        return original(lspst, pst)
+
+    monkeypatch.setattr(stage_module, "_run_lspst", spy)
+
+    assert _run(db, stage, readpst, "--lspst-path", str(chosen)) == 0
+    assert used == [chosen.resolve()]
+
+
+def test_failed_messages_count_toward_the_ledger(
+    tmp_path, stub_readpst, lspst_overrides, monkeypatch
+):
+    # lspst lists 3; readpst yields 2 messages plus 1 per-message parse failure:
+    # nothing is missing, so the PST is complete and the failed row is a
+    # parse_failure (not extraction_incomplete).
+    _, db, ids, readpst, stage = _ledger_world(
+        tmp_path, stub_readpst, in_mbox=2, rows=2
+    )
+    con = connect_database(db)
+    try:
+        failed = _insert(
+            con,
+            pst=tmp_path / "a.pst",
+            index=9,
+            message_id="<failed@example.test>",
+            body="old body",
+        )
+        con.commit()
+    finally:
+        con.close()
+    lspst_overrides["a.pst"] = _emails(3)
+    original = ReadpstParser.iter_extraction_results
+
+    def with_one_failure(self, source):
+        yield from original(self, source)
+        yield ExtractionResult(
+            failure=IngestFailure.from_source(
+                source,
+                folder_path="Inbox",
+                logical_locator="Inbox/mbox#9",
+                error_stage="parse-pst",
+                error_type="ValueError",
+                error_message="synthetic",
+            )
+        )
+
+    monkeypatch.setattr(ReadpstParser, "iter_extraction_results", with_one_failure)
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["extraction_complete"] is True
+    counts = _report(stage)["counts"]
+    assert counts["parse_failure"] == 1
+    assert counts["extraction_incomplete"] == 0
+    assert failed not in _staged(stage)
+
+
+def test_more_extracted_than_listed_is_complete(
+    tmp_path, stub_readpst, lspst_overrides
+):
+    _, db, _, readpst, stage = _ledger_world(tmp_path, stub_readpst, in_mbox=3, rows=3)
+    lspst_overrides["a.pst"] = _emails(2)
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["extraction_complete"] is True
+    assert entry["extracted_messages"] == 3
+
+
+def test_missing_pst_has_no_ledger_and_no_warning(tmp_path, stub_readpst, capsys):
+    pst, db, _, readpst, stage = _ledger_world(
+        tmp_path, stub_readpst, in_mbox=1, rows=1
+    )
+    pst.unlink()
+
+    assert _run(db, stage, readpst) == 0
+
+    entry = _report(stage)["per_pst"][0]
+    assert entry["ledger"] == "unavailable"
+    assert entry["extraction_complete"] is None
+    assert "WARNING" not in capsys.readouterr().out
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="uses a .cmd stub")
+def test_run_lspst_runs_the_binary_without_a_shell(tmp_path):
+    cmd = tmp_path / "lspst.cmd"
+    cmd.write_bytes(b"@echo off\r\necho Email\tFrom: a\r\nexit /b 0\r\n")
+    pst = _make_pst(tmp_path, "a.pst")
+
+    code, out, _ = stage_module._run_lspst(cmd, pst)
+
+    assert code == 0
+    assert out.startswith("Email")
+    assert stage_module._lspst_ledger(cmd, pst) == {
+        "state": "ok",
+        "emails": 1,
+        "note": None,
+    }
 
 
 # ---------------------------------------------------------------------------
