@@ -976,10 +976,14 @@ def test_archive_automation_is_scoped_to_skill_publication_only():
     }
 
     assert "publish-cli-on-archive" not in local_hooks
-    assert local_hooks["deploy-skill-to-ssot"]["stages"] == [
-        "post-commit",
-        "post-merge",
-    ]
+    # D-20261106-2: the skill reaches the SSOT only through a release, so it always
+    # pairs with the installed bes of that release; no git hook deploys it earlier.
+    assert "deploy-skill-to-ssot" not in local_hooks
+    hook_types = config.get("default_install_hook_types", [])
+    assert "post-commit" not in hook_types
+    assert "post-merge" not in hook_types
+    release = (REPO_ROOT / "scripts" / "release.ps1").read_text(encoding="utf-8")
+    assert "scripts/deploy-skill-to-ssot.py --verify-required" in release
     assert not (REPO_ROOT / "scripts" / "publish-cli-on-archive.py").exists()
 
 
