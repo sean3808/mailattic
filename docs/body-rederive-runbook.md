@@ -74,8 +74,11 @@ uv run python scripts/body_rederive_stage.py imap-from-pst \
   --database <WSL 上的正式庫快照> --stage <WSL>/stage-imap-pst.db \
   --ids-file <WSL>/stage-imap-unreachable-ids.txt \
   --pst-map '<pst_source 原路徑>=<WSL 上的 PST 副本>' ...（每個 PST 一個）\
+  --pst '<pst_source 原路徑>' ...（只列原檔還在的 PST）\
   --overwrite
 ```
+
+`--pst` 要列出原檔還在的每個 PST（不列 `archive.pst`）。沒列 `--pst` 時正式庫記得的 PST 全部納入；原檔已不存在的那個無法證明完整，所有找不到的信就都會計為 `extraction_incomplete`，`not_in_pst` 會是 0。
 
 3. **結束碼必須是 0**。2 = 某個 PST 解包不完整或沒有封數帳本：找不到的信會計為 `extraction_incomplete`（不是 `not_in_pst`），重跑同一行。清單裡不是 IMAP 來源的 id 計為 `not_imap_row`，同一 Message-ID 內文不一致計為 `message_id_ambiguous`，皆不寫入。
 4. 搬回 Windows 後照步驟 4 試算、寫入（套用工具認得這種暫存庫，並核對對應的正式庫列確實是 IMAP 來源）。
