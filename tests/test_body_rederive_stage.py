@@ -2127,11 +2127,19 @@ def test_imap_stage_records_unreachable_ids_in_report_and_stage_meta(
 
     assert _run_imap(db, stage, env_file) == 0
 
-    expected = sorted([ids[1], ids[2], ids[3]])
+    expected = sorted(
+        [
+            {"id": ids[1], "message_id": "i2@example.test"},
+            {"id": ids[2], "message_id": "i4@example.test"},
+            {"id": ids[3], "message_id": "i5@example.test"},
+        ],
+        key=lambda e: e["id"],
+    )
     report = _report(stage)
-    assert report["unreachable_ids"] == expected
+    assert report["unreachable"] == expected
+    assert "unreachable_ids" not in report
     assert report["unreachable_ids_count"] == 3
-    assert json.loads(_stage_meta(stage)["report_json"])["unreachable_ids"] == expected
+    assert json.loads(_stage_meta(stage)["report_json"])["unreachable"] == expected
     assert not list(tmp_path.glob("*unreachable-ids*"))
     counts = report["counts"]
     unreachable = (
@@ -2147,18 +2155,42 @@ def test_imap_stage_records_unreachable_ids_in_report_and_stage_meta(
 # ---------------------------------------------------------------------------
 def _imap_stage_db(
     path: Path,
-    ids: list[int] | None,
+    ids: list | None,
     *,
     source_kind: str = "imap",
     complete: bool = True,
     canonical: str | None = "canonical.db",
+    old_key: bool = False,
 ) -> Path:
-    """A minimal finished ``imap`` stage database carrying *ids* as its
-    ``unreachable_ids`` (None: a stage built before the list existed)."""
+    """A minimal finished ``imap`` stage database whose ``unreachable`` list
+    holds *ids*: an int is paired with that row's Message-ID read from the
+    ``canonical.db`` beside *path* (unknown id: ""), a ``(id, message_id)``
+    tuple is stored as given. None: no list at all. *old_key*: the pre-binding
+    shape (a plain ``unreachable_ids`` int list)."""
     path.unlink(missing_ok=True)
     report: dict = {"mode": "imap", "verdict": {"complete": complete, "reasons": []}}
+    entries = []
     if ids is not None:
-        report["unreachable_ids"] = ids
+        snapshot = path.parent / "canonical.db"
+        for item in ids:
+            if isinstance(item, tuple):
+                entries.append({"id": item[0], "message_id": item[1]})
+                continue
+            message_id = ""
+            if snapshot.exists():
+                con = sqlite3.connect(snapshot)
+                try:
+                    found = con.execute(
+                        "SELECT message_id FROM messages WHERE id = ?", (item,)
+                    ).fetchone()
+                finally:
+                    con.close()
+                if found:
+                    message_id = stage_module.normalize_message_id(found[0])
+            entries.append({"id": item, "message_id": message_id})
+        report["unreachable_ids" if old_key else "unreachable"] = (
+            [e["id"] for e in entries] if old_key else entries
+        )
     con = sqlite3.connect(path)
     try:
         con.executescript(stage_module._STAGE_SCHEMA)
@@ -2400,6 +2432,9 @@ def test_from_pst_bad_map_key_is_refused_before_the_old_stage_is_deleted(
         ),
         pytest.param(lambda p, mid: _imap_stage_db(p, None), id="no-list"),
         pytest.param(
+            lambda p, mid: _imap_stage_db(p, [mid], old_key=True), id="old-id-list"
+        ),
+        pytest.param(
             lambda p, mid: _imap_stage_db(p, [mid], canonical=None), id="no-canonical"
         ),
     ],
@@ -2420,6 +2455,30 @@ def test_from_pst_unusable_imap_stage_is_refused_before_deletion(
 
     assert _run_from_pst(db, stage, readpst, imap_stage, "--overwrite") == 1
     assert stage.read_bytes() == before
+
+
+def test_from_pst_identity_mismatch_is_never_staged_and_verdict_not_complete(
+    tmp_path, stub_readpst
+):
+    # The stored id points at a canonical row with a different Message-ID: the
+    # imap stage was built from another snapshot. The PST holds the canonical
+    # row's message, so a wrongly accepted id would be staged.
+    db, (good, other), readpst, imap_stage, stage = _from_pst_world(
+        tmp_path,
+        stub_readpst,
+        [_table_message("<g1@example.test>"), _table_message("<g2@example.test>")],
+        [("<g1@example.test>", PLAIN_FLAT), ("<g2@example.test>", PLAIN_FLAT)],
+    )
+    _imap_stage_db(imap_stage, [good, (other, "someone-else@example.test")])
+
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 2
+
+    report = _report(stage)
+    assert report["counts"]["identity_mismatch"] == 1
+    assert report["counts"]["rewrite"] == 1
+    assert set(_staged(stage)) == {good}
+    assert report["verdict"]["complete"] is False
+    assert any("identity_mismatch" in r for r in report["verdict"]["reasons"])
 
 
 def test_from_pst_imap_stage_equal_to_stage_is_refused(tmp_path, stub_readpst):

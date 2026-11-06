@@ -64,7 +64,7 @@ uv run python scripts/body_rederive_apply.py --canonical mailattic.db --stage <�
 
 ## IMAP 抓不到的信改從 PST 重做（#59）
 
-步驟 3 的 IMAP 暫存抓不到的信（伺服器已刪、資料夾不在、舊 mbsync 檔名）原本維持原樣；其中不少仍在 PST 裡。步驟 3 的 IMAP 暫存庫會把這三類信的正式庫 `messages.id` 清單記在自己的報告裡（`unreachable_ids`，封數是 `unreachable_ids_count`）。新子命令 `imap-from-pst` 以 `--imap-stage` 指定那個暫存庫，只處理清單上的信，依 Message-ID 到 PST 找內文；**伺服器還抓得到的信不在清單上，不會被 PST 版本覆蓋**。
+步驟 3 的 IMAP 暫存抓不到的信（伺服器已刪、資料夾不在、舊 mbsync 檔名）原本維持原樣；其中不少仍在 PST 裡。步驟 3 的 IMAP 暫存庫會把這三類信的正式庫 `messages.id` 清單記在自己的報告裡（`unreachable`，封數是 `unreachable_ids_count`）。新子命令 `imap-from-pst` 以 `--imap-stage` 指定那個暫存庫，只處理清單上的信，依 Message-ID 到 PST 找內文。清單裡每封信除了 `id` 也記著它的 Message-ID，`imap-from-pst` 會核對正式庫同一 `id` 的 Message-ID 是否相符；不符（報告 `identity_mismatch` > 0，結束碼 2）代表這份 IMAP 暫存庫不是用目前這份正式庫快照建的，該信不寫，請用同一份快照重建 IMAP 暫存庫；**伺服器還抓得到的信不在清單上，不會被 PST 版本覆蓋**。
 
 1. 步驟 3 照舊（結束碼必須是 0；工具只接受「已證明完整」的 IMAP 暫存庫，否則拒絕）。
 2. 把 IMAP 暫存庫（`stage-imap.db`）與 PST 副本、正式庫快照一併複製進 WSL 磁碟，在 WSL 跑（PST 的 `--pst-map` 與步驟 2 相同）：
