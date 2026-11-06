@@ -759,13 +759,14 @@ def _process_pst(
 
     Returns (counts, extracted, extraction_complete, the ledger actually used
     -- an ``unavailable`` lspst ledger is replaced by a ``recount`` one when
-    *work_root* is given and the recount ran --, the recount seconds, and the
-    number of messages readpst yielded as per-message failures).
+    *work_root* is given and the recount ran --, the recount seconds, the
+    number of messages readpst yielded as per-message failures, and whether
+    readpst itself failed part-way through the PST).
     """
     counts = _empty_counts()
     if not read_from.exists():
         counts["pst_missing"] = sum(len(v) for v in rows.values())
-        return counts, 0, None, ledger, None, 0
+        return counts, 0, None, ledger, None, 0, False
 
     source = PstSource(path=read_from, input_mode="file", requested_from=read_from)
     failed_locators: set[str] = set()
@@ -867,6 +868,7 @@ def _process_pst(
         ledger,
         recount_seconds,
         failure_count,
+        pst_level_failure,
     )
 
 
@@ -939,7 +941,7 @@ def build_pst_stage(
                     ledger = _lspst_ledger(lspst, read_from)
                 else:
                     ledger = _ledger("unavailable", None, _LEDGER_NOTE_PST_MISSING)
-                counts, extracted_count, complete, ledger, recount_seconds, _ = (
+                counts, extracted_count, complete, ledger, recount_seconds, _, _ = (
                     _process_pst(
                         pst_source,
                         rows,
@@ -1160,6 +1162,7 @@ def build_imap_from_pst_stage(
                     ledger,
                     recount_seconds,
                     failures,
+                    unreadable,
                 ) = _process_pst(
                     pst_source,
                     {},
@@ -1182,6 +1185,9 @@ def build_imap_from_pst_stage(
                         "rows": 0,
                         "extracted_messages": extracted_count,
                         "extraction_failures": failures,
+                        # readpst itself failed part-way: whatever was yielded
+                        # before the failure cannot prove the PST complete.
+                        "pst_unreadable": unreadable,
                         "ledger": ledger["state"],
                         "ledger_emails": ledger["emails"],
                         "ledger_note": ledger["note"],
@@ -1198,7 +1204,9 @@ def build_imap_from_pst_stage(
                 p for p in per_pst if p["ledger_note"] != _LEDGER_NOTE_PST_MISSING
             ]
             all_proven = bool(existing) and all(
-                p["extraction_complete"] is True and p["extraction_failures"] == 0
+                p["extraction_complete"] is True
+                and p["extraction_failures"] == 0
+                and p["pst_unreadable"] is False
                 for p in existing
             )
             not_found_reason = "not_in_pst" if all_proven else "extraction_incomplete"
@@ -1594,6 +1602,15 @@ def _verdict(report: dict) -> dict:
                     f"{name}: {entry.get('extraction_failures')!r} message(s) "
                     "failed extraction; their Message-IDs never reached the "
                     "lookup, so candidate agreement cannot be proven"
+                )
+            if (
+                mode == "imap-from-pst"
+                and isinstance(entry, dict)
+                and entry.get("pst_unreadable") is not False
+            ):
+                reasons.append(
+                    f"{name}: readpst failed part-way (or the flag is missing), "
+                    "so the PST is not proven completely extracted"
                 )
             if not isinstance(entry, dict):
                 reasons.append(f"malformed per_pst entry: {entry!r}")

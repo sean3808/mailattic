@@ -2564,6 +2564,41 @@ def test_from_pst_per_message_extraction_failure_makes_the_verdict_not_complete(
     )
 
 
+def test_from_pst_reader_failing_after_the_ledger_count_is_not_complete(
+    tmp_path, stub_readpst, monkeypatch
+):
+    # readpst yields every message the ledger lists, then fails: the count
+    # matches, but the PST is not proven completely read.
+    db, (found, missing), readpst, imap_stage, stage = _from_pst_world(
+        tmp_path,
+        stub_readpst,
+        [_table_message("<g1@example.test>")],
+        [("<g1@example.test>", PLAIN_FLAT), ("<g2@example.test>", "old body")],
+    )
+    _imap_stage_db(imap_stage, [found, missing])
+    original = ReadpstParser.iter_extraction_results
+
+    def fails_at_the_end(self, source):
+        yield from original(self, source)
+        raise RuntimeError("readpst failed for a.pst: synthetic")
+
+    monkeypatch.setattr(ReadpstParser, "iter_extraction_results", fails_at_the_end)
+
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 2
+
+    report = _report(stage)
+    entry = report["per_pst"][0]
+    assert entry["extraction_complete"] is True  # the count alone looks fine
+    assert entry["pst_unreadable"] is True
+    assert report["counts"]["not_in_pst"] == 0
+    assert report["counts"]["extraction_incomplete"] == 1
+    assert report["verdict"]["complete"] is False
+    assert any(
+        "a.pst" in reason and "readpst failed" in reason
+        for reason in report["verdict"]["reasons"]
+    )
+
+
 def test_from_pst_existing_stage_is_refused_without_overwrite(tmp_path, stub_readpst):
     db, (mid,), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
