@@ -124,20 +124,24 @@ IMAP rows the server no longer holds (``imap-from-pst`` subcommand, #59):
     re-derives exactly
     those rows from PST content found by Message-ID. It unpacks the canonical
     PSTs like ``pst`` mode (same ledgers, completeness verdict and
-    ``--pst-map`` / ``--pst`` options; a ``--pst`` that matches no canonical
-    PST, or an empty selection, is refused; a PST with per-message extraction
-    failures makes the verdict NOT complete) and records every extracted Message-ID's
-    body; each listed id must be a ``source_input_mode='maildir'`` row
+    ``--pst-map`` option). There is no ``--pst`` filter: every canonical
+    file-mode ``pst_source`` is searched, so "all candidates agree" always
+    covers all of them. A PST whose file is gone is named in the verdict's
+    ``missing_sources`` and does not block (the #14 ``pst_missing`` rule); a PST
+    with per-message extraction failures makes the verdict NOT complete. Every
+    extracted Message-ID's body is recorded; each listed id must be a
+    ``source_input_mode='maildir'`` row
     (otherwise ``not_imap_row``) whose normalized Message-ID equals the one the
     imap stage recorded (otherwise ``identity_mismatch``: another snapshot,
     never staged, verdict NOT complete) with a Message-ID (otherwise
     ``no_message_id``, never staged). Then, as in the pst fallback: found and
     all candidates agree -> ``unchanged`` or a staged ``rewrite`` (or
     ``degraded_kept``); candidates differ -> ``message_id_ambiguous``; not found
-    -> ``not_in_pst``, or ``extraction_incomplete`` when any PST of the run is
-    not proven complete. The stage's ``source_kind`` is ``imap_pst``. Rows the
+    -> ``not_in_pst``, or ``extraction_incomplete`` unless every existing PST
+    is proven complete with zero extraction failures. The stage's ``source_kind``
+    is ``imap_pst``. Rows the
     server still serves are never listed, so they are never overwritten with a
-    PST-derived body. Refusals (bad ``--pst-map`` key, bad ``--pst``, unusable
+    PST-derived body. Refusals (bad ``--pst-map`` key, no canonical PST, unusable
     imap stage) happen before an old stage is cleared.
 
 Usage:
@@ -150,7 +154,7 @@ Usage:
     uv run python scripts/body_rederive_stage.py imap-from-pst \\
         --database <canonical.db> \\
         --stage <stage.db> --imap-stage <stage-imap.db> \\
-        [--pst-map CANONICAL=LOCAL ...] [--pst <path> ...] [--readpst-path P] \\
+        [--pst-map CANONICAL=LOCAL ...] [--readpst-path P] \\
         [--lspst-path P] [--overwrite]
 
 The canonical database is opened read-only (``mode=ro``). The only writes are
@@ -1089,13 +1093,15 @@ def build_imap_from_pst_stage(
     imap_stage: Path,
     readpst_path: Path | None,
     lspst_path: Path | None = None,
-    pst_filter: list[Path],
     overwrite: bool,
     pst_map: dict[str, Path] | None = None,
 ) -> dict:
     """Re-derive the IMAP (maildir) rows the *imap_stage* could not reach, from
-    PST content found by Message-ID (#59). Same unpack / ledger / fallback machinery as
-    ``build_pst_stage``; only the listed rows are examined."""
+    PST content found by Message-ID (#59). Same unpack / ledger / fallback
+    machinery as ``build_pst_stage``; only the listed rows are examined. Every
+    canonical file-mode ``pst_source`` takes part (there is no PST filter); one
+    whose file is gone is named in the verdict's ``missing_sources`` and
+    does not block."""
     pst_map = pst_map or {}
     _check_stage_target(database, stage, overwrite)
     if imap_stage.resolve() == stage.resolve():
@@ -1113,26 +1119,8 @@ def build_imap_from_pst_stage(
             raise StageRefused(
                 f"--pst-map names a pst_source not in the canonical DB: {unknown_keys}"
             )
-        not_in_canonical: list[str] = []
-        if pst_filter:
-            wanted = [str(p) for p in pst_filter]
-            selected = [
-                s for s in pst_sources if any(_same_path(s, Path(w)) for w in wanted)
-            ]
-            not_in_canonical = [
-                w
-                for w in wanted
-                if not any(_same_path(s, Path(w)) for s in pst_sources)
-            ]
-            pst_sources = selected
-        # A mistyped --pst, or no PST left, would let "not found" read as
-        # "not in PST" over an empty / short selection.
-        if not_in_canonical:
-            raise StageRefused(
-                f"--pst names no canonical pst_source: {not_in_canonical}"
-            )
         if not pst_sources:
-            raise StageRefused("no PST selected: the canonical DB has none")
+            raise StageRefused("no PST to search: the canonical DB has no file rows")
         # Every refusal is decided; only now may a previous stage be removed.
         _clear_stage_target(stage)
 
@@ -1204,10 +1192,18 @@ def build_imap_from_pst_stage(
                         "elapsed_seconds": round(time.perf_counter() - began, 3),
                     }
                 )
-            # A missing message may only be called "not in PST" when every PST
-            # of the run is proven complete (a missing PST file is not).
-            all_complete = all(p["extraction_complete"] is True for p in per_pst)
-            not_found_reason = "not_in_pst" if all_complete else "extraction_incomplete"
+            # "Not in PST" is claimed only when at least one PST file exists and
+            # every existing one is proven complete with no per-message failure.
+            # A PST whose file is gone is named by the verdict (missing_sources)
+            # and, as in pst mode, does not by itself weaken that claim.
+            existing = [
+                p for p in per_pst if p["ledger_note"] != _LEDGER_NOTE_PST_MISSING
+            ]
+            all_proven = bool(existing) and all(
+                p["extraction_complete"] is True and p["extraction_failures"] == 0
+                for p in existing
+            )
+            not_found_reason = "not_in_pst" if all_proven else "extraction_incomplete"
             for entry in wanted_ids:
                 found = canonical.execute(
                     "SELECT id, message_id, source_input_mode, body_text "
@@ -1252,7 +1248,6 @@ def build_imap_from_pst_stage(
                 ),
                 "rows_in_scope": len(wanted_ids),
                 "counts": counts,
-                "requested_psts_not_in_canonical": not_in_canonical,
                 "degraded_sample_ids": samples.items,
                 "per_pst": per_pst,
             }
@@ -1570,6 +1565,14 @@ def _verdict(report: dict) -> dict:
             "the imap stage and this canonical snapshot do not belong together; "
             "rebuild the imap stage from this snapshot"
         )
+    if mode == "imap-from-pst" and isinstance(report.get("per_pst"), list):
+        readable = [
+            e
+            for e in report["per_pst"]
+            if isinstance(e, dict) and e.get("ledger_note") != _LEDGER_NOTE_PST_MISSING
+        ]
+        if not readable:
+            reasons.append("no PST file exists, so nothing was searched")
     if mode in ("pst", "imap-from-pst"):
         if mode == "pst" and counts.get("pst_unreadable") != 0:
             reasons.append(
@@ -1739,7 +1742,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     from_pst.add_argument("--readpst-path", type=Path, default=None)
     from_pst.add_argument("--lspst-path", type=Path, default=None)
-    from_pst.add_argument("--pst", type=Path, action="append", default=[])
     from_pst.add_argument(
         "--pst-map",
         action="append",
@@ -1786,7 +1788,6 @@ def main(argv: list[str] | None = None) -> int:
                 imap_stage=Path(args.imap_stage).expanduser().resolve(),
                 readpst_path=args.readpst_path,
                 lspst_path=args.lspst_path,
-                pst_filter=list(args.pst),
                 overwrite=args.overwrite,
                 pst_map=_parse_pst_map(args.pst_map),
             )

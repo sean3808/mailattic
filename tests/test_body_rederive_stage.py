@@ -2495,35 +2495,6 @@ def test_from_pst_imap_stage_equal_to_stage_is_refused(tmp_path, stub_readpst):
     assert imap_stage.read_bytes() == before
 
 
-def test_from_pst_unmatched_pst_filter_is_refused_before_deletion(
-    tmp_path, stub_readpst
-):
-    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
-        tmp_path,
-        stub_readpst,
-        [_table_message("<g1@example.test>")],
-        [("<g1@example.test>", PLAIN_FLAT)],
-    )
-    _imap_stage_db(imap_stage, [mid])
-    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
-    before = stage.read_bytes()
-
-    code = _run_from_pst(
-        db,
-        stage,
-        readpst,
-        imap_stage,
-        "--overwrite",
-        "--pst",
-        str(tmp_path / "a.pst"),
-        "--pst",
-        str(tmp_path / "typo.pst"),
-    )
-
-    assert code == 1
-    assert stage.read_bytes() == before
-
-
 def test_from_pst_empty_pst_selection_is_refused_before_deletion(
     tmp_path, stub_readpst
 ):
@@ -2628,26 +2599,108 @@ def _two_pst_world(tmp_path: Path, stub_readpst):
     return db, readpst, imap_stage, tmp_path / "out" / "stage.db", pst
 
 
-def test_from_pst_pst_filter_excluding_a_missing_pst_keeps_not_in_pst(
+def test_from_pst_missing_pst_file_is_named_and_does_not_block_not_in_pst(
     tmp_path, stub_readpst
 ):
     db, readpst, imap_stage, stage, pst = _two_pst_world(tmp_path, stub_readpst)
 
-    assert _run_from_pst(db, stage, readpst, imap_stage, "--pst", str(pst)) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
 
     report = _report(stage)
     assert report["verdict"]["complete"] is True
+    assert report["verdict"]["missing_sources"] == [
+        str((tmp_path / "gone.pst").resolve())
+    ]
     assert report["counts"]["not_in_pst"] == 1
     assert report["counts"]["extraction_incomplete"] == 0
+    assert "requested_psts_not_in_canonical" not in report
 
 
-def test_from_pst_without_pst_filter_a_missing_pst_makes_not_found_incomplete(
-    tmp_path, stub_readpst
+def test_from_pst_not_found_with_a_per_message_failure_is_extraction_incomplete(
+    tmp_path, stub_readpst, monkeypatch
 ):
     db, readpst, imap_stage, stage, _ = _two_pst_world(tmp_path, stub_readpst)
+    original = ReadpstParser.iter_extraction_results
 
-    _run_from_pst(db, stage, readpst, imap_stage)
+    def with_failure(self, source):
+        yield from original(self, source)
+        yield ExtractionResult(
+            failure=IngestFailure.from_source(
+                source,
+                folder_path="Inbox",
+                logical_locator="Inbox/mbox#9",
+                error_stage="parse-pst",
+                error_type="ValueError",
+                error_message="synthetic",
+            )
+        )
+
+    monkeypatch.setattr(ReadpstParser, "iter_extraction_results", with_failure)
+
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 2
+
+    counts = _report(stage)["counts"]
+    assert counts["extraction_incomplete"] == 1
+    assert counts["not_in_pst"] == 0
+
+
+def test_from_pst_all_existing_psts_are_consulted_for_candidate_agreement(
+    tmp_path, stub_readpst
+):
+    readpst, mboxes = stub_readpst
+    a = _make_pst(tmp_path, "a.pst")
+    b = _make_pst(tmp_path, "b.pst")
+    mboxes["a.pst"] = [_plain_message("<g1@example.test>", "first version")]
+    mboxes["b.pst"] = [_plain_message("<g1@example.test>", "second version")]
+    db = initialize_database(tmp_path / "canonical.db")
+    con = connect_database(db)
+    try:
+        _insert(con, pst=a, index=1, message_id="<anchor-a@example.test>", body="a")
+        _insert(con, pst=b, index=1, message_id="<anchor-b@example.test>", body="a")
+        mid = _insert(
+            con,
+            pst=a,
+            index=100,
+            message_id="<g1@example.test>",
+            body="old body",
+            input_mode="maildir",
+        )
+        con.commit()
+    finally:
+        con.close()
+    imap_stage = _imap_stage_db(tmp_path / "stage-imap.db", [mid])
+    stage = tmp_path / "out" / "stage.db"
+
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
+
+    assert _staged(stage) == {}
+    assert _report(stage)["counts"]["message_id_ambiguous"] == 1
+
+
+def test_from_pst_with_no_existing_pst_file_is_not_complete(tmp_path, stub_readpst):
+    readpst, _ = stub_readpst
+    gone = tmp_path / "gone.pst"  # never created
+    db = initialize_database(tmp_path / "canonical.db")
+    con = connect_database(db)
+    try:
+        _insert(con, pst=gone, index=1, message_id="<anchor@example.test>", body="a")
+        mid = _insert(
+            con,
+            pst=gone,
+            index=100,
+            message_id="<g1@example.test>",
+            body="old body",
+            input_mode="maildir",
+        )
+        con.commit()
+    finally:
+        con.close()
+    imap_stage = _imap_stage_db(tmp_path / "stage-imap.db", [mid])
+    stage = tmp_path / "out" / "stage.db"
+
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 2
 
     report = _report(stage)
     assert report["counts"]["extraction_incomplete"] == 1
     assert report["counts"]["not_in_pst"] == 0
+    assert report["verdict"]["complete"] is False

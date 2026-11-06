@@ -74,13 +74,12 @@ uv run python scripts/body_rederive_stage.py imap-from-pst \
   --database <WSL 上的正式庫快照> --stage <WSL>/stage-imap-pst.db \
   --imap-stage <WSL>/stage-imap.db \
   --pst-map '<pst_source 原路徑>=<WSL 上的 PST 副本>' ...（每個 PST 一個）\
-  --pst '<pst_source 原路徑>' ...（只列原檔還在的 PST）\
   --overwrite
 ```
 
-`--pst` 要列出原檔還在的每個 PST（列了正式庫沒有的 PST，或一個都沒選到，工具會拒絕）（不列 `archive.pst`）。沒列 `--pst` 時正式庫記得的 PST 全部納入；原檔已不存在的那個無法證明完整，所有找不到的信就都會計為 `extraction_incomplete`，`not_in_pst` 會是 0。
+這個子命令沒有 `--pst`：正式庫記得的每個 PST 一律納入，原檔還在的全部解包、全部參與比對。原檔已不存在的 PST（例如 `archive.pst`）不會擋住結果，但會記名在判定的 `missing_sources`（摘要印 `missing source`），也不因它把找不到的信降成 `extraction_incomplete`。
 
-3. **結束碼必須是 0，而且 `extraction_incomplete` 必須是 0**。結束碼 2 = 某個 PST 解包不完整、沒有封數帳本，或有信在解包時單封失敗（報告 `extraction_failures` > 0，那封的 Message-ID 沒進比對，無法證明候選一致），重跑同一行。結束碼 0 但 `extraction_incomplete` 不是 0 = 有 PST 原檔不存在卻被納入（通常是忘了 `--pst`）：找不到的信沒被判成 `not_in_pst`，補上 `--pst` 重跑。清單裡不是 IMAP 來源的 id 計為 `not_imap_row`，同一 Message-ID 內文不一致計為 `message_id_ambiguous`，皆不寫入。
+3. **結束碼必須是 0，而且 `extraction_incomplete` 必須是 0**。結束碼 2 = 某個 PST 解包不完整、沒有封數帳本，或有信在解包時單封失敗（報告 `extraction_failures` > 0，那封的 Message-ID 沒進比對，無法證明候選一致），重跑同一行。結束碼 0 但 `extraction_incomplete` 不是 0 時不要往下做，把報告貼回票上討論。清單裡不是 IMAP 來源的 id 計為 `not_imap_row`，同一 Message-ID 內文不一致計為 `message_id_ambiguous`，皆不寫入。
 4. 搬回 Windows 後照步驟 4 試算、寫入（套用工具認得這種暫存庫，並核對對應的正式庫列確實是 IMAP 來源）。
 
 ## 還原
@@ -105,7 +104,7 @@ uv run python scripts/body_rederive_apply.py --canonical mailattic.db --restore 
 
 | 類別 | 封數 | 說明 |
 |---|---|---|
-| IMAP：伺服器已刪 | 1,301 | 其中 1,054 封仍在 Outlook 本機 PST（依 Message-ID 比對），**247 封伺服器已刪且不在任何 PST** |
+| IMAP：伺服器已刪 | 1,301 | 其中 1,070 封在 PST（依 Message-ID 比對），**231 封伺服器已刪且不在任何 PST**（2026-11-06，以當天 PST 重算） |
 | IMAP：舊 mbsync 檔名無法定位 | 107 | 其中 91 封不在 PST |
 | PST：無 Message-ID（不重做，Sean 拍板） | 7,790 | 含表格估計 2,221 封（2020–2023 封存檔 701 封可靠；其餘 PST 的位置有偏移，只是估計），另 1,745 封無法判斷 |
 | PST：重做後內文變差而保留（#57） | 304 | 亂碼或 base64，待 #57 修好後可再重做 |
