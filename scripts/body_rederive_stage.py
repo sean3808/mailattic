@@ -284,6 +284,10 @@ _LOCATOR_RE = re.compile(
     r"(?:\.v(?P<uidvalidity>\d+)(?:\.[0-9a-f]+)?)?\.eml$"
 )
 
+# imap-from-pst has no per-PST row ownership; the shared fallback store still
+# wants a pst_source key, so every listed id is pooled under this one.
+_IMAP_FROM_PST_POOL = ""
+
 # imap-from-pst (#59): outcomes per listed canonical id. paired_by_message_id
 # is informational (how many of rewrite + unchanged were resolved), exactly as
 # in pst mode.
@@ -1152,9 +1156,14 @@ def build_imap_from_pst_stage(
                 if not row["message_id"]:
                     counts["no_message_id"] += 1
                     continue
-                store.add_pool("", row, not_found_reason)
+                store.add_pool(_IMAP_FROM_PST_POOL, row, not_found_reason)
             _resolve_fallback(
-                store, stage_con, {"": counts}, canonical, samples, SOURCE_KIND_IMAP_PST
+                store,
+                stage_con,
+                {_IMAP_FROM_PST_POOL: counts},
+                canonical,
+                samples,
+                SOURCE_KIND_IMAP_PST,
             )
             stage_con.commit()
             report = {

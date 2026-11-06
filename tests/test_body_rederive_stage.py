@@ -2409,3 +2409,56 @@ def test_from_pst_existing_stage_is_refused_without_overwrite(tmp_path, stub_rea
     ids_file.write_text(f"{mid}\n", encoding="utf-8")
     assert _run_from_pst(db, stage, readpst, ids_file) == 0
     assert _run_from_pst(db, stage, readpst, ids_file) == 1
+
+
+def _two_pst_world(tmp_path: Path, stub_readpst):
+    """a.pst exists; gone.pst is a canonical pst_source with no file on disk.
+    The listed id (g1) is in neither."""
+    readpst, mboxes = stub_readpst
+    pst = _make_pst(tmp_path, "a.pst")
+    mboxes["a.pst"] = [_plain_message("<other@example.test>")]
+    gone = tmp_path / "gone.pst"  # never created
+    db = initialize_database(tmp_path / "canonical.db")
+    con = connect_database(db)
+    try:
+        _insert(con, pst=pst, index=1, message_id="<anchor@example.test>", body="a")
+        _insert(con, pst=gone, index=1, message_id="<anchor2@example.test>", body="a")
+        mid = _insert(
+            con,
+            pst=pst,
+            index=100,
+            message_id="<g1@example.test>",
+            body="old body",
+            input_mode="maildir",
+        )
+        con.commit()
+    finally:
+        con.close()
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text(f"{mid}\n", encoding="utf-8")
+    return db, readpst, ids_file, tmp_path / "out" / "stage.db", pst
+
+
+def test_from_pst_pst_filter_excluding_a_missing_pst_keeps_not_in_pst(
+    tmp_path, stub_readpst
+):
+    db, readpst, ids_file, stage, pst = _two_pst_world(tmp_path, stub_readpst)
+
+    assert _run_from_pst(db, stage, readpst, ids_file, "--pst", str(pst)) == 0
+
+    report = _report(stage)
+    assert report["verdict"]["complete"] is True
+    assert report["counts"]["not_in_pst"] == 1
+    assert report["counts"]["extraction_incomplete"] == 0
+
+
+def test_from_pst_without_pst_filter_a_missing_pst_makes_not_found_incomplete(
+    tmp_path, stub_readpst
+):
+    db, readpst, ids_file, stage, _ = _two_pst_world(tmp_path, stub_readpst)
+
+    _run_from_pst(db, stage, readpst, ids_file)
+
+    report = _report(stage)
+    assert report["counts"]["extraction_incomplete"] == 1
+    assert report["counts"]["not_in_pst"] == 0
