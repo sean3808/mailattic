@@ -1,9 +1,9 @@
 """
 deploy-skill-to-ssot.py
 ========================
-Git post-commit / post-merge hook：main 上的 commit 落地後，把 repo
-dev-canonical skill 自動部署到 SSOT working tree（只 cp，不在 SSOT 跑任何
-git 指令）。
+由 `scripts/release.ps1` 在發行時呼叫（D-20261106-2；不再掛 git
+post-commit / post-merge hook）：把 repo dev-canonical skill 部署到 SSOT
+working tree（只 cp，不在 SSOT 跑任何 git 指令）。
 
 三道閘：
   1. main gate：當前分支是否為 main？（新流程語意：main = 已完成；
