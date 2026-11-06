@@ -62,6 +62,24 @@ uv run python scripts/body_rederive_apply.py --canonical mailattic.db --stage <�
 
 `bes show <db_id>` 看幾封含報價表格的信，欄位應以 `|` 分隔對齊。
 
+## IMAP 抓不到的信改從 PST 重做（#59）
+
+步驟 3 的 IMAP 暫存抓不到的信（伺服器已刪、資料夾不在、舊 mbsync 檔名）原本維持原樣；其中不少仍在 PST 裡。步驟 3 跑完時，暫存庫旁會多一份 `<暫存庫名>-unreachable-ids.txt`（每行一個正式庫 `messages.id`，只含這三類信；報告的 `unreachable_ids_count` 是封數）。新子命令 `imap-from-pst` 只處理這份清單上的信，依 Message-ID 到 PST 找內文；**伺服器還抓得到的信不在清單上，不會被 PST 版本覆蓋**。
+
+1. 步驟 3 照舊（會產生清單檔）。
+2. 把清單檔與 PST 副本、正式庫快照一併複製進 WSL 磁碟，在 WSL 跑（PST 的 `--pst-map` 與步驟 2 相同）：
+
+```bash
+uv run python scripts/body_rederive_stage.py imap-from-pst \
+  --database <WSL 上的正式庫快照> --stage <WSL>/stage-imap-pst.db \
+  --ids-file <WSL>/stage-imap-unreachable-ids.txt \
+  --pst-map '<pst_source 原路徑>=<WSL 上的 PST 副本>' ...（每個 PST 一個）\
+  --overwrite
+```
+
+3. **結束碼必須是 0**。2 = 某個 PST 解包不完整或沒有封數帳本：找不到的信會計為 `extraction_incomplete`（不是 `not_in_pst`），重跑同一行。清單裡不是 IMAP 來源的 id 計為 `not_imap_row`，同一 Message-ID 內文不一致計為 `message_id_ambiguous`，皆不寫入。
+4. 搬回 Windows 後照步驟 4 試算、寫入（套用工具認得這種暫存庫，並核對對應的正式庫列確實是 IMAP 來源）。
+
 ## 還原
 
 ```powershell
