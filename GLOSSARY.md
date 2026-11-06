@@ -144,6 +144,12 @@
 - **Avoid**: auto-abandon, 自動放棄, 自動結案（不分原因）, resolved by any route
 - **Why**: Contract #5 retries a failed UID until it is stored, but nothing closed the record afterwards, so every healed failure stayed open forever and `bes db doctor` could never reach zero. It is not abandonment: abandonment concedes the data is lost, self-healing proves it is present, so "the system never abandons on its own" still holds. Strict on purpose: the same message arriving through another route (matched by Message-ID) does not heal the record, because another route's copy cannot prove this source's copy lost nothing, and many failure records carry no Message-ID at all. Owner: Sean (settled in #31 grilling, 2026-10-30); source: #31.
 
+### Body re-derivation (內文重做)
+
+- **Definition**: Recomputing an already-stored message's body from its original message, taken again from the source it came from (the PST it was imported from, or the mail server), using today's conversion. Only the body and its search text change; the message's identity and every other field stay as they were. The source copy is first looked up at the message's original location; when that no longer holds it, by the same Message-ID, accepted only when every candidate's content agrees. A message whose re-derived body comes out worse than the stored one keeps its stored body.
+- **Avoid**: 回補 / backfill (that closes attachment failures), 重匯 / re-import (re-derivation never adds or removes messages), [[rebuild]] (the whole-store disaster-recovery path)
+- **Why**: The store keeps converted text, not the original message, so older bodies can only be improved by going back to the source; once the server has deleted a message and no PST holds it, its body stays as stored. Location-first, Message-ID fallback because PSTs keep changing after import as the mailbox is reorganised. Owner: Sean (#14 grilling, 2026-11-05; Message-ID fallback ratified 2026-11-06, [D-20261106-1](docs/decisions/D-20261106-1-body-rederive-falls-back-to-message-id-match.md)); source: [#14](https://github.com/sean3808/mailattic/issues/14).
+
 ### Table fidelity (表格保真)
 
 - **Definition**: The guarantee that a table in a stored message body is either rendered so every value stays in its own column position, or carries a [[table fidelity warning]]. A table that reads as normal text while its column correspondence is lost is the defect this guarantee rules out.
