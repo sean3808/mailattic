@@ -62,6 +62,26 @@ uv run python scripts/body_rederive_apply.py --canonical mailattic.db --stage <�
 
 `bes show <db_id>` 看幾封含報價表格的信，欄位應以 `|` 分隔對齊。
 
+## IMAP 抓不到的信改從 PST 重做（#59）
+
+步驟 3 的 IMAP 暫存抓不到的信（伺服器已刪、資料夾不在、舊 mbsync 檔名）原本維持原樣；其中不少仍在 PST 裡。步驟 3 的 IMAP 暫存庫會把這三類信的正式庫 `messages.id` 清單記在自己的報告裡（`unreachable`，封數是 `unreachable_ids_count`）。新子命令 `imap-from-pst` 以 `--imap-stage` 指定那個暫存庫，只處理清單上的信，依 Message-ID 到 PST 找內文。清單裡每封信除了 `id` 也記著它的 Message-ID，`imap-from-pst` 會核對正式庫同一 `id` 的 Message-ID 是否相符；不符（報告 `identity_mismatch` > 0，結束碼 2）代表這份 IMAP 暫存庫不是用目前這份正式庫快照建的，該信不寫，請用同一份快照重建 IMAP 暫存庫；**伺服器還抓得到的信不在清單上，不會被 PST 版本覆蓋**。
+
+1. 步驟 3 照舊（結束碼必須是 0；工具只接受「已證明完整」的 IMAP 暫存庫，否則拒絕）。
+2. 把 IMAP 暫存庫（`stage-imap.db`）與 PST 副本、正式庫快照一併複製進 WSL 磁碟，在 WSL 跑（PST 的 `--pst-map` 與步驟 2 相同）：
+
+```bash
+uv run python scripts/body_rederive_stage.py imap-from-pst \
+  --database <WSL 上的正式庫快照> --stage <WSL>/stage-imap-pst.db \
+  --imap-stage <WSL>/stage-imap.db \
+  --pst-map '<pst_source 原路徑>=<WSL 上的 PST 副本>' ...（每個 PST 一個）\
+  --overwrite
+```
+
+這個子命令沒有 `--pst`：正式庫記得的每個 PST 一律納入，原檔還在的全部解包、全部參與比對。原檔已不存在的 PST（例如 `archive.pst`）不會擋住結果，但會記名在判定的 `missing_sources`（摘要印 `missing source`），也不因它把找不到的信降成 `extraction_incomplete`。
+
+3. **結束碼必須是 0，而且 `extraction_incomplete` 必須是 0**。結束碼 2 = 某個 PST 解包不完整、沒有封數帳本，或有信在解包時單封失敗（報告 `extraction_failures` > 0，那封的 Message-ID 沒進比對，無法證明候選一致），重跑同一行。結束碼 0 但 `extraction_incomplete` 不是 0 時不要往下做，把報告貼回票上討論。清單裡的 id 在這份快照找不到、不是 IMAP 來源或 Message-ID 對不上，計為 `identity_mismatch`（結束碼 2，IMAP 暫存不是由這份快照產生的，從這份快照重做 IMAP 暫存）；同一 Message-ID 內文不一致計為 `message_id_ambiguous`，不寫入。
+4. 搬回 Windows 後照步驟 4 試算、寫入（套用工具認得這種暫存庫，並核對對應的正式庫列確實是 IMAP 來源）。
+
 ## 還原
 
 ```powershell
@@ -84,7 +104,7 @@ uv run python scripts/body_rederive_apply.py --canonical mailattic.db --restore 
 
 | 類別 | 封數 | 說明 |
 |---|---|---|
-| IMAP：伺服器已刪 | 1,301 | 其中 1,054 封仍在 Outlook 本機 PST（依 Message-ID 比對），**247 封伺服器已刪且不在任何 PST** |
+| IMAP：伺服器已刪 | 1,301 | 其中 1,070 封在 PST（依 Message-ID 比對），**231 封伺服器已刪且不在任何 PST**（2026-11-06，以當天 PST 重算） |
 | IMAP：舊 mbsync 檔名無法定位 | 107 | 其中 91 封不在 PST |
 | PST：無 Message-ID（不重做，Sean 拍板） | 7,790 | 含表格估計 2,221 封（2020–2023 封存檔 701 封可靠；其餘 PST 的位置有偏移，只是估計），另 1,745 封無法判斷 |
 | PST：重做後內文變差而保留（#57） | 304 | 亂碼或 base64，待 #57 修好後可再重做 |

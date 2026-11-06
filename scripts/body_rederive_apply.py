@@ -15,7 +15,8 @@ ingest indexes). ``message_fts`` is a plain FTS5 table keyed by
 
 Plan: every stage row with ``status='rewrite'`` whose canonical row exists,
 has a ``message_fts`` row at the same rowid, belongs to the ``source_input_mode``
-its ``source_kind`` implies (``pst`` -> ``file``, ``imap`` -> ``maildir``), and
+its ``source_kind`` implies (``pst`` -> ``file``, ``imap`` / ``imap_pst`` ->
+``maildir``), and
 whose current normalized ``message_id`` equals the stage's
 ``expected_message_id`` (the pairing the stage verified; a rebuilt canonical DB
 may have reassigned ids), and whose current ``sha256(body_text)`` equals the
@@ -110,7 +111,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
 from body_rederive_stage import _sha256_text as _stage_sha256_text  # noqa: E402
 
 # source_kind written by the stage builder -> messages.source_input_mode.
-_MODE_FOR_KIND = {"pst": "file", "imap": "maildir"}
+_MODE_FOR_KIND = {"pst": "file", "imap": "maildir", "imap_pst": "maildir"}
 
 _DRYRUN_REPORT = "{stem}-apply-report-dryrun.json"
 _CONFIRM_REPORT = "{stem}-apply-report-confirm.json"

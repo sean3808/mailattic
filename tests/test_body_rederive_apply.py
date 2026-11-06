@@ -873,3 +873,41 @@ def test_dry_run_prints_verdict_and_missing_sources(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "stage verdict: complete" in out
     assert "gone-archive.pst" in out
+
+
+# ---------------------------------------------------------------------------
+# imap_pst stage kind (#59)
+# ---------------------------------------------------------------------------
+def test_imap_pst_stage_row_applies_on_maildir_and_is_mode_mismatch_on_file(
+    tmp_path, capsys
+):
+    db = tmp_path / "canonical.db"
+    initialize_database(db)
+    con = connect_database(db)
+    try:
+        maildir_id = _add_message(con, "M", "maildir", "old mailword text")
+        file_id = _add_message(con, "P", "file", "old pstword text")
+        con.commit()
+    finally:
+        con.close()
+    rows = [
+        _stage_row(
+            maildir_id, "imap_pst", "old mailword text", "new mailbody", key="M"
+        ),
+        _stage_row(file_id, "imap_pst", "old pstword text", "new pstbody", key="P"),
+    ]
+    stage = _make_stage(tmp_path / "stage.db", rows)
+    args = ["--stage", str(stage), "--canonical", str(db)]
+
+    assert apply_module.main(args) == 0
+    capsys.readouterr()
+    report = json.loads(
+        (tmp_path / "stage-apply-report-dryrun.json").read_text(encoding="utf-8")
+    )
+    assert report["counts"]["planned"] == 1
+    assert report["counts"]["mode_mismatch"] == 1
+
+    assert apply_module.main([*args, "--confirm"]) == 0
+    capsys.readouterr()
+    assert _body(db, maildir_id) == "new mailbody"
+    assert _body(db, file_id) == "old pstword text"
