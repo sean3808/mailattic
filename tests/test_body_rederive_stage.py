@@ -2099,7 +2099,9 @@ def test_exit_code_comes_from_the_persisted_verdict(
 # ---------------------------------------------------------------------------
 # #59: IMAP rows the server no longer has -> unreachable ids list
 # ---------------------------------------------------------------------------
-def test_imap_stage_writes_unreachable_ids_file(tmp_path, fake_imap):
+def test_imap_stage_records_unreachable_ids_in_report_and_stage_meta(
+    tmp_path, fake_imap
+):
     env_file, install = fake_imap
     fake = FakeImapConnection(
         {
@@ -2125,13 +2127,12 @@ def test_imap_stage_writes_unreachable_ids_file(tmp_path, fake_imap):
 
     assert _run_imap(db, stage, env_file) == 0
 
-    ids_file = tmp_path / "stage-unreachable-ids.txt"
-    assert ids_file.read_text("utf-8") == "".join(
-        f"{i}\n" for i in sorted([ids[1], ids[2], ids[3]])
-    )
+    expected = sorted([ids[1], ids[2], ids[3]])
     report = _report(stage)
-    assert report["unreachable_ids_file"] == str(ids_file)
+    assert report["unreachable_ids"] == expected
     assert report["unreachable_ids_count"] == 3
+    assert json.loads(_stage_meta(stage)["report_json"])["unreachable_ids"] == expected
+    assert not list(tmp_path.glob("*unreachable-ids*"))
     counts = report["counts"]
     unreachable = (
         counts["not_on_server"]
@@ -2141,33 +2142,41 @@ def test_imap_stage_writes_unreachable_ids_file(tmp_path, fake_imap):
     assert unreachable == 3
 
 
-def test_imap_overwrite_replaces_a_stale_unreachable_ids_file(tmp_path, fake_imap):
-    env_file, install = fake_imap
-    install(
-        FakeImapConnection({"INBOX": {11: _eml(_plain_message("<i1@example.test>"))}})
-    )
-    db, _ = _imap_canonical(
-        tmp_path,
-        [_maildir_row("INBOX/new/uid-11.eml", "<i1@example.test>", "Hello there")],
-    )
-    stage = tmp_path / "stage.db"
-    ids_file = tmp_path / "stage-unreachable-ids.txt"
-    ids_file.write_text("999\n", encoding="utf-8")
-
-    assert _run_imap(db, stage, env_file, "--overwrite") == 0
-
-    assert ids_file.read_text("utf-8") == ""
-    assert _report(stage)["unreachable_ids_count"] == 0
-
-
 # ---------------------------------------------------------------------------
 # #59: imap-from-pst
 # ---------------------------------------------------------------------------
+def _imap_stage_db(
+    path: Path,
+    ids: list[int] | None,
+    *,
+    source_kind: str = "imap",
+    complete: bool = True,
+    canonical: str | None = "canonical.db",
+) -> Path:
+    """A minimal finished ``imap`` stage database carrying *ids* as its
+    ``unreachable_ids`` (None: a stage built before the list existed)."""
+    path.unlink(missing_ok=True)
+    report: dict = {"mode": "imap", "verdict": {"complete": complete, "reasons": []}}
+    if ids is not None:
+        report["unreachable_ids"] = ids
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(stage_module._STAGE_SCHEMA)
+        meta = [("source_kind", source_kind), ("report_json", json.dumps(report))]
+        if canonical is not None:
+            meta.append(("canonical", canonical))
+        con.executemany("INSERT INTO stage_meta VALUES (?, ?)", meta)
+        con.commit()
+    finally:
+        con.close()
+    return path
+
+
 def _from_pst_world(tmp_path: Path, stub_readpst, mailbox_messages, maildir_rows):
     """One PST (a.pst) holding *mailbox_messages*; canonical = one PST-mode row
     (so a.pst is a known pst_source) plus *maildir_rows* ((message_id, body) or
     (message_id, body, mode)). Returns (db, ids of the extra rows, readpst,
-    ids_file, stage)."""
+    imap_stage, stage)."""
     readpst, mboxes = stub_readpst
     pst = _make_pst(tmp_path, "a.pst")
     mboxes["a.pst"] = mailbox_messages
@@ -2191,10 +2200,10 @@ def _from_pst_world(tmp_path: Path, stub_readpst, mailbox_messages, maildir_rows
         con.commit()
     finally:
         con.close()
-    return db, ids, readpst, tmp_path / "ids.txt", tmp_path / "out" / "stage.db"
+    return db, ids, readpst, tmp_path / "stage-imap.db", tmp_path / "out" / "stage.db"
 
 
-def _run_from_pst(db, stage, readpst, ids_file, *extra) -> int:
+def _run_from_pst(db, stage, readpst, imap_stage, *extra) -> int:
     return stage_module.main(
         [
             "imap-from-pst",
@@ -2202,8 +2211,8 @@ def _run_from_pst(db, stage, readpst, ids_file, *extra) -> int:
             str(db),
             "--stage",
             str(stage),
-            "--ids-file",
-            str(ids_file),
+            "--imap-stage",
+            str(imap_stage),
             "--readpst-path",
             str(readpst),
             *extra,
@@ -2212,15 +2221,15 @@ def _run_from_pst(db, stage, readpst, ids_file, *extra) -> int:
 
 
 def test_from_pst_rewrite_is_staged_with_imap_pst_kind(tmp_path, stub_readpst):
-    db, (mid,), readpst, ids_file, stage = _from_pst_world(
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
         [_table_message("<g1@example.test>")],
         [("<g1@example.test>", PLAIN_FLAT)],
     )
-    ids_file.write_text(f"{mid}\n", encoding="utf-8")
+    _imap_stage_db(imap_stage, [mid])
 
-    assert _run_from_pst(db, stage, readpst, ids_file) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
 
     staged = _staged(stage)
     assert set(staged) == {mid}
@@ -2239,15 +2248,15 @@ def test_from_pst_rewrite_is_staged_with_imap_pst_kind(tmp_path, stub_readpst):
 
 
 def test_from_pst_equal_body_is_unchanged_and_not_staged(tmp_path, stub_readpst):
-    db, (mid,), readpst, ids_file, stage = _from_pst_world(
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
         [_plain_message("<g1@example.test>")],
         [("<g1@example.test>", "Hello there")],
     )
-    ids_file.write_text(f"{mid}\n", encoding="utf-8")
+    _imap_stage_db(imap_stage, [mid])
 
-    assert _run_from_pst(db, stage, readpst, ids_file) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
 
     assert _staged(stage) == {}
     assert _report(stage)["counts"]["unchanged"] == 1
@@ -2256,7 +2265,7 @@ def test_from_pst_equal_body_is_unchanged_and_not_staged(tmp_path, stub_readpst)
 def test_from_pst_candidates_that_disagree_are_ambiguous_and_not_staged(
     tmp_path, stub_readpst
 ):
-    db, (mid,), readpst, ids_file, stage = _from_pst_world(
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
         [
@@ -2265,24 +2274,24 @@ def test_from_pst_candidates_that_disagree_are_ambiguous_and_not_staged(
         ],
         [("<g1@example.test>", "old body")],
     )
-    ids_file.write_text(f"{mid}\n", encoding="utf-8")
+    _imap_stage_db(imap_stage, [mid])
 
-    assert _run_from_pst(db, stage, readpst, ids_file) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
 
     assert _staged(stage) == {}
     assert _report(stage)["counts"]["message_id_ambiguous"] == 1
 
 
 def test_from_pst_not_found_in_a_complete_pst_is_not_in_pst(tmp_path, stub_readpst):
-    db, (mid,), readpst, ids_file, stage = _from_pst_world(
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
         [_plain_message("<other@example.test>")],
         [("<g1@example.test>", "old body")],
     )
-    ids_file.write_text(f"{mid}\n", encoding="utf-8")
+    _imap_stage_db(imap_stage, [mid])
 
-    assert _run_from_pst(db, stage, readpst, ids_file) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
 
     counts = _report(stage)["counts"]
     assert counts["not_in_pst"] == 1
@@ -2293,16 +2302,16 @@ def test_from_pst_not_found_in_a_complete_pst_is_not_in_pst(tmp_path, stub_readp
 def test_from_pst_not_found_with_incomplete_extraction_exits_two(
     tmp_path, stub_readpst, lspst_overrides
 ):
-    db, (found, missing), readpst, ids_file, stage = _from_pst_world(
+    db, (found, missing), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
         [_table_message("<g1@example.test>")],
         [("<g1@example.test>", PLAIN_FLAT), ("<g2@example.test>", "old body")],
     )
-    ids_file.write_text(f"{found}\n{missing}\n", encoding="utf-8")
+    _imap_stage_db(imap_stage, [found, missing])
     lspst_overrides["a.pst"] = _emails(5)  # lspst lists 5, readpst yielded 1
 
-    assert _run_from_pst(db, stage, readpst, ids_file) == 2
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 2
 
     report = _report(stage)
     assert report["counts"]["extraction_incomplete"] == 1
@@ -2314,7 +2323,7 @@ def test_from_pst_not_found_with_incomplete_extraction_exits_two(
 def test_from_pst_counts_non_imap_and_unknown_ids_and_never_stages_them(
     tmp_path, stub_readpst
 ):
-    db, (file_row, no_mid), readpst, ids_file, stage = _from_pst_world(
+    db, (file_row, no_mid), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
         [_table_message("<g1@example.test>")],
@@ -2323,9 +2332,9 @@ def test_from_pst_counts_non_imap_and_unknown_ids_and_never_stages_them(
             (None, "old body"),
         ],
     )
-    ids_file.write_text(f"{file_row}\n{no_mid}\n987654\n", encoding="utf-8")
+    _imap_stage_db(imap_stage, [file_row, no_mid, 987654])
 
-    assert _run_from_pst(db, stage, readpst, ids_file) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
 
     counts = _report(stage)["counts"]
     assert counts["not_imap_row"] == 2  # the file-mode row and the unknown id
@@ -2334,15 +2343,15 @@ def test_from_pst_counts_non_imap_and_unknown_ids_and_never_stages_them(
 
 
 def test_from_pst_degraded_body_is_kept(tmp_path, stub_readpst):
-    db, (mid,), readpst, ids_file, stage = _from_pst_world(
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
         [_plain_message("<g1@example.test>", B64_LINES)],
         [("<g1@example.test>", OLD_TEXT)],
     )
-    ids_file.write_text(f"{mid}\n", encoding="utf-8")
+    _imap_stage_db(imap_stage, [mid])
 
-    assert _run_from_pst(db, stage, readpst, ids_file) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
 
     assert _staged(stage) == {}
     report = _report(stage)
@@ -2353,21 +2362,21 @@ def test_from_pst_degraded_body_is_kept(tmp_path, stub_readpst):
 def test_from_pst_bad_map_key_is_refused_before_the_old_stage_is_deleted(
     tmp_path, stub_readpst
 ):
-    db, (mid,), readpst, ids_file, stage = _from_pst_world(
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
         [_table_message("<g1@example.test>")],
         [("<g1@example.test>", PLAIN_FLAT)],
     )
-    ids_file.write_text(f"{mid}\n", encoding="utf-8")
-    assert _run_from_pst(db, stage, readpst, ids_file) == 0
+    _imap_stage_db(imap_stage, [mid])
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
     before = stage.read_bytes()
 
     code = _run_from_pst(
         db,
         stage,
         readpst,
-        ids_file,
+        imap_stage,
         "--overwrite",
         "--pst-map",
         f"{tmp_path / 'typo.pst'}={tmp_path / 'a.pst'}",
@@ -2377,38 +2386,159 @@ def test_from_pst_bad_map_key_is_refused_before_the_old_stage_is_deleted(
     assert stage.read_bytes() == before
 
 
-@pytest.mark.parametrize("content", [None, "12\nnot-a-number\n"])
-def test_from_pst_unreadable_or_malformed_ids_file_is_refused_before_deletion(
-    tmp_path, stub_readpst, content
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda p, mid: p.write_bytes(b"not sqlite"), id="not-a-db"),
+        pytest.param(lambda p, mid: p.unlink(), id="missing"),
+        pytest.param(
+            lambda p, mid: _imap_stage_db(p, [mid], source_kind="pst"), id="wrong-kind"
+        ),
+        pytest.param(
+            lambda p, mid: _imap_stage_db(p, [mid], complete=False),
+            id="incomplete-verdict",
+        ),
+        pytest.param(lambda p, mid: _imap_stage_db(p, None), id="no-list"),
+        pytest.param(
+            lambda p, mid: _imap_stage_db(p, [mid], canonical=None), id="no-canonical"
+        ),
+    ],
+)
+def test_from_pst_unusable_imap_stage_is_refused_before_deletion(
+    tmp_path, stub_readpst, build
 ):
-    db, (mid,), readpst, ids_file, stage = _from_pst_world(
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
         [_table_message("<g1@example.test>")],
         [("<g1@example.test>", PLAIN_FLAT)],
     )
-    ids_file.write_text(f"{mid}\n", encoding="utf-8")
-    assert _run_from_pst(db, stage, readpst, ids_file) == 0
+    _imap_stage_db(imap_stage, [mid])
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
     before = stage.read_bytes()
-    if content is None:
-        ids_file.unlink()
-    else:
-        ids_file.write_text(content, encoding="utf-8")
+    build(imap_stage, mid)
 
-    assert _run_from_pst(db, stage, readpst, ids_file, "--overwrite") == 1
+    assert _run_from_pst(db, stage, readpst, imap_stage, "--overwrite") == 1
     assert stage.read_bytes() == before
 
 
-def test_from_pst_existing_stage_is_refused_without_overwrite(tmp_path, stub_readpst):
-    db, (mid,), readpst, ids_file, stage = _from_pst_world(
+def test_from_pst_imap_stage_equal_to_stage_is_refused(tmp_path, stub_readpst):
+    db, (mid,), readpst, imap_stage, _ = _from_pst_world(
         tmp_path,
         stub_readpst,
         [_table_message("<g1@example.test>")],
         [("<g1@example.test>", PLAIN_FLAT)],
     )
-    ids_file.write_text(f"{mid}\n", encoding="utf-8")
-    assert _run_from_pst(db, stage, readpst, ids_file) == 0
-    assert _run_from_pst(db, stage, readpst, ids_file) == 1
+    _imap_stage_db(imap_stage, [mid])
+    before = imap_stage.read_bytes()
+
+    assert _run_from_pst(db, imap_stage, readpst, imap_stage, "--overwrite") == 1
+    assert imap_stage.read_bytes() == before
+
+
+def test_from_pst_unmatched_pst_filter_is_refused_before_deletion(
+    tmp_path, stub_readpst
+):
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
+        tmp_path,
+        stub_readpst,
+        [_table_message("<g1@example.test>")],
+        [("<g1@example.test>", PLAIN_FLAT)],
+    )
+    _imap_stage_db(imap_stage, [mid])
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
+    before = stage.read_bytes()
+
+    code = _run_from_pst(
+        db,
+        stage,
+        readpst,
+        imap_stage,
+        "--overwrite",
+        "--pst",
+        str(tmp_path / "a.pst"),
+        "--pst",
+        str(tmp_path / "typo.pst"),
+    )
+
+    assert code == 1
+    assert stage.read_bytes() == before
+
+
+def test_from_pst_empty_pst_selection_is_refused_before_deletion(
+    tmp_path, stub_readpst
+):
+    readpst, _ = stub_readpst
+    db = initialize_database(tmp_path / "canonical.db")  # no file-mode rows at all
+    con = connect_database(db)
+    try:
+        con.execute(
+            "INSERT INTO messages (subject, body_text, message_id, pst_source, "
+            "folder_path, logical_locator, source_input_mode, dedup_key) VALUES "
+            "('s', 'b', '<g1@example.test>', 'm', 'f', 'INBOX/new/uid-1.eml', "
+            "'maildir', 'k')"
+        )
+        mid = con.execute("SELECT id FROM messages").fetchone()[0]
+        con.commit()
+    finally:
+        con.close()
+    imap_stage = _imap_stage_db(tmp_path / "stage-imap.db", [mid])
+    stage = tmp_path / "stage.db"
+    stage.write_bytes(b"precious")
+
+    assert _run_from_pst(db, stage, readpst, imap_stage, "--overwrite") == 1
+    assert stage.read_bytes() == b"precious"
+
+
+def test_from_pst_per_message_extraction_failure_makes_the_verdict_not_complete(
+    tmp_path, stub_readpst, monkeypatch
+):
+    # The failed message may share the Message-ID: agreement is unproven.
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
+        tmp_path,
+        stub_readpst,
+        [_table_message("<g1@example.test>")],
+        [("<g1@example.test>", PLAIN_FLAT)],
+    )
+    _imap_stage_db(imap_stage, [mid])
+    original = ReadpstParser.iter_extraction_results
+
+    def with_failure(self, source):
+        yield from original(self, source)
+        yield ExtractionResult(
+            failure=IngestFailure.from_source(
+                source,
+                folder_path="Inbox",
+                logical_locator="Inbox/mbox#9",
+                error_stage="parse-pst",
+                error_type="ValueError",
+                error_message="synthetic",
+            )
+        )
+
+    monkeypatch.setattr(ReadpstParser, "iter_extraction_results", with_failure)
+
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 2
+
+    report = _report(stage)
+    assert report["per_pst"][0]["extraction_failures"] == 1
+    assert report["verdict"]["complete"] is False
+    assert any(
+        "a.pst" in reason and "failed" in reason
+        for reason in report["verdict"]["reasons"]
+    )
+
+
+def test_from_pst_existing_stage_is_refused_without_overwrite(tmp_path, stub_readpst):
+    db, (mid,), readpst, imap_stage, stage = _from_pst_world(
+        tmp_path,
+        stub_readpst,
+        [_table_message("<g1@example.test>")],
+        [("<g1@example.test>", PLAIN_FLAT)],
+    )
+    _imap_stage_db(imap_stage, [mid])
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 1
 
 
 def _two_pst_world(tmp_path: Path, stub_readpst):
@@ -2434,17 +2564,17 @@ def _two_pst_world(tmp_path: Path, stub_readpst):
         con.commit()
     finally:
         con.close()
-    ids_file = tmp_path / "ids.txt"
-    ids_file.write_text(f"{mid}\n", encoding="utf-8")
-    return db, readpst, ids_file, tmp_path / "out" / "stage.db", pst
+    imap_stage = tmp_path / "stage-imap.db"
+    _imap_stage_db(imap_stage, [mid])
+    return db, readpst, imap_stage, tmp_path / "out" / "stage.db", pst
 
 
 def test_from_pst_pst_filter_excluding_a_missing_pst_keeps_not_in_pst(
     tmp_path, stub_readpst
 ):
-    db, readpst, ids_file, stage, pst = _two_pst_world(tmp_path, stub_readpst)
+    db, readpst, imap_stage, stage, pst = _two_pst_world(tmp_path, stub_readpst)
 
-    assert _run_from_pst(db, stage, readpst, ids_file, "--pst", str(pst)) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage, "--pst", str(pst)) == 0
 
     report = _report(stage)
     assert report["verdict"]["complete"] is True
@@ -2455,9 +2585,9 @@ def test_from_pst_pst_filter_excluding_a_missing_pst_keeps_not_in_pst(
 def test_from_pst_without_pst_filter_a_missing_pst_makes_not_found_incomplete(
     tmp_path, stub_readpst
 ):
-    db, readpst, ids_file, stage, _ = _two_pst_world(tmp_path, stub_readpst)
+    db, readpst, imap_stage, stage, _ = _two_pst_world(tmp_path, stub_readpst)
 
-    _run_from_pst(db, stage, readpst, ids_file)
+    _run_from_pst(db, stage, readpst, imap_stage)
 
     report = _report(stage)
     assert report["counts"]["extraction_incomplete"] == 1

@@ -64,23 +64,23 @@ uv run python scripts/body_rederive_apply.py --canonical mailattic.db --stage <�
 
 ## IMAP 抓不到的信改從 PST 重做（#59）
 
-步驟 3 的 IMAP 暫存抓不到的信（伺服器已刪、資料夾不在、舊 mbsync 檔名）原本維持原樣；其中不少仍在 PST 裡。步驟 3 跑完時，暫存庫旁會多一份 `<暫存庫名>-unreachable-ids.txt`（每行一個正式庫 `messages.id`，只含這三類信；報告的 `unreachable_ids_count` 是封數）。新子命令 `imap-from-pst` 只處理這份清單上的信，依 Message-ID 到 PST 找內文；**伺服器還抓得到的信不在清單上，不會被 PST 版本覆蓋**。
+步驟 3 的 IMAP 暫存抓不到的信（伺服器已刪、資料夾不在、舊 mbsync 檔名）原本維持原樣；其中不少仍在 PST 裡。步驟 3 的 IMAP 暫存庫會把這三類信的正式庫 `messages.id` 清單記在自己的報告裡（`unreachable_ids`，封數是 `unreachable_ids_count`）。新子命令 `imap-from-pst` 以 `--imap-stage` 指定那個暫存庫，只處理清單上的信，依 Message-ID 到 PST 找內文；**伺服器還抓得到的信不在清單上，不會被 PST 版本覆蓋**。
 
-1. 步驟 3 照舊（會產生清單檔）。
-2. 把清單檔與 PST 副本、正式庫快照一併複製進 WSL 磁碟，在 WSL 跑（PST 的 `--pst-map` 與步驟 2 相同）：
+1. 步驟 3 照舊（結束碼必須是 0；工具只接受「已證明完整」的 IMAP 暫存庫，否則拒絕）。
+2. 把 IMAP 暫存庫（`stage-imap.db`）與 PST 副本、正式庫快照一併複製進 WSL 磁碟，在 WSL 跑（PST 的 `--pst-map` 與步驟 2 相同）：
 
 ```bash
 uv run python scripts/body_rederive_stage.py imap-from-pst \
   --database <WSL 上的正式庫快照> --stage <WSL>/stage-imap-pst.db \
-  --ids-file <WSL>/stage-imap-unreachable-ids.txt \
+  --imap-stage <WSL>/stage-imap.db \
   --pst-map '<pst_source 原路徑>=<WSL 上的 PST 副本>' ...（每個 PST 一個）\
   --pst '<pst_source 原路徑>' ...（只列原檔還在的 PST）\
   --overwrite
 ```
 
-`--pst` 要列出原檔還在的每個 PST（不列 `archive.pst`）。沒列 `--pst` 時正式庫記得的 PST 全部納入；原檔已不存在的那個無法證明完整，所有找不到的信就都會計為 `extraction_incomplete`，`not_in_pst` 會是 0。
+`--pst` 要列出原檔還在的每個 PST（列了正式庫沒有的 PST，或一個都沒選到，工具會拒絕）（不列 `archive.pst`）。沒列 `--pst` 時正式庫記得的 PST 全部納入；原檔已不存在的那個無法證明完整，所有找不到的信就都會計為 `extraction_incomplete`，`not_in_pst` 會是 0。
 
-3. **結束碼必須是 0，而且 `extraction_incomplete` 必須是 0**。結束碼 2 = 某個 PST 解包不完整或沒有封數帳本，重跑同一行。結束碼 0 但 `extraction_incomplete` 不是 0 = 有 PST 原檔不存在卻被納入（通常是忘了 `--pst`）：找不到的信沒被判成 `not_in_pst`，補上 `--pst` 重跑。清單裡不是 IMAP 來源的 id 計為 `not_imap_row`，同一 Message-ID 內文不一致計為 `message_id_ambiguous`，皆不寫入。
+3. **結束碼必須是 0，而且 `extraction_incomplete` 必須是 0**。結束碼 2 = 某個 PST 解包不完整、沒有封數帳本，或有信在解包時單封失敗（報告 `extraction_failures` > 0，那封的 Message-ID 沒進比對，無法證明候選一致），重跑同一行。結束碼 0 但 `extraction_incomplete` 不是 0 = 有 PST 原檔不存在卻被納入（通常是忘了 `--pst`）：找不到的信沒被判成 `not_in_pst`，補上 `--pst` 重跑。清單裡不是 IMAP 來源的 id 計為 `not_imap_row`，同一 Message-ID 內文不一致計為 `message_id_ambiguous`，皆不寫入。
 4. 搬回 Windows 後照步驟 4 試算、寫入（套用工具認得這種暫存庫，並核對對應的正式庫列確實是 IMAP 來源）。
 
 ## 還原

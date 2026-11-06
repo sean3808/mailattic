@@ -114,15 +114,18 @@ How IMAP rows are re-derived (``imap`` subcommand):
     remaining rows are counted as ``fetch_error`` and the exit code is 2.
 
 IMAP rows the server no longer holds (``imap-from-pst`` subcommand, #59):
-  * the ``imap`` stage also writes ``<stage stem>-unreachable-ids.txt`` next to
-    the stage: one canonical ``messages.id`` per line, sorted, for every row
-    counted ``not_on_server``, ``folder_missing`` or ``locator_unparsable``
-    (report: ``unreachable_ids_file`` / ``unreachable_ids_count``). A rerun with
-    ``--overwrite`` replaces it;
-  * ``imap-from-pst`` takes that list (``--ids-file``) and re-derives exactly
+  * the ``imap`` stage records the sorted canonical ``messages.id`` of every
+    row counted ``not_on_server``, ``folder_missing`` or ``locator_unparsable``
+    as ``unreachable_ids`` in its report (``stage_meta.report_json`` and the
+    JSON report; ``unreachable_ids_count`` is its length);
+  * ``imap-from-pst`` takes that stage (``--imap-stage``; refused unless it is
+    an ``imap`` stage with a complete verdict, a ``canonical`` and the list) and
+    re-derives exactly
     those rows from PST content found by Message-ID. It unpacks the canonical
     PSTs like ``pst`` mode (same ledgers, completeness verdict and
-    ``--pst-map`` / ``--pst`` options) and records every extracted Message-ID's
+    ``--pst-map`` / ``--pst`` options; a ``--pst`` that matches no canonical
+    PST, or an empty selection, is refused; a PST with per-message extraction
+    failures makes the verdict NOT complete) and records every extracted Message-ID's
     body; each listed id must be a ``source_input_mode='maildir'`` row
     (otherwise ``not_imap_row``) with a Message-ID (otherwise
     ``no_message_id``, never staged). Then, as in the pst fallback: found and
@@ -131,8 +134,8 @@ IMAP rows the server no longer holds (``imap-from-pst`` subcommand, #59):
     -> ``not_in_pst``, or ``extraction_incomplete`` when any PST of the run is
     not proven complete. The stage's ``source_kind`` is ``imap_pst``. Rows the
     server still serves are never listed, so they are never overwritten with a
-    PST-derived body. Refusals (bad ``--pst-map`` key, unreadable or malformed
-    ids file) happen before an old stage is cleared.
+    PST-derived body. Refusals (bad ``--pst-map`` key, bad ``--pst``, unusable
+    imap stage) happen before an old stage is cleared.
 
 Usage:
     uv run python scripts/body_rederive_stage.py pst --database <canonical.db> \\
@@ -143,7 +146,7 @@ Usage:
         [--limit N] [--overwrite]
     uv run python scripts/body_rederive_stage.py imap-from-pst \\
         --database <canonical.db> \\
-        --stage <stage.db> --ids-file <imap stage>-unreachable-ids.txt \\
+        --stage <stage.db> --imap-stage <stage-imap.db> \\
         [--pst-map CANONICAL=LOCAL ...] [--pst <path> ...] [--readpst-path P] \\
         [--lspst-path P] [--overwrite]
 
@@ -455,10 +458,6 @@ def _report_path(stage: Path) -> Path:
     return stage.parent / f"{stage.stem}-report.json"
 
 
-def _unreachable_ids_path(stage: Path) -> Path:
-    return stage.parent / f"{stage.stem}-unreachable-ids.txt"
-
-
 def _remove_stage_files(stage: Path) -> None:
     for suffix in ("", "-wal", "-shm", "-journal"):
         candidate = Path(str(stage) + suffix)
@@ -744,7 +743,7 @@ def _process_pst(
     samples: _DegradedSamples,
     ledger: dict | None = None,
     work_root: Path | None = None,
-) -> tuple[dict[str, int], int, bool | None, dict | None, float | None]:
+) -> tuple[dict[str, int], int, bool | None, dict | None, float | None, int]:
     """``pst_source`` keys the canonical rows; ``read_from`` is the file read.
 
     They differ when the PST moved since import (``--pst-map``). The locator
@@ -752,12 +751,13 @@ def _process_pst(
 
     Returns (counts, extracted, extraction_complete, the ledger actually used
     -- an ``unavailable`` lspst ledger is replaced by a ``recount`` one when
-    *work_root* is given and the recount ran -- and the recount seconds).
+    *work_root* is given and the recount ran --, the recount seconds, and the
+    number of messages readpst yielded as per-message failures).
     """
     counts = _empty_counts()
     if not read_from.exists():
         counts["pst_missing"] = sum(len(v) for v in rows.values())
-        return counts, 0, None, ledger, None
+        return counts, 0, None, ledger, None, 0
 
     source = PstSource(path=read_from, input_mode="file", requested_from=read_from)
     failed_locators: set[str] = set()
@@ -852,7 +852,14 @@ def _process_pst(
                     store.add_pool(pst_source, row, "locator_not_found")
                 else:
                     counts["locator_not_found"] += 1
-    return counts, extracted_count, extraction_complete, ledger, recount_seconds
+    return (
+        counts,
+        extracted_count,
+        extraction_complete,
+        ledger,
+        recount_seconds,
+        failure_count,
+    )
 
 
 def build_pst_stage(
@@ -924,7 +931,7 @@ def build_pst_stage(
                     ledger = _lspst_ledger(lspst, read_from)
                 else:
                     ledger = _ledger("unavailable", None, _LEDGER_NOTE_PST_MISSING)
-                counts, extracted_count, complete, ledger, recount_seconds = (
+                counts, extracted_count, complete, ledger, recount_seconds, _ = (
                     _process_pst(
                         pst_source,
                         rows,
@@ -1010,44 +1017,67 @@ def build_pst_stage(
     return report
 
 
-def _read_ids_file(path: Path) -> list[int]:
-    """Canonical ids, one per line (blank lines ignored), de-duplicated and
-    sorted. Refuses an unreadable file or a line that is not an integer."""
+def _read_imap_stage_ids(imap_stage: Path) -> list[int]:
+    """The unreachable canonical ids recorded by a finished, complete ``imap``
+    stage (its ``stage_meta.report_json``). Refuses anything else: a missing or
+    non-SQLite file, another source kind, a verdict that is not complete, no
+    ``canonical``, or no ``unreachable_ids`` list."""
+    if not imap_stage.is_file():
+        raise StageRefused(f"--imap-stage not found: {imap_stage}")
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise StageRefused(f"--ids-file cannot be read: {path} ({exc})") from exc
-    ids: set[int] = set()
-    for number, line in enumerate(text.splitlines(), start=1):
-        stripped = line.strip()
-        if not stripped:
-            continue
+        con = sqlite3.connect(imap_stage.resolve().as_uri() + "?mode=ro", uri=True)
         try:
-            ids.add(int(stripped))
-        except ValueError:
-            raise StageRefused(
-                f"--ids-file line {number} is not an integer: {stripped!r}"
-            ) from None
-    return sorted(ids)
+            meta = dict(con.execute("SELECT key, value FROM stage_meta"))
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise StageRefused(f"--imap-stage is not a stage database: {exc}") from exc
+    if meta.get("source_kind") != SOURCE_KIND_IMAP:
+        raise StageRefused(
+            f"--imap-stage source_kind is {meta.get('source_kind')!r}, "
+            f"expected {SOURCE_KIND_IMAP!r}"
+        )
+    if not meta.get("canonical"):
+        raise StageRefused("--imap-stage records no canonical database")
+    try:
+        report = json.loads(meta.get("report_json", ""))
+    except ValueError:
+        raise StageRefused("--imap-stage has no readable report_json") from None
+    verdict = report.get("verdict") if isinstance(report, dict) else None
+    if not isinstance(verdict, dict) or verdict.get("complete") is not True:
+        raise StageRefused(
+            "--imap-stage verdict is not complete; rerun the imap stage first"
+        )
+    ids = report.get("unreachable_ids")
+    if not isinstance(ids, list) or not all(
+        isinstance(i, int) and not isinstance(i, bool) for i in ids
+    ):
+        raise StageRefused(
+            "--imap-stage has no unreachable_ids list (built before #59?); "
+            "rerun the imap stage"
+        )
+    return sorted(set(ids))
 
 
 def build_imap_from_pst_stage(
     *,
     database: Path,
     stage: Path,
-    ids_file: Path,
+    imap_stage: Path,
     readpst_path: Path | None,
     lspst_path: Path | None = None,
     pst_filter: list[Path],
     overwrite: bool,
     pst_map: dict[str, Path] | None = None,
 ) -> dict:
-    """Re-derive the IMAP (maildir) rows listed in *ids_file* from PST content
-    found by Message-ID (#59). Same unpack / ledger / fallback machinery as
+    """Re-derive the IMAP (maildir) rows the *imap_stage* could not reach, from
+    PST content found by Message-ID (#59). Same unpack / ledger / fallback machinery as
     ``build_pst_stage``; only the listed rows are examined."""
     pst_map = pst_map or {}
     _check_stage_target(database, stage, overwrite)
-    wanted_ids = _read_ids_file(ids_file)
+    if imap_stage.resolve() == stage.resolve():
+        raise StageRefused("--imap-stage and --stage are the same file")
+    wanted_ids = _read_imap_stage_ids(imap_stage)
     lspst = _resolve_lspst(lspst_path, readpst_path)
     work_root = stage.parent / f"{stage.stem}-work"
     started = datetime.now(UTC)
@@ -1060,8 +1090,6 @@ def build_imap_from_pst_stage(
             raise StageRefused(
                 f"--pst-map names a pst_source not in the canonical DB: {unknown_keys}"
             )
-        # Every refusal is decided; only now may a previous stage be removed.
-        _clear_stage_target(stage)
         not_in_canonical: list[str] = []
         if pst_filter:
             wanted = [str(p) for p in pst_filter]
@@ -1074,6 +1102,16 @@ def build_imap_from_pst_stage(
                 if not any(_same_path(s, Path(w)) for s in pst_sources)
             ]
             pst_sources = selected
+        # A mistyped --pst, or no PST left, would let "not found" read as
+        # "not in PST" over an empty / short selection.
+        if not_in_canonical:
+            raise StageRefused(
+                f"--pst names no canonical pst_source: {not_in_canonical}"
+            )
+        if not pst_sources:
+            raise StageRefused("no PST selected: the canonical DB has none")
+        # Every refusal is decided; only now may a previous stage be removed.
+        _clear_stage_target(stage)
 
         parser_cache: list[ReadpstParser] = []
 
@@ -1106,7 +1144,14 @@ def build_imap_from_pst_stage(
                     ledger = _ledger("unavailable", None, _LEDGER_NOTE_PST_MISSING)
                 # No canonical PST rows are paired here: the unpack only
                 # feeds the Message-ID store (and settles the ledger).
-                _, extracted_count, complete, ledger, recount_seconds = _process_pst(
+                (
+                    _,
+                    extracted_count,
+                    complete,
+                    ledger,
+                    recount_seconds,
+                    failures,
+                ) = _process_pst(
                     pst_source,
                     {},
                     parser_factory,
@@ -1127,6 +1172,7 @@ def build_imap_from_pst_stage(
                         "read_from": str(read_from),
                         "rows": 0,
                         "extracted_messages": extracted_count,
+                        "extraction_failures": failures,
                         "ledger": ledger["state"],
                         "ledger_emails": ledger["emails"],
                         "ledger_note": ledger["note"],
@@ -1170,7 +1216,7 @@ def build_imap_from_pst_stage(
                 "mode": "imap-from-pst",
                 "canonical": str(database),
                 "stage": str(stage),
-                "ids_file": str(ids_file),
+                "imap_stage": str(imap_stage),
                 "started_at": started.isoformat(),
                 "elapsed_seconds": round(
                     (datetime.now(UTC) - started).total_seconds(), 3
@@ -1393,9 +1439,6 @@ def _build_imap_stage(
 
         # Connection and LIST succeeded: only now may a previous stage go.
         _clear_stage_target(stage)
-        ids_path = _unreachable_ids_path(stage)
-        with suppress(FileNotFoundError):
-            ids_path.unlink()
         stage_con = sqlite3.connect(stage)
         try:
             stage_con.executescript(_STAGE_SCHEMA)
@@ -1433,9 +1476,6 @@ def _build_imap_stage(
                     }
                 )
             unreachable_ids = sorted(set(unreachable))
-            ids_path.write_text(
-                "".join(f"{i}\n" for i in unreachable_ids), encoding="utf-8"
-            )
             report = {
                 "mode": "imap",
                 "canonical": str(database),
@@ -1447,7 +1487,7 @@ def _build_imap_stage(
                 "rows_in_scope": len(rows),
                 "aborted": aborted,
                 "gone_from_server": totals["not_on_server"] + totals["folder_missing"],
-                "unreachable_ids_file": str(ids_path),
+                "unreachable_ids": unreachable_ids,
                 "unreachable_ids_count": len(unreachable_ids),
                 "counts": totals,
                 "degraded_sample_ids": samples.items,
@@ -1504,6 +1544,16 @@ def _verdict(report: dict) -> dict:
             entries = []
         for entry in entries:
             name = entry.get("pst_source") if isinstance(entry, dict) else None
+            if (
+                mode == "imap-from-pst"
+                and isinstance(entry, dict)
+                and entry.get("extraction_failures") != 0
+            ):
+                reasons.append(
+                    f"{name}: {entry.get('extraction_failures')!r} message(s) "
+                    "failed extraction; their Message-IDs never reached the "
+                    "lookup, so candidate agreement cannot be proven"
+                )
             if not isinstance(entry, dict):
                 reasons.append(f"malformed per_pst entry: {entry!r}")
             elif entry.get("ledger_note") == _LEDGER_NOTE_PST_MISSING:
@@ -1539,7 +1589,8 @@ def _print_summary(report: dict, report_path: Path) -> None:
     counts = report["counts"]
     if report["mode"] == "imap-from-pst":
         print(
-            f"[stage] {report['rows_in_scope']} unreachable IMAP id(s) listed, "
+            f"[stage] {report['rows_in_scope']} unreachable IMAP id(s) "
+            "from the imap stage, "
             f"{len(report['per_pst'])} PST(s) unpacked, {report['elapsed_seconds']}s"
         )
         outcomes = _IMAP_PST_OUTCOMES
@@ -1561,8 +1612,8 @@ def _print_summary(report: dict, report_path: Path) -> None:
         print(f"  {key}: {counts[key]}")
     if report["mode"] == "imap":
         print(
-            f"  unreachable ids ({report['unreachable_ids_count']}): "
-            f"{report['unreachable_ids_file']}"
+            f"  unreachable ids (input of imap-from-pst): "
+            f"{report['unreachable_ids_count']}"
         )
         print(
             f"  gone_from_server (not_on_server + folder_missing): "
@@ -1642,11 +1693,11 @@ def _build_parser() -> argparse.ArgumentParser:
     from_pst.add_argument("--database", type=Path, default=None)
     from_pst.add_argument("--stage", type=Path, required=True)
     from_pst.add_argument(
-        "--ids-file",
+        "--imap-stage",
         type=Path,
         required=True,
-        help="Unreachable ids list written by the imap stage "
-        "(<stage stem>-unreachable-ids.txt).",
+        help="A finished, complete `imap` stage database; its unreachable_ids "
+        "are the rows to re-derive.",
     )
     from_pst.add_argument("--readpst-path", type=Path, default=None)
     from_pst.add_argument("--lspst-path", type=Path, default=None)
@@ -1694,7 +1745,7 @@ def main(argv: list[str] | None = None) -> int:
             report = build_imap_from_pst_stage(
                 database=database,
                 stage=stage,
-                ids_file=Path(args.ids_file).expanduser().resolve(),
+                imap_stage=Path(args.imap_stage).expanduser().resolve(),
                 readpst_path=args.readpst_path,
                 lspst_path=args.lspst_path,
                 pst_filter=list(args.pst),
