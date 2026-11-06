@@ -66,7 +66,7 @@ guard（`scripts/guard-release-tag.py`，掛 pre-push）是**唯讀 fail-closed 
 - **「乾淨」包含未追蹤檔**（`git status --porcelain --untracked-files=all` 必須為空；被 git 忽略的檔不算）。開發目錄有別的 session 留下的改動時，可改從日常 checkout（同一個 `origin`、已 `git pull --ff-only` 到同一個 main）發行。發行最後一步是 `git push --atomic <remote> main <tag>`：跑的期間不要從別處推 main，否則 atomic push 被拒，要照錯誤訊息的指令重推。
 - **本機測試數可能比乾淨 checkout 多**：開發目錄有被 git 忽略的 `tests/test_recipient_rebuild_*.py`（本機用、不進版控），launcher 一樣會收進去。比對兩邊的 passed 數字前先扣掉這幾支。
 - pre-commit framework 會接管 `.git/hooks/pre-push`，guard 以 `pre-push.legacy` 形式被串接執行。
-- **main commit hook 是即時同步，不能取代 release 核對**：Spectra `archive` 觸發已退役，現行 hook 在 main commit 後同步 skill（[D-20260820-4](decisions/D-20260820-4-skill-ssot-deploy-trigger-main-commit.md)），但不發布全域 CLI。正式 release 自己確認 SSOT 一致；不走 GitHub Actions / self-hosted runner，也不依 tag 修改 `pyproject.toml` package version。
+- **skill 只隨 release 部署**：main commit 不再觸發 skill 同步（[D-20261106-2](decisions/D-20261106-2-skill-ssot-deploy-only-on-release.md) 取代 D-20260820-4），SSOT 上的 skill 因此一定跟同一次發行的 `bes` 配對。正式 release 自己確認 SSOT 一致；不走 GitHub Actions / self-hosted runner，也不依 tag 修改 `pyproject.toml` package version。
 
 ## 暫存 maildir 與憑證檔
 

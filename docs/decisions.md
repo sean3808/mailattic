@@ -31,7 +31,7 @@
 | [D-20260820-1](decisions/D-20260820-1-review-trigger-is-change-size-not-pr.md) | 2026-08-20 | 語意 review 的觸發條件是變更 size，不是走不走 PR | accepted |
 | [D-20260820-2](decisions/D-20260820-2-excluded-ci-infrastructure-options.md) | 2026-08-20 | 三個 CI 基礎設施選項明文排除，「Free 方案」是所有 CI 決策的固定前提 | accepted |
 | [D-20260820-3](decisions/D-20260820-3-migrate-to-contract-anchored-flowback.md) | 2026-08-20 | 退出 Spectra 鏈，遷移 Contract-Anchored Flow-Back | accepted |
-| [D-20260820-4](decisions/D-20260820-4-skill-ssot-deploy-trigger-main-commit.md) | 2026-08-20 | skill→SSOT 自動部署的觸發改為「main commit + 內容不一致」 | accepted |
+| [D-20260820-4](decisions/D-20260820-4-skill-ssot-deploy-trigger-main-commit.md) | 2026-08-20 | ~~skill→SSOT 自動部署的觸發改為「main commit + 內容不一致」~~ | ~~superseded~~ |
 | [D-20260821-1](decisions/D-20260821-1-retire-system-drive-hardware-guard.md) | 2026-08-21 | 退役 runtime-root 守門的系統碟（硬體動機）拒絕與其豁免機制 | accepted |
 | [D-20260821-2](decisions/D-20260821-2-runtime-root-override-does-not-move-pytest-cache.md) | 2026-08-21 | -RuntimeRoot 覆寫不搬 pytest cache —— 記為已知邊界而非修復 | accepted |
 | [D-20260826-1](decisions/D-20260826-1-keyword-search-orders-by-relevance.md) | 2026-08-26 | 帶 keyword 的搜尋改用相關性排序，不再一律時間新到舊 | accepted |
@@ -49,4 +49,5 @@
 | [D-20261018-2](decisions/D-20261018-2-public-tree-scrub-criteria-and-accepted-residuals.md) | 2026-10-18 | 公開樹的去識別判準：先問誰會驗這個值，量級與作息資訊列為已接受殘留 | accepted |
 | [D-20261105-1](decisions/D-20261105-1-table-fidelity-without-storing-html.md) | 2026-11-05 | 表格保真不靠存 HTML：轉換器轉對、轉不對就標提示、需要時匯出原信 | accepted |
 | [D-20261106-1](decisions/D-20261106-1-body-rederive-falls-back-to-message-id-match.md) | 2026-11-06 | 內文重做在原位置對不上時，改以 Message-ID 在所有 PST 找原信 | accepted |
+| [D-20261106-2](decisions/D-20261106-2-skill-ssot-deploy-only-on-release.md) | 2026-11-06 | skill→SSOT 部署只在發行時跑，拿掉 main commit 的 git hook | accepted |
 <!-- END GENERATED ADR-INDEX -->

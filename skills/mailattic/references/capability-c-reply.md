@@ -94,10 +94,12 @@ bes behaviour (none of it needs caller intervention):
 - Sending account (`From:` in Step 2's stdout)
 - Subject
 - Full `To` / `Cc` / `Bcc` (as in Step 2's stdout; do not summarise as "the customer and 3 others")
-- The body you wrote (the Step 1 file content)
+- The body as read back from the actual draft, including any auto-appended quote (see the final-EML rule below), not just the Step 1 file content
 - Attachment names and sizes (as in Step 2's stdout; say none if there are none)
 - Fingerprint (`fingerprint:` in Step 2's stdout)
 - **Agent Duty**: explicitly name every recipient marked `never seen` or `never seen (domain seen)` in the recipient check, so that typos or unvetted addresses stand out immediately
+
+**The review must come from the final EML, not from the body file you wrote.** `draft-reply` automatically appends the original mail's quoted text, so the `--body-from` file is not the final MIME body. Before presenting, read the complete plain / html parts, all To/Cc/Bcc and the attachments back from the actual draft, and present them together with the fingerprint. When the auto-appended quote contains business data (prices, quantities, other parties' details), list it explicitly. A matching fingerprint does not mean the user has seen everything - never claim the user saw the full content just because the fingerprint matches. Negative signal: your preview never mentioned the quote, yet the actual EML carries the original mail.
 
 Go to Step 4 only when the user clearly says send ("寄", "送出", "幫我寄"). If the user wants changes: delete the old `.eml`, edit the body file, rerun Step 2, and **present the new draft id and fingerprint for review again**.
 

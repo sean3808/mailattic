@@ -1,8 +1,9 @@
 ---
 id: D-20260820-4
 date: 2026-08-20
-status: accepted
+status: superseded
 title: skill→SSOT 自動部署的觸發改為「main commit + 內容不一致」
+superseded_by: D-20261106-2
 ---
 
 ## Context
