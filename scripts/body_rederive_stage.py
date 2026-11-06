@@ -129,11 +129,10 @@ IMAP rows the server no longer holds (``imap-from-pst`` subcommand, #59):
     covers all of them. A PST whose file is gone is named in the verdict's
     ``missing_sources`` and does not block (the #14 ``pst_missing`` rule); a PST
     with per-message extraction failures makes the verdict NOT complete. Every
-    extracted Message-ID's body is recorded; each listed id must be a
-    ``source_input_mode='maildir'`` row
-    (otherwise ``not_imap_row``) whose normalized Message-ID equals the one the
-    imap stage recorded (otherwise ``identity_mismatch``: another snapshot,
-    never staged, verdict NOT complete) with a Message-ID (otherwise
+    extracted Message-ID's body is recorded; each listed id must be an existing
+    ``source_input_mode='maildir'`` row whose normalized Message-ID equals the
+    one the imap stage recorded (otherwise ``identity_mismatch``: another
+    snapshot, never staged, verdict NOT complete) with a Message-ID (otherwise
     ``no_message_id``, never staged). Then, as in the pst fallback: found and
     all candidates agree -> ``unchanged`` or a staged ``rewrite`` (or
     ``degraded_kept``); candidates differ -> ``message_id_ambiguous``; not found
@@ -312,10 +311,9 @@ _IMAP_PST_OUTCOMES = (
     # extraction_incomplete: not found, but some PST of the run is not proven
     # complete, so "not in PST" would be a claim the evidence cannot back.
     "extraction_incomplete",
-    # not_imap_row: the id is not a canonical source_input_mode='maildir' row.
-    "not_imap_row",
-    # identity_mismatch: the row's Message-ID differs from the one the imap
-    # stage recorded for that id (the stage belongs to another snapshot).
+    # identity_mismatch: the listed id is missing, not a maildir row, or its
+    # Message-ID differs from the one the imap stage recorded (the stage
+    # belongs to another snapshot).
     "identity_mismatch",
     "paired_by_message_id",
 )
@@ -1210,15 +1208,17 @@ def build_imap_from_pst_stage(
                     "FROM messages WHERE id = ?",
                     (entry["id"],),
                 ).fetchone()
-                if found is None or found["source_input_mode"] != "maildir":
-                    counts["not_imap_row"] += 1
-                    continue
-                canonical_mid = normalize_message_id(found["message_id"])
-                if canonical_mid != entry["message_id"]:
-                    # Same id, different message: not the snapshot the imap
-                    # stage was built from. Never staged.
+                # The imap stage lists only maildir rows of its own snapshot, so
+                # a missing row, a non-maildir row or a different Message-ID all
+                # mean this canonical DB is not that snapshot. Never staged.
+                if (
+                    found is None
+                    or found["source_input_mode"] != "maildir"
+                    or normalize_message_id(found["message_id"]) != entry["message_id"]
+                ):
                     counts["identity_mismatch"] += 1
                     continue
+                canonical_mid = normalize_message_id(found["message_id"])
                 row = {
                     "id": found["id"],
                     "message_id": canonical_mid,

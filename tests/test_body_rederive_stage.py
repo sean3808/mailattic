@@ -2352,9 +2352,11 @@ def test_from_pst_not_found_with_incomplete_extraction_exits_two(
     assert set(_staged(stage)) == {found}  # the Message-ID-verified row stays
 
 
-def test_from_pst_counts_non_imap_and_unknown_ids_and_never_stages_them(
+def test_from_pst_non_imap_and_unknown_ids_are_identity_mismatch(
     tmp_path, stub_readpst
 ):
+    # The imap stage lists only maildir rows of its own snapshot: a listed id
+    # that is missing or not a maildir row means another snapshot.
     db, (file_row, no_mid), readpst, imap_stage, stage = _from_pst_world(
         tmp_path,
         stub_readpst,
@@ -2366,11 +2368,14 @@ def test_from_pst_counts_non_imap_and_unknown_ids_and_never_stages_them(
     )
     _imap_stage_db(imap_stage, [file_row, no_mid, 987654])
 
-    assert _run_from_pst(db, stage, readpst, imap_stage) == 0
+    assert _run_from_pst(db, stage, readpst, imap_stage) == 2
 
-    counts = _report(stage)["counts"]
-    assert counts["not_imap_row"] == 2  # the file-mode row and the unknown id
+    report = _report(stage)
+    counts = report["counts"]
+    assert counts["identity_mismatch"] == 2  # the file-mode row and the unknown id
+    assert "not_imap_row" not in counts
     assert counts["no_message_id"] == 1
+    assert report["verdict"]["complete"] is False
     assert _staged(stage) == {}
 
 
