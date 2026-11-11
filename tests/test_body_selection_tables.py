@@ -13,7 +13,6 @@ code before this change; every other test encodes new behaviour (red first).
 
 from __future__ import annotations
 
-import time
 from email import message_from_bytes, policy
 from email.message import EmailMessage
 
@@ -146,15 +145,31 @@ def test_plain_only_message_is_unchanged() -> None:
 
 def test_oversize_table_renders_plain_with_warning_and_is_fast() -> None:
     html = _big_table(1001, 101)  # 101,101 slots > 100,000
-    start = time.perf_counter()
     text = parser._html_to_text(html)
-    elapsed = time.perf_counter() - start
     lines = text.splitlines()
-    assert elapsed < 1.0
     assert lines[0] == parser.TABLE_FIDELITY_WARNING
     assert " | " not in text
     assert "r0c0 r0c1" in lines[1]
     assert "r1000c100" in text
+
+
+def test_oversize_table_layout_work_stays_within_the_cap(monkeypatch) -> None:
+    # The cap bounds layout work, so measure work, not wall-clock time: a
+    # host under load made a 1-second threshold flaky (#61). The input has
+    # about twice the cap in cells; laying out every cell before rejecting
+    # the table (the slow path the cap exists to prevent) visits them all.
+    visited = 0
+    real_cell_text = parser._cell_text
+
+    def counting_cell_text(*args, **kwargs):
+        nonlocal visited
+        visited += 1
+        return real_cell_text(*args, **kwargs)
+
+    monkeypatch.setattr(parser, "_cell_text", counting_cell_text)
+    text = parser._html_to_text(_big_table(1001, 200))  # 200,200 cells
+    assert text.splitlines()[0] == parser.TABLE_FIDELITY_WARNING
+    assert visited <= parser._HTML_GRID_SLOT_LIMIT + 1
 
 
 def test_table_at_the_cap_is_still_a_grid() -> None:
