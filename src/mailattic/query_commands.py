@@ -317,7 +317,6 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
 
     export_parser = subparsers.add_parser(
         "export-original",
-        aliases=["original-export"],
         help=(
             "Export one stored message's original from source "
             "(.msg for PST, .eml for IMAP)."
@@ -332,7 +331,7 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
         "--copy-to",
         type=Path,
         dest="copy_to",
-        default=Path("."),
+        default=None,
         metavar="DIR",
         help="Directory to export the original file into. Default: current directory.",
     )
@@ -351,13 +350,6 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
         "--json",
         action="store_true",
         help="Emit outcome as JSON.",
-    )
-    export_parser.add_argument(
-        "--env-file",
-        type=Path,
-        default=None,
-        dest="env_file",
-        help="Path to IMAP settings file (optional override).",
     )
     export_parser.set_defaults(handler=_handle_export_original)
 
@@ -781,14 +773,15 @@ def _handle_export_original(args: argparse.Namespace) -> int:
         )
         return 2
 
+    dest_dir = (args.copy_to or Path.cwd()).resolve()
+
     try:
         result = export_original_message(
             database_path=args.database,
             identifier=args.identifier,
-            destination_dir=args.copy_to,
+            destination_dir=dest_dir,
             overwrite=args.overwrite,
             skip_existing=args.skip_existing,
-            env_file=args.env_file,
         )
     except KeyError as exc:
         print(_format_exception_message(exc), file=sys.stderr)

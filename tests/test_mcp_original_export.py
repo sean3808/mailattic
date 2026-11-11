@@ -252,3 +252,18 @@ def test_mcp_original_export_unknown_message_id_raises_error(tmp_path: Path) -> 
             )
         )
     assert "not found" in str(exc_info.value).lower()
+
+
+def test_mcp_original_export_refuses_rfc_message_id(tmp_path: Path) -> None:
+    db_path, _, _ = _seed_db(tmp_path)
+    server = create_server(database_path=db_path)
+    dest_dir = tmp_path / "host_exports"
+
+    with pytest.raises(ToolError) as exc_info:
+        asyncio.run(
+            server.call_tool(
+                "mail_original_export",
+                {"message_id": "<pst101@example.com>", "dest_dir": str(dest_dir)},
+            )
+        )
+    assert "not a valid stored id" in str(exc_info.value)

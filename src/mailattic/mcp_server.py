@@ -2453,12 +2453,6 @@ def create_server(
         elif isinstance(message_id, str):
             if _is_canonical_stored_id_string(message_id):
                 resolved_id = int(message_id)
-            elif "@" in message_id or "<" in message_id:
-                try:
-                    thread_ids = reader.resolve_thread_message_ids(message_id)
-                    resolved_id = thread_ids[0] if thread_ids else None
-                except Exception:
-                    resolved_id = None
             else:
                 raise build_tool_error(
                     ValueError,

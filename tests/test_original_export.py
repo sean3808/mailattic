@@ -689,3 +689,138 @@ def test_cli_export_original_json_output(
     assert data["format"] == "eml"
     assert data["source_type"] == "imap"
     assert Path(data["dest_path"]).exists()
+
+
+def test_outlook_unavailable_returns_failed_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        subject="Unavailable Outlook",
+    )
+    from mailattic import original_export
+
+    monkeypatch.setattr(original_export, "_load_default_outlook_reader", lambda: None)
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        outlook_reader=None,
+    )
+    assert result.status == "failed"
+    assert result.detail is not None
+    assert "Outlook is not running or unavailable" in result.detail
+
+
+def test_imap_unavailable_returns_failed_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        uid=99,
+        message_id="<unavail@example.com>",
+        subject="Unavailable IMAP",
+    )
+    from mailattic import original_export
+
+    monkeypatch.setattr(
+        original_export,
+        "_load_default_imap_client",
+        lambda *args, **kwargs: None,
+    )
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        imap_client=None,
+    )
+    assert result.status == "failed"
+    assert result.detail is not None
+    assert "IMAP server connection could not be established" in result.detail
+
+
+def test_pst_location_prioritizes_folder_path(tmp_path: Path) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        folder_path="Reports/Monthly",
+        message_id="<multi@example.com>",
+        subject="Monthly Report",
+    )
+
+    item_inbox = FakeOutlookItem(
+        entry_id="inbox-item",
+        subject="Monthly Report",
+        message_id="<multi@example.com>",
+    )
+    item_reports = FakeOutlookItem(
+        entry_id="reports-item",
+        subject="Monthly Report",
+        message_id="<multi@example.com>",
+    )
+
+    inbox = FakeOutlookFolder("Inbox", [item_inbox])
+    monthly = FakeOutlookFolder("Monthly", [item_reports])
+    reports = FakeOutlookFolder("Reports", [])
+    reports.Folders = FakeCollection(monthly)
+
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = FakeCollection(inbox, reports)
+    store = FakeOutlookStore(pst_file, root)
+    namespace = FakeOutlookNamespace([store], items_by_id={})
+    reader = FakeOutlookReader(namespace)
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        outlook_reader=reader,
+    )
+
+    assert result.status == "exported"
+    assert result.dest_path is not None
+    assert result.dest_path.read_bytes().startswith(
+        b"MSG-BYTES:Monthly Report:reports-item"
+    )
+
+
+def test_unsupported_outbound_source_returns_not_found(tmp_path: Path) -> None:
+    db_path = initialize_database(tmp_path / "test.db")
+    conn = connect_database(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO messages (
+            message_id, subject, sender_name, sender_email, sent_at,
+            pst_source, folder_path, logical_locator, dedup_key, source_input_mode
+        ) VALUES (
+            '<outbound1@example.com>', 'Outbound Email', 'Sean', 'sean@mailattic.test',
+            '2026-05-01T10:00:00+08:00', 'outbound-bes', 'Sent',
+            'loc-1', 'dedup-1', 'outbound'
+        )
+        """
+    )
+    db_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+    )
+
+    assert result.status == "not_found"
+    assert result.dest_path is None
+    assert result.subject == "Outbound Email"
+    assert result.sent_at == "2026-05-01T10:00:00+08:00"
+    assert "does not support original export" in (result.detail or "")

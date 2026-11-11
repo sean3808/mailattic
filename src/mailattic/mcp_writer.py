@@ -294,6 +294,7 @@ class MailWriter:
             imap_client=imap_client,
             env_file=env_file,
             refuse_filename=_refuse_runnable_filename,
+            message=message,
         )
 
     def _resolve_sender_and_env(self) -> tuple[Mapping[str, str], str]:
