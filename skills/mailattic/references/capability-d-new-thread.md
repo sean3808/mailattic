@@ -23,7 +23,7 @@ Four steps. **The caller AI writes the body into a file; bes does mechanical ste
 <user's current project root>/draft_<topic>.txt
 ```
 
-A plain-text UTF-8 file with no headers (To/From/Subject are passed as flags to bes). After the user edits it as needed, go to Step 2.
+A plain-text UTF-8 file with no headers (To/From/Subject are passed as flags to bes). A Markdown pipe table in the body (header row, `---` separator row, body rows; every row the same cell count) renders as a table in the HTML part; other Markdown is sent as plain text, and the plain-text part is the file unchanged. After the user edits it as needed, go to Step 2.
 
 ### Step 2: produce the draft
 

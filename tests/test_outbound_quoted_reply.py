@@ -301,6 +301,69 @@ class TestTableFidelityWarningNotQuoted:
         assert line in plain
 
 
+class TestReplyTextPipeTableRendering:
+    """A Markdown pipe table the agent wrote in the reply text becomes an HTML
+    table; the quoted original and the plain part are never table-rendered."""
+
+    TABLE = "Item | Qty\n:---|---:\nPEN-100 | 4\nPEN-200 | 7"
+
+    def test_pipe_table_renders_one_tr_per_row_with_escaped_cells(self) -> None:
+        reply = f"Intro line\n{self.TABLE}\n\nClosing line"
+        _, html_body = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert html_body.count("<table") == 1
+        assert html_body.count("<tr") == 3
+        assert "PEN-100" in html_body
+        assert "PEN-200" in html_body
+        assert "Intro line" in html_body
+        assert "Closing line" in html_body
+        assert "Item | Qty" not in html_body
+
+    def test_border_styling_is_inline(self) -> None:
+        _, html_body = build_quoted_reply_bodies(_make_original(), self.TABLE)
+
+        assert "<style" not in html_body
+        assert "border-collapse: collapse" in html_body
+        assert "border: 1px solid" in html_body
+        assert "<td style=" in html_body
+        assert "<th style=" in html_body
+
+    def test_markup_in_a_cell_is_escaped(self) -> None:
+        _, html_body = build_quoted_reply_bodies(
+            _make_original(), "A | B\n---|---\n<b>x</b> | y"
+        )
+
+        assert "&lt;b&gt;x&lt;/b&gt;" in html_body
+        assert "<b>x</b>" not in html_body
+
+    def test_plain_part_keeps_source_text(self) -> None:
+        reply = f"Intro\n{self.TABLE}"
+        plain, _ = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert plain.startswith(reply + "\n\n")
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            "A | B\n---|---|---\nx | y",  # separator wider than header
+            "A | B\n---|---\nx | y | z",  # body row wider than header
+            "A | B\n---|---\nx",  # body row narrower than header
+        ],
+    )
+    def test_mismatched_cell_counts_stay_plain_text(self, block: str) -> None:
+        _, html_body = build_quoted_reply_bodies(_make_original(), block)
+
+        assert "<table" not in html_body
+        assert block.replace("\n", "<br>") in html_body
+
+    def test_quoted_original_is_not_table_rendered(self) -> None:
+        original = _make_original(body_text="Item | Qty\n---|---\nPEN-100 | 4")
+        _, html_body = build_quoted_reply_bodies(original, "plain reply")
+
+        assert "<table" not in html_body
+        assert "Item | Qty<br>---|---<br>PEN-100 | 4" in html_body
+
+
 # ---------------------------------------------------------------------------
 # Group 5: integration tests — multipart draft + _extract_body_text
 # ---------------------------------------------------------------------------

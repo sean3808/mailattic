@@ -547,6 +547,93 @@ def _esc(s: str) -> str:
     return html.escape(s).replace("\n", "<br>")
 
 
+_TABLE_SEPARATOR_CELL = re.compile(r"^:?-+:?$")
+_TABLE_CELL_BORDER = "border: 1px solid #808080; padding: 4px 8px;"
+
+
+def _split_table_row(line: str) -> list[str]:
+    """Split a pipe-table row into stripped cells (outer pipes optional)."""
+    stripped = line.strip()
+    stripped = stripped.removeprefix("|").removesuffix("|")
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _render_pipe_table(
+    header: list[str], aligns: list[str], rows: list[list[str]]
+) -> str:
+    def cell(tag: str, text: str, align: str) -> str:
+        align_css = f" text-align: {align};" if align else ""
+        return (
+            f'<{tag} style="{_TABLE_CELL_BORDER}{align_css}">'
+            f"{html.escape(text)}</{tag}>"
+        )
+
+    def row(tag: str, cells: list[str]) -> str:
+        inner = "".join(cell(tag, c, a) for c, a in zip(cells, aligns, strict=True))
+        return f"<tr>{inner}</tr>"
+
+    body = "".join(row("td", r) for r in rows)
+    return (
+        '<table style="border-collapse: collapse; border: 1px solid #808080;">'
+        f"{row('th', header)}{body}</table>"
+    )
+
+
+def _authored_text_to_html(text: str) -> str:
+    """Convert agent-authored plain text to an HTML fragment.
+
+    Markdown pipe tables become inline-styled ``<table>`` elements; everything
+    else is escaped with line breaks as ``<br>`` (same as :func:`_esc`).  A
+    candidate block whose separator or body rows do not match the header's cell
+    count is kept as plain text rather than guessing a column.
+    """
+    lines = text.split("\n")
+    parts: list[str] = []
+    pending: list[str] = []
+
+    def flush() -> None:
+        if pending:
+            parts.append(_esc("\n".join(pending)))
+            pending.clear()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        sep = lines[i + 1] if i + 1 < len(lines) else ""
+        if "|" in line and "|" in sep:
+            header = _split_table_row(line)
+            sep_cells = _split_table_row(sep)
+            if len(sep_cells) == len(header) and all(
+                _TABLE_SEPARATOR_CELL.match(c) for c in sep_cells
+            ):
+                j = i + 2
+                rows: list[list[str]] = []
+                while j < len(lines) and lines[j].strip():
+                    rows.append(_split_table_row(lines[j]))
+                    j += 1
+                if all(len(r) == len(header) for r in rows):
+                    aligns = [
+                        "center"
+                        if c.startswith(":") and c.endswith(":")
+                        else "right"
+                        if c.endswith(":")
+                        else ""
+                        for c in sep_cells
+                    ]
+                    flush()
+                    parts.append(_render_pipe_table(header, aligns, rows))
+                    i = j
+                    continue
+                # Mismatched body rows: the whole block stays plain text.
+                pending.extend(lines[i:j])
+                i = j
+                continue
+        pending.append(line)
+        i += 1
+    flush()
+    return "".join(parts)
+
+
 def build_quoted_reply_bodies(
     original: dict[str, object],
     reply_text: str,
@@ -622,7 +709,7 @@ def build_quoted_reply_bodies(
     # HTML body: escaped reply + quoted block div with <hr> separator and <b> labels
     cc_row = f"<b>Cc:</b> {_esc(cc_val)}<br>\n" if cc_val else ""
     html_body = (
-        _esc(reply_text)
+        _authored_text_to_html(reply_text)
         + "\n<div>\n<hr>\n"
         + f"<b>From:</b> {_esc(from_val)}<br>\n"
         + f"<b>Sent:</b> {_esc(sent_val)}<br>\n"
@@ -1287,7 +1374,7 @@ def assemble_draft_new(
     msg["Date"] = formatdate(localtime=True)
 
     plain_body = body_text
-    html_body = _esc(plain_body)
+    html_body = _authored_text_to_html(plain_body)
     if font_style:
         html_body = f'<div style="{font_style}">\n{html_body}\n</div>'
 
