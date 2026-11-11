@@ -37,6 +37,10 @@ from .attachment_store import (
     resolve_store_root,
 )
 from .imap_runtime import load_env_file
+from .original_export import (
+    OriginalExportResult,
+    export_original_message,
+)
 from .outbound import (
     ENV_VAR_SMTP_ENV_FILE,
     DraftNewResult,
@@ -253,6 +257,45 @@ class MailWriter:
             verify_content_hash=True,
             refuse_filename=_refuse_runnable_filename,
         ).items
+
+    def export_original(
+        self,
+        message: Mapping[str, object],
+        destination_dir: Path,
+        *,
+        outlook_reader: Any | None = None,
+        imap_client: Any | None = None,
+        env_file: Path | None = None,
+    ) -> OriginalExportResult:
+        """Export original message (.msg for PST, .eml for IMAP) to destination."""
+        resolved = destination_dir.expanduser().resolve()
+        in_store = ValueError(
+            "it is inside the attachment store, which this tool never "
+            "writes. Choose a folder outside it."
+        )
+        if resolved.is_relative_to(self.attachment_root.resolve()):
+            raise in_store
+        resolved.mkdir(parents=True, exist_ok=True)
+        if _lands_in(resolved, self.attachment_root):
+            raise in_store
+        if any(_lands_in(resolved, folder) for folder in _auto_open_folders()):
+            raise ValueError(
+                "files there open automatically or run macros without a prompt "
+                "(Startup, an Office startup folder, or Office Templates/"
+                "Addins). Choose an ordinary folder."
+            )
+        return export_original_message(
+            database_path=self.database_path,
+            identifier=int(message["id"]),
+            destination_dir=resolved,
+            skip_existing=True,
+            overwrite=False,
+            outlook_reader=outlook_reader,
+            imap_client=imap_client,
+            env_file=env_file,
+            refuse_filename=_refuse_runnable_filename,
+            message=message,
+        )
 
     def _resolve_sender_and_env(self) -> tuple[Mapping[str, str], str]:
         # #268 (overturns #189's "settings load only at send time"): From is

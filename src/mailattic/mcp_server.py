@@ -205,6 +205,15 @@ _MAIL_ATTACHMENT_EXPORT_DESCRIPTION = (
     "stored payload, metadata only), skipped-blocked-type, or failed, with the "
     "absolute dest_path. Returns paths, never file content."
 )
+_MAIL_ORIGINAL_EXPORT_DESCRIPTION = (
+    "Retrieve one stored message's original file from its source (PST via Outlook "
+    "saved as .msg, or mail server via IMAP saved as .eml) into a host folder so "
+    "the user can open it in Outlook to verify tables or original layout. "
+    "message_id is the stored integer message id (or its decimal string). "
+    "dest_dir must be an absolute host path of at most 200 characters. "
+    "Never overwrites. When neither source still holds the message, returns "
+    "status not_found with the subject, sender, and sent date instead of failing."
+)
 _MAIL_DRAFT_REPLY_DESCRIPTION = (
     "Generate an RFC5322 reply-all draft for a stored message and write it to the "
     "MCP-dedicated draft folder. message_id is the RFC Message-ID "
@@ -2406,6 +2415,100 @@ def create_server(
                 "{budget} characters. The files may already be written; call "
                 "again with fewer attachment_ids to receive their paths.",
                 budget=MCP_RESPONSE_BUDGET_CHARS,
+            )
+        return delivered
+
+    @server.tool(
+        name="mail_original_export",
+        title="Export original message to a host folder",
+        description=_MAIL_ORIGINAL_EXPORT_DESCRIPTION,
+        annotations=ToolAnnotations(
+            title="Export original message to a host folder",
+            **{**_READ_ONLY_HINTS, "readOnlyHint": False},
+        ),
+    )
+    def mail_original_export(
+        message_id: StrictInt | StrictStr,
+        dest_dir: StrictStr,
+    ) -> Annotated[CallToolResult, dict[str, object]]:
+        if len(dest_dir) > _MAIL_ATTACHMENT_EXPORT_DEST_DIR_MAX_CHARS:
+            raise build_tool_error(
+                ValueError,
+                "dest_dir is longer than {max_chars} characters. Choose a "
+                "shorter absolute host path.",
+                max_chars=_MAIL_ATTACHMENT_EXPORT_DEST_DIR_MAX_CHARS,
+            )
+        destination = Path(dest_dir)
+        if not destination.is_absolute():
+            raise build_tool_error(
+                ValueError,
+                "dest_dir must be an absolute host path; received {dest_dir}. "
+                "Pass the host path of a folder you can read back.",
+                dest_dir=dest_dir,
+            )
+
+        resolved_id: int | None = None
+        if isinstance(message_id, int):
+            resolved_id = message_id
+        elif isinstance(message_id, str):
+            if _is_canonical_stored_id_string(message_id):
+                resolved_id = int(message_id)
+            else:
+                raise build_tool_error(
+                    ValueError,
+                    "mail_original_export received {received} which is not a valid "
+                    "stored id. Provide an integer, or its plain ASCII decimal "
+                    "string form.",
+                    received=message_id,
+                )
+
+        if resolved_id is None:
+            raise build_tool_error(
+                ValueError,
+                "Stored message id {message_id} was not found.",
+                message_id=message_id,
+            )
+
+        try:
+            message = reader.get_message(resolved_id)
+        except KeyError as exc:
+            raise build_tool_error(
+                ValueError,
+                "Stored message id {message_id} was not found.",
+                message_id=message_id,
+            ) from exc
+        except FileNotFoundError as exc:
+            raise _missing_database_error(resolved_database_path) from exc
+        except sqlite3.Error as exc:
+            raise _database_runtime_error(resolved_database_path, exc) from exc
+        except Exception as exc:
+            raise _unexpected_tool_error(
+                "retrieving message", exc, message_id=message_id
+            ) from exc
+
+        try:
+            result = writer.export_original(message, destination)
+        except ValueError as exc:
+            raise build_tool_error(
+                ValueError,
+                "dest_dir {dest_dir} is refused: {reason}",
+                dest_dir=dest_dir,
+                reason=str(exc),
+            ) from exc
+        except OSError as exc:
+            raise build_tool_error(
+                ValueError,
+                "dest_dir {dest_dir} could not be created: {detail}",
+                dest_dir=dest_dir,
+                detail=str(exc),
+            ) from exc
+
+        payload = result.to_dict()
+        delivered = _build_success_result("mail_original_export", payload)
+        if measure_call_tool_result_chars(delivered) > MCP_RESPONSE_BUDGET_CHARS:
+            raise build_tool_error(
+                ValueError,
+                "mail_original_export result exceeds delivery budget.",
             )
         return delivered
 

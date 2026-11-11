@@ -32,6 +32,7 @@ from .datetime_bounds import (
     normalize_optional_date_text,
     whole_day_bound,
 )
+from .original_export import export_original_message
 from .query import (
     SearchFilters,
     ThreadIdentifierError,
@@ -313,6 +314,44 @@ def register_message_commands(subparsers: argparse._SubParsersAction) -> None:  
         ),
     )
     thread_parser.set_defaults(handler=_handle_thread)
+
+    export_parser = subparsers.add_parser(
+        "export-original",
+        help=(
+            "Export one stored message's original from source "
+            "(.msg for PST, .eml for IMAP)."
+        ),
+    )
+    export_parser.add_argument(
+        "identifier",
+        help="Stored message identifier: numeric db_id (int) or RFC822 Message-ID.",
+    )
+    add_database_argument(export_parser)
+    export_parser.add_argument(
+        "--copy-to",
+        type=Path,
+        dest="copy_to",
+        default=None,
+        metavar="DIR",
+        help="Directory to export the original file into. Default: current directory.",
+    )
+    export_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing files in destination directory.",
+    )
+    export_parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        dest="skip_existing",
+        help="Skip files that already exist in destination directory.",
+    )
+    export_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit outcome as JSON.",
+    )
+    export_parser.set_defaults(handler=_handle_export_original)
 
 
 def register_contact_history_command(
@@ -723,6 +762,58 @@ def _handle_thread(args: argparse.Namespace) -> int:
                 _print_message_raw(message)
             print()
     return 0
+
+
+def _handle_export_original(args: argparse.Namespace) -> int:
+    if args.overwrite and args.skip_existing:
+        print(
+            "error: conflicting export flags: cannot use both --overwrite and "
+            "--skip-existing",
+            file=sys.stderr,
+        )
+        return 2
+
+    dest_dir = (args.copy_to or Path.cwd()).resolve()
+
+    try:
+        result = export_original_message(
+            database_path=args.database,
+            identifier=args.identifier,
+            destination_dir=dest_dir,
+            overwrite=args.overwrite,
+            skip_existing=args.skip_existing,
+        )
+    except KeyError as exc:
+        print(_format_exception_message(exc), file=sys.stderr)
+        return 1
+    except (FileNotFoundError, sqlite3.Error) as exc:
+        print(_format_exception_message(exc), file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(_format_exception_message(exc), file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return (
+            0 if result.status in ("exported", "skipped-existing", "not_found") else 1
+        )
+
+    if result.status == "exported":
+        print(f"Exported: {result.dest_path}")
+        return 0
+    if result.status == "skipped-existing":
+        print(f"Skipped (destination exists): {result.dest_path}")
+        return 0
+    if result.status == "not_found":
+        print("Original message not found in source.")
+        print(f"Subject: {result.subject}")
+        print(f"Sender:  {result.sender}")
+        print(f"Date:    {result.sent_at}")
+        return 0
+
+    print(f"Export failed: {result.detail}", file=sys.stderr)
+    return 1
 
 
 def _handle_contact_history(args: argparse.Namespace) -> int:
