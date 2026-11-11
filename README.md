@@ -41,7 +41,7 @@ Most email tools for AI agents are live proxies. The agent asks, the server conn
 |---|---|---|
 | CLI `bes` | Coding agents and scripts on the same machine | `search`, `show`, `thread`, `attachments`, `contact-history`, `sync-imap`, `draft-reply`, `send-draft`, and more. Query subcommands can print JSON; the output options of each subcommand are in [`docs/cli-reference.md`](docs/cli-reference.md) |
 | Python API | In-process callers | `search_messages`, `SearchFilters`, `get_message` |
-| MCP server `bes-mcp` | Sandboxed assistants that cannot run a host CLI | Six read tools, plus attachment export, reply draft, new-thread draft, and send |
+| MCP server `bes-mcp` | Sandboxed assistants that cannot run a host CLI | Six read tools, plus attachment export, original export, reply draft, new-thread draft, and send |
 
 All three run the same query code, so a date filter or a keyword means the same thing in each.
 
