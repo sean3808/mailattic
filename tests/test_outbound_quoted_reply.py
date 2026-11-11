@@ -18,6 +18,7 @@ from mailattic.outbound import (
     build_quoted_reply_bodies,
 )
 from mailattic.outbound_commands import _handle_draft_reply
+from mailattic.parser import PLAIN_TABLE_FIDELITY_WARNING, TABLE_FIDELITY_WARNING
 from mailattic.storage import (
     connect_database,
     initialize_database,
@@ -272,6 +273,32 @@ class TestHtmlEscaping:
         _, html_body = build_quoted_reply_bodies(original, "reply")
 
         assert "<hr>" in html_body
+
+
+class TestTableFidelityWarningNotQuoted:
+    """The table fidelity warning is a note for agents reading the store, not
+    part of what the sender wrote: quoting it would send it to the recipient."""
+
+    @pytest.mark.parametrize(
+        "warning", [PLAIN_TABLE_FIDELITY_WARNING, TABLE_FIDELITY_WARNING]
+    )
+    def test_warning_line_is_dropped_but_body_is_kept(self, warning: str) -> None:
+        original = _make_original(
+            body_text=f"{warning}\nDear Sean,\nItem | Qty\nPEN-100 | 4"
+        )
+        plain, html_body = build_quoted_reply_bodies(original, "reply")
+
+        for rendered_body in (plain, html_body):
+            assert "[表格失真提示]" not in rendered_body
+            assert "Dear Sean," in rendered_body
+            assert "PEN-100 | 4" in rendered_body
+
+    def test_sender_text_quoting_the_prefix_is_kept(self) -> None:
+        # Only the exact warning lines are ours; anything else is the sender's.
+        line = "[表格失真提示] is what the archive tool shows"
+        plain, _ = build_quoted_reply_bodies(_make_original(body_text=line), "r")
+
+        assert line in plain
 
 
 # ---------------------------------------------------------------------------

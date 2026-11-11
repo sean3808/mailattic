@@ -65,7 +65,11 @@ from .models import (
     NormalizedMessage,
 )
 from .mutf7 import encode_mutf7
-from .parser import subject_from_raw_headers
+from .parser import (
+    PLAIN_TABLE_FIDELITY_WARNING,
+    TABLE_FIDELITY_WARNING,
+    subject_from_raw_headers,
+)
 from .query import (
     RecipientFamiliarity,
     check_recipient_familiarity,
@@ -533,6 +537,11 @@ def _format_recipient_header(entries_raw: object) -> str:
     )
 
 
+_TABLE_FIDELITY_WARNING_LINES = frozenset(
+    {PLAIN_TABLE_FIDELITY_WARNING, TABLE_FIDELITY_WARNING}
+)
+
+
 def _esc(s: str) -> str:
     """Escape plain text for an HTML body, keeping line breaks as <br>."""
     return html.escape(s).replace("\n", "<br>")
@@ -580,6 +589,14 @@ def build_quoted_reply_bodies(
     # Same cleaner as the display path, so style text already stored in an
     # older body is not quoted back to the recipient (#294).
     body_text_val = render_text(str(original.get("body_text") or ""))
+    # The table fidelity warning is a note to agents reading the store, not
+    # sender text; quoting it would mail it to the recipient. Exact lines only,
+    # so sender text that merely mentions the prefix is kept.
+    body_text_val = "\n".join(
+        line
+        for line in body_text_val.split("\n")
+        if line not in _TABLE_FIDELITY_WARNING_LINES
+    )
 
     # Plain-text body: reply + separator line + header block + original body
     separator = "_" * 32
