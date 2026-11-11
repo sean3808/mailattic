@@ -65,11 +65,7 @@ from .models import (
     NormalizedMessage,
 )
 from .mutf7 import encode_mutf7
-from .parser import (
-    PLAIN_TABLE_FIDELITY_WARNING,
-    TABLE_FIDELITY_WARNING,
-    subject_from_raw_headers,
-)
+from .parser import strip_table_fidelity_warnings, subject_from_raw_headers
 from .query import (
     RecipientFamiliarity,
     check_recipient_familiarity,
@@ -537,11 +533,6 @@ def _format_recipient_header(entries_raw: object) -> str:
     )
 
 
-_TABLE_FIDELITY_WARNING_LINES = frozenset(
-    {PLAIN_TABLE_FIDELITY_WARNING, TABLE_FIDELITY_WARNING}
-)
-
-
 def _esc(s: str) -> str:
     """Escape plain text for an HTML body, keeping line breaks as <br>."""
     return html.escape(s).replace("\n", "<br>")
@@ -556,6 +547,13 @@ def _split_table_row(line: str) -> list[str]:
     stripped = line.strip()
     stripped = stripped.removeprefix("|").removesuffix("|")
     return [cell.strip() for cell in stripped.split("|")]
+
+
+def _align(separator_cell: str) -> str:
+    """CSS text-align for a pipe-table separator cell ("" for the default)."""
+    if separator_cell.startswith(":") and separator_cell.endswith(":"):
+        return "center"
+    return "right" if separator_cell.endswith(":") else ""
 
 
 def _render_pipe_table(
@@ -612,14 +610,7 @@ def _authored_text_to_html(text: str) -> str:
                     rows.append(_split_table_row(lines[j]))
                     j += 1
                 if all(len(r) == len(header) for r in rows):
-                    aligns = [
-                        "center"
-                        if c.startswith(":") and c.endswith(":")
-                        else "right"
-                        if c.endswith(":")
-                        else ""
-                        for c in sep_cells
-                    ]
+                    aligns = [_align(c) for c in sep_cells]
                     flush()
                     parts.append(_render_pipe_table(header, aligns, rows))
                     i = j
@@ -679,11 +670,7 @@ def build_quoted_reply_bodies(
     # The table fidelity warning is a note to agents reading the store, not
     # sender text; quoting it would mail it to the recipient. Exact lines only,
     # so sender text that merely mentions the prefix is kept.
-    body_text_val = "\n".join(
-        line
-        for line in body_text_val.split("\n")
-        if line not in _TABLE_FIDELITY_WARNING_LINES
-    )
+    body_text_val = strip_table_fidelity_warnings(body_text_val)
 
     # Plain-text body: reply + separator line + header block + original body
     separator = "_" * 32

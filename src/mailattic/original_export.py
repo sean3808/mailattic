@@ -14,8 +14,8 @@ import email
 import imaplib
 import re
 import uuid
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -32,7 +32,9 @@ from .outlook_pst import (
 )
 from .query import (
     connect_database,
+    get_message,
     normalize_message_id,
+    select_rows_by_message_id,
 )
 
 
@@ -111,6 +113,49 @@ def _format_sender_string(message: Mapping[str, object]) -> str:
     return str(email_addr or name or "")
 
 
+def _base_result(
+    message: Mapping[str, object],
+    fmt: Literal["msg", "eml"],
+    source_type: Literal["pst", "imap"],
+) -> OriginalExportResult:
+    """Failed-by-default result carrying the message identity; derive outcomes
+    from it with ``dataclasses.replace``."""
+    return OriginalExportResult(
+        status="failed",
+        format=fmt,
+        source_type=source_type,
+        subject=str(message.get("subject") or ""),
+        sender=_format_sender_string(message),
+        sent_at=str(message.get("sent_at") or ""),
+    )
+
+
+def _nothing_found(unreadable_count: int) -> tuple[None, str | None]:
+    """No verified match: an error when some items could not be looked at."""
+    if unreadable_count > 0:
+        return (
+            None,
+            f"Target item not found and {unreadable_count} items "
+            "could not be read due to errors",
+        )
+    return None, None
+
+
+def _pick_unique[T](
+    candidates: Sequence[T],
+    key: Callable[[T], object],
+    ambiguity_message: str,
+) -> tuple[T | None, str | None]:
+    """The single candidate, or the first when all share one *key*; else the
+    ambiguity error (D-20261106-1: identical copies are one message)."""
+    if not candidates:
+        return None, None
+    first_key = key(candidates[0])
+    if all(key(c) == first_key for c in candidates[1:]):
+        return candidates[0], None
+    return None, ambiguity_message
+
+
 def _verify_outlook_item(item: Any, message: Mapping[str, object]) -> bool:
     """Check whether *item* matches *message*, strictly preventing wrong-mail export."""
     db_msg_id = message.get("message_id")
@@ -149,27 +194,25 @@ def _resolve_pst_store(namespace: Any, pst_source: str) -> Any | None:
     if stores is None:
         return None
 
-    count = int(getattr(stores, "Count", 0))
-    # First pass: exact normalized path match
-    for i in range(1, count + 1):
+    entries: list[tuple[Any, str, str]] = []  # (store, normalized path, name)
+    for i in range(1, int(getattr(stores, "Count", 0)) + 1):
         try:
             store = stores.Item(i)
             fp = getattr(store, "FilePath", None)
-            if fp and _normalized_windows_path(fp) == expected_path:
-                return store
+            if fp:
+                entries.append(
+                    (store, _normalized_windows_path(fp), Path(fp).name.casefold())
+                )
         except Exception:
             continue
 
-    # Second pass: filename match (if PST path was relocated)
-    for i in range(1, count + 1):
-        try:
-            store = stores.Item(i)
-            fp = getattr(store, "FilePath", None)
-            if fp and Path(fp).name.casefold() == expected_name:
-                return store
-        except Exception:
-            continue
-
+    # Exact normalized path match first, then filename (PST path relocated).
+    for store, path, _ in entries:
+        if path == expected_path:
+            return store
+    for store, _, name in entries:
+        if name == expected_name:
+            return store
     return None
 
 
@@ -199,6 +242,54 @@ def _find_pst_folder_by_path(root_folder: Any, folder_path: str) -> Any | None:
     return current
 
 
+@dataclass
+class _ScanTally:
+    """Count of items/folders that could not be looked at during a PST search."""
+
+    unreadable: int = 0
+
+
+def _matching_items(
+    folder: Any, message: Mapping[str, object], tally: _ScanTally
+) -> list[Any]:
+    """Items directly in *folder* that verify against *message*; anything that
+    cannot be read is counted once in *tally*."""
+    try:
+        items = getattr(folder, "Items", None)
+    except Exception:
+        tally.unreadable += 1
+        return []
+    if items is None:
+        return []
+    try:
+        count = int(getattr(items, "Count", 0))
+    except Exception:
+        tally.unreadable += 1
+        return []
+    matches: list[Any] = []
+    for i in range(1, count + 1):
+        try:
+            item = items.Item(i)
+            if _verify_outlook_item(item, message):
+                matches.append(item)
+        except Exception:
+            tally.unreadable += 1
+    return matches
+
+
+def _same_folder(a: Any, b: Any) -> bool:
+    if a is b:
+        return True
+    try:
+        entry_a = getattr(a, "EntryID", None)
+        return entry_a is not None and entry_a == getattr(b, "EntryID", None)
+    except Exception:
+        return False
+
+
+_PST_AMBIGUOUS = "Ambiguous Message-ID: multiple differing items found in PST"
+
+
 def _find_pst_item(
     namespace: Any,
     store: Any,
@@ -208,7 +299,10 @@ def _find_pst_item(
     logical_locator = str(message.get("logical_locator") or "").strip()
     db_msg_id = message.get("message_id")
     folder_path = str(message.get("folder_path") or "").strip()
-    unreadable_count = 0
+    tally = _ScanTally()
+
+    def body_of(item: Any) -> object:
+        return getattr(item, "Body", None) or ""
 
     # 1. Try logical_locator (EntryID)
     if logical_locator:
@@ -233,102 +327,50 @@ def _find_pst_item(
         return None, "PST root folder is unavailable"
 
     # 2. Try locating inside folder_path first
+    target_folder = None
     if folder_path:
-        target_folder = None
         try:
             target_folder = _find_pst_folder_by_path(root_folder, folder_path)
         except Exception:
-            unreadable_count += 1
+            tally.unreadable += 1
 
         if target_folder is not None:
-            items = None
-            try:
-                items = getattr(target_folder, "Items", None)
-            except Exception:
-                unreadable_count += 1
-
-            if items is not None:
-                try:
-                    count = int(getattr(items, "Count", 0))
-                except Exception:
-                    unreadable_count += 1
-                    count = 0
-                folder_candidates: list[Any] = []
-                for i in range(1, count + 1):
-                    try:
-                        item = items.Item(i)
-                        if _verify_outlook_item(item, message):
-                            folder_candidates.append(item)
-                    except Exception:
-                        unreadable_count += 1
-                        continue
-                if len(folder_candidates) == 1:
-                    return folder_candidates[0], None
-                if len(folder_candidates) > 1:
-                    first_body = getattr(folder_candidates[0], "Body", None) or ""
-                    if all(
-                        (getattr(c, "Body", None) or "") == first_body
-                        for c in folder_candidates[1:]
-                    ):
-                        return folder_candidates[0], None
-                    return (
-                        None,
-                        "Ambiguous Message-ID: multiple differing items found in PST",
-                    )
+            folder_candidates = _matching_items(target_folder, message, tally)
+            if folder_candidates:
+                return _pick_unique(folder_candidates, body_of, _PST_AMBIGUOUS)
 
     # 3. Fall back to scanning store by Message-ID
     if not db_msg_id:
-        if unreadable_count > 0:
-            return (
-                None,
-                f"Target item not found and {unreadable_count} items "
-                "could not be read due to errors",
-            )
-        return None, None
+        return _nothing_found(tally.unreadable)
 
     candidates: list[tuple[Any, str]] = []  # (item, folder_name)
 
     def scan_folder(folder: Any, current_path: str) -> None:
-        nonlocal unreadable_count
         fname = str(getattr(folder, "Name", ""))
         full_p = f"{current_path}/{fname}" if current_path else fname
-        try:
-            items = getattr(folder, "Items", None)
-        except Exception:
-            unreadable_count += 1
-            items = None
-
-        if items is not None:
-            try:
-                count = int(getattr(items, "Count", 0))
-            except Exception:
-                unreadable_count += 1
-                count = 0
-            for i in range(1, count + 1):
-                try:
-                    item = items.Item(i)
-                    if _verify_outlook_item(item, message):
-                        candidates.append((item, full_p))
-                except Exception:
-                    unreadable_count += 1
-                    continue
+        # The folder_path pass already read this folder's Items (and found no
+        # match); re-reading would count its unreadable items twice.
+        if target_folder is None or not _same_folder(folder, target_folder):
+            candidates.extend(
+                (item, full_p) for item in _matching_items(folder, message, tally)
+            )
         try:
             child_folders = getattr(folder, "Folders", None)
         except Exception:
-            unreadable_count += 1
+            tally.unreadable += 1
             child_folders = None
 
         if child_folders is not None:
             try:
                 count = int(getattr(child_folders, "Count", 0))
             except Exception:
-                unreadable_count += 1
+                tally.unreadable += 1
                 count = 0
             for i in range(1, count + 1):
                 try:
                     scan_folder(child_folders.Item(i), full_p)
                 except Exception:
-                    unreadable_count += 1
+                    tally.unreadable += 1
                     continue
 
     try:
@@ -337,11 +379,8 @@ def _find_pst_item(
         return None, f"PST folder scan failed: {exc}"
 
     if candidates:
-        if len(candidates) == 1:
-            return candidates[0][0], None
-
         # Disambiguate by folder_path if provided
-        if folder_path:
+        if len(candidates) > 1 and folder_path:
             norm_target = folder_path.casefold().replace("\\", "/")
             matching_candidates = [
                 c[0]
@@ -351,25 +390,9 @@ def _find_pst_item(
             if len(matching_candidates) == 1:
                 return matching_candidates[0], None
 
-        # Multiple candidates: check if bodies are identical (D-20261106-1)
-        items_only = [c[0] for c in candidates]
-        first_body = getattr(items_only[0], "Body", None) or ""
-        all_identical = all(
-            (getattr(c, "Body", None) or "") == first_body for c in items_only[1:]
-        )
-        if all_identical:
-            return items_only[0], None
+        return _pick_unique([c[0] for c in candidates], body_of, _PST_AMBIGUOUS)
 
-        return None, "Ambiguous Message-ID: multiple differing items found in PST"
-
-    if unreadable_count > 0:
-        return (
-            None,
-            f"Target item not found and {unreadable_count} items "
-            "could not be read due to errors",
-        )
-
-    return None, None
+    return _nothing_found(tally.unreadable)
 
 
 def _load_default_outlook_reader() -> Any | None:
@@ -384,43 +407,25 @@ def _load_default_outlook_reader() -> Any | None:
 def _write_original_file(
     destination_path: Path,
     write_fn: Callable[[Path], None],
+    base: OriginalExportResult,
     *,
     overwrite: bool,
     skip_existing: bool,
-    format: Literal["msg", "eml"],
-    source_type: Literal["pst", "imap"],
-    subject: str,
-    sender: str,
-    sent_at: str,
 ) -> OriginalExportResult:
-    """Atomic write via sibling temp file, handling overwrite and skip-existing."""
-    destination_dir = destination_path.parent
-    destination_dir.mkdir(parents=True, exist_ok=True)
+    """Atomic write via sibling temp file, handling overwrite and skip-existing.
 
-    if destination_path.exists():
-        if skip_existing:
-            return OriginalExportResult(
-                status="skipped-existing",
-                dest_path=destination_path,
-                format=format,
-                source_type=source_type,
-                subject=subject,
-                sender=sender,
-                sent_at=sent_at,
-            )
-        if not overwrite:
-            return OriginalExportResult(
-                status="failed",
-                dest_path=destination_path,
-                format=format,
-                source_type=source_type,
-                subject=subject,
-                sender=sender,
-                sent_at=sent_at,
-                detail=f"Destination exists: {destination_path}",
-            )
+    The destination directory must already exist (created at the entry point).
+    """
+    exists_result = replace(
+        base,
+        status="skipped-existing" if skip_existing else "failed",
+        dest_path=destination_path,
+        detail=None if skip_existing else f"Destination exists: {destination_path}",
+    )
+    if destination_path.exists() and (skip_existing or not overwrite):
+        return exists_result
 
-    tmp_path = destination_dir / f"{_EXPORT_TMP_PREFIX}{uuid.uuid4().hex}.tmp"
+    tmp_path = destination_path.parent / f"{_EXPORT_TMP_PREFIX}{uuid.uuid4().hex}.tmp"
     try:
         write_fn(tmp_path)
         if overwrite:
@@ -429,48 +434,12 @@ def _write_original_file(
             tmp_path.rename(destination_path)
     except FileExistsError:
         tmp_path.unlink(missing_ok=True)
-        if skip_existing:
-            return OriginalExportResult(
-                status="skipped-existing",
-                dest_path=destination_path,
-                format=format,
-                source_type=source_type,
-                subject=subject,
-                sender=sender,
-                sent_at=sent_at,
-            )
-        return OriginalExportResult(
-            status="failed",
-            dest_path=destination_path,
-            format=format,
-            source_type=source_type,
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
-            detail=f"Destination exists: {destination_path}",
-        )
+        return exists_result
     except Exception as exc:
         tmp_path.unlink(missing_ok=True)
-        return OriginalExportResult(
-            status="failed",
-            dest_path=None,
-            format=format,
-            source_type=source_type,
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
-            detail=f"Writing original file failed: {exc}",
-        )
+        return replace(base, detail=f"Writing original file failed: {exc}")
 
-    return OriginalExportResult(
-        status="exported",
-        dest_path=destination_path,
-        format=format,
-        source_type=source_type,
-        subject=subject,
-        sender=sender,
-        sent_at=sent_at,
-    )
+    return replace(base, status="exported", dest_path=destination_path)
 
 
 def export_from_pst(
@@ -481,75 +450,34 @@ def export_from_pst(
     skip_existing: bool = False,
     outlook_reader: Any | None = None,
 ) -> OriginalExportResult:
-    subject = str(message.get("subject") or "")
-    sender = _format_sender_string(message)
-    sent_at = str(message.get("sent_at") or "")
+    base = _base_result(message, "msg", "pst")
 
     reader = outlook_reader or _load_default_outlook_reader()
     if reader is None:
-        return OriginalExportResult(
-            status="failed",
-            dest_path=None,
-            format="msg",
-            source_type="pst",
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
-            detail="Outlook is not running or unavailable.",
-        )
+        return replace(base, detail="Outlook is not running or unavailable.")
 
     try:
         namespace = getattr(reader, "namespace", reader)
         if namespace is None:
             raise RuntimeError("Outlook namespace is None")
     except Exception as exc:
-        return OriginalExportResult(
-            status="failed",
-            dest_path=None,
-            format="msg",
-            source_type="pst",
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
-            detail=f"Outlook COM is unavailable: {exc}",
-        )
+        return replace(base, detail=f"Outlook COM is unavailable: {exc}")
 
     pst_source = str(message.get("pst_source") or "").strip()
     store = _resolve_pst_store(namespace, pst_source)
     if store is None:
-        return OriginalExportResult(
+        return replace(
+            base,
             status="not_found",
-            dest_path=None,
-            format="msg",
-            source_type="pst",
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
             detail=f"PST source not mounted in Outlook: {pst_source}",
         )
 
     item, err = _find_pst_item(namespace, store, message)
     if err is not None:
-        return OriginalExportResult(
-            status="failed",
-            dest_path=None,
-            format="msg",
-            source_type="pst",
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
-            detail=err,
-        )
+        return replace(base, detail=err)
     if item is None:
-        return OriginalExportResult(
-            status="not_found",
-            dest_path=None,
-            format="msg",
-            source_type="pst",
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
-            detail="Original message not found in PST.",
+        return replace(
+            base, status="not_found", detail="Original message not found in PST."
         )
 
     def write_item(tmp_path: Path) -> None:
@@ -558,13 +486,9 @@ def export_from_pst(
     return _write_original_file(
         destination_path,
         write_item,
+        base,
         overwrite=overwrite,
         skip_existing=skip_existing,
-        format="msg",
-        source_type="pst",
-        subject=subject,
-        sender=sender,
-        sent_at=sent_at,
     )
 
 
@@ -624,51 +548,24 @@ def _find_imap_rfc822(
     # 2. Try Message-ID search
     db_msg_id = message.get("message_id")
     if not db_msg_id:
-        if unreadable_count > 0:
-            return (
-                None,
-                f"Target item not found and {unreadable_count} items "
-                "could not be read due to errors",
-            )
-        return None, None
+        return _nothing_found(unreadable_count)
 
-    clean_id = normalize_message_id(str(db_msg_id))
-    raw_uids: list[int] = []
-
-    for search_term in (f'"{clean_id}"', f'"<{clean_id}>"'):
-        try:
-            conn = getattr(client, "_conn", client)
-            typ, data = conn.uid("SEARCH", "HEADER", "Message-ID", search_term)
-            if typ != "OK":
-                return None, f"IMAP SEARCH failed with status {typ!r}: {data}"
-            if data and data[0]:
-                raw = (
-                    data[0].decode("ascii", errors="replace")
-                    if isinstance(data[0], bytes)
-                    else str(data[0])
-                )
-                raw_uids = [int(u) for u in raw.split() if u.isdigit()]
-                if raw_uids:
-                    break
-        except (
-            imaplib.IMAP4.abort,
-            imaplib.IMAP4.error,
-            OSError,
-            EOFError,
-            TimeoutError,
-        ) as exc:
-            return None, f"IMAP SEARCH protocol error: {exc}"
-        except Exception as exc:
-            return None, f"IMAP SEARCH failed: {exc}"
-
-    if not raw_uids:
-        if unreadable_count > 0:
-            return (
-                None,
-                f"Target item not found and {unreadable_count} items "
-                "could not be read due to errors",
-            )
-        return None, None
+    # HEADER search is a substring match, so the bare id also finds the
+    # bracketed header value.
+    try:
+        raw_uids = client.search_uids_by_message_id(
+            normalize_message_id(str(db_msg_id))
+        )
+    except (
+        imaplib.IMAP4.abort,
+        imaplib.IMAP4.error,
+        OSError,
+        EOFError,
+        TimeoutError,
+    ) as exc:
+        return None, f"IMAP SEARCH protocol error: {exc}"
+    except Exception as exc:
+        return None, f"IMAP SEARCH failed: {exc}"
 
     candidates: list[bytes] = []
     for uid in raw_uids:
@@ -691,25 +588,13 @@ def _find_imap_rfc822(
             continue
 
     if candidates:
-        if len(candidates) == 1:
-            return candidates[0], None
-
-        if all(c == candidates[0] for c in candidates[1:]):
-            return candidates[0], None
-
-        return (
-            None,
+        return _pick_unique(
+            candidates,
+            lambda c: c,
             "Ambiguous Message-ID: multiple differing messages found on IMAP server",
         )
 
-    if unreadable_count > 0:
-        return (
-            None,
-            f"Target item not found and {unreadable_count} items "
-            "could not be read due to errors",
-        )
-
-    return None, None
+    return _nothing_found(unreadable_count)
 
 
 def _load_default_imap_client(env_file: Path | None = None) -> Any | None:
@@ -735,44 +620,25 @@ def export_from_imap(
     imap_client: Any | None = None,
     env_file: Path | None = None,
 ) -> OriginalExportResult:
-    subject = str(message.get("subject") or "")
-    sender = _format_sender_string(message)
-    sent_at = str(message.get("sent_at") or "")
+    base = _base_result(message, "eml", "imap")
 
+    # A client created here is closed here; an injected one is the caller's.
+    owns_client = imap_client is None
     client = imap_client or _load_default_imap_client(env_file)
     if client is None:
-        return OriginalExportResult(
-            status="failed",
-            dest_path=None,
-            format="eml",
-            source_type="imap",
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
-            detail="IMAP server connection could not be established.",
-        )
+        return replace(base, detail="IMAP server connection could not be established.")
 
-    rfc822, err = _find_imap_rfc822(client, message)
+    try:
+        rfc822, err = _find_imap_rfc822(client, message)
+    finally:
+        if owns_client:
+            client.close()
     if err is not None:
-        return OriginalExportResult(
-            status="failed",
-            dest_path=None,
-            format="eml",
-            source_type="imap",
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
-            detail=err,
-        )
+        return replace(base, detail=err)
     if rfc822 is None:
-        return OriginalExportResult(
+        return replace(
+            base,
             status="not_found",
-            dest_path=None,
-            format="eml",
-            source_type="imap",
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
             detail="Original message not found on IMAP server.",
         )
 
@@ -782,14 +648,40 @@ def export_from_imap(
     return _write_original_file(
         destination_path,
         write_rfc822,
+        base,
         overwrite=overwrite,
         skip_existing=skip_existing,
-        format="eml",
-        source_type="imap",
-        subject=subject,
-        sender=sender,
-        sent_at=sent_at,
     )
+
+
+def _load_stored_message(
+    database_path: str | Path, identifier: int | str
+) -> dict[str, object] | OriginalExportResult:
+    """Look up the stored message by db id or Message-ID.
+
+    A Message-ID that matches more than one stored row is refused (returned as
+    a failed result) rather than resolved to an arbitrary one.
+    """
+    if isinstance(identifier, int) or identifier.isdigit():
+        return get_message(database_path, int(identifier), read_only=True)
+
+    clean_id = normalize_message_id(str(identifier))
+    connection = connect_database(database_path, create=False, read_only=True)
+    try:
+        rows = select_rows_by_message_id(connection, clean_id, "id")
+    finally:
+        connection.close()
+    if not rows:
+        raise KeyError(f"No message found for identifier {identifier!r}")
+    if len(rows) > 1:
+        return OriginalExportResult(
+            status="failed",
+            detail=(
+                f"Ambiguous Message-ID: {len(rows)} stored messages match "
+                f"{identifier!r}; use the stored id instead."
+            ),
+        )
+    return get_message(database_path, int(rows[0]["id"]), read_only=True)
 
 
 def export_original_message(
@@ -807,50 +699,19 @@ def export_original_message(
 ) -> OriginalExportResult:
     """Retrieve one message's original from source and export to destination_dir."""
     if message is None:
-        connection = connect_database(database_path, create=False, read_only=True)
-        try:
-            row = None
-            if isinstance(identifier, int) or (
-                isinstance(identifier, str) and identifier.isdigit()
-            ):
-                stored_id = int(identifier)
-                row = connection.execute(
-                    "SELECT * FROM messages WHERE id = ?", [stored_id]
-                ).fetchone()
-            else:
-                clean_id = normalize_message_id(str(identifier))
-                rows = connection.execute(
-                    "SELECT * FROM messages WHERE message_id = ?", [clean_id]
-                ).fetchall()
-                if not rows:
-                    rows = connection.execute(
-                        "SELECT * FROM messages WHERE message_id = ?", [f"<{clean_id}>"]
-                    ).fetchall()
-                if rows:
-                    row = rows[0]
-
-            if row is None:
-                raise KeyError(f"No message found for identifier {identifier!r}")
-            message = dict(row)
-        finally:
-            connection.close()
+        loaded = _load_stored_message(database_path, identifier)
+        if isinstance(loaded, OriginalExportResult):
+            return loaded
+        message = loaded
 
     source_type = classify_message_source(message)
     if source_type == "unsupported":
-        subject = str(message.get("subject") or "")
-        sender = _format_sender_string(message)
-        sent_at = str(message.get("sent_at") or "")
         src_label = str(
             message.get("pst_source") or message.get("source_input_mode") or "unknown"
         )
-        return OriginalExportResult(
+        return replace(
+            _base_result(message, "msg", "pst"),
             status="not_found",
-            dest_path=None,
-            format="msg",
-            source_type="pst",
-            subject=subject,
-            sender=sender,
-            sent_at=sent_at,
             detail=f"Source {src_label!r} does not support original export.",
         )
 
@@ -863,16 +724,7 @@ def export_original_message(
     if refuse_filename:
         refusal = refuse_filename(filename)
         if refusal is not None:
-            return OriginalExportResult(
-                status="failed",
-                dest_path=None,
-                format=fmt,
-                source_type=source_type,
-                subject=str(message.get("subject") or ""),
-                sender=_format_sender_string(message),
-                sent_at=str(message.get("sent_at") or ""),
-                detail=refusal,
-            )
+            return replace(_base_result(message, fmt, source_type), detail=refusal)
 
     destination_path = dest_dir / filename
 

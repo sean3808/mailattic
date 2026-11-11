@@ -1296,6 +1296,19 @@ _HTML_GRID_SLOT_LIMIT = 100_000
 
 # Placed on its own line right before a table whose columns cannot be trusted.
 TABLE_FIDELITY_WARNING = f"{_TABLE_FIDELITY_PREFIX} 以下表格的{_TABLE_FIDELITY_ADVICE}"
+_TABLE_FIDELITY_WARNING_LINES = frozenset(
+    {PLAIN_TABLE_FIDELITY_WARNING, TABLE_FIDELITY_WARNING}
+)
+
+
+def strip_table_fidelity_warnings(text: str) -> str:
+    """Drop lines exactly equal to either table fidelity warning.
+
+    Exact lines only, so sender text that merely mentions the prefix is kept.
+    """
+    return "\n".join(
+        line for line in text.split("\n") if line not in _TABLE_FIDELITY_WARNING_LINES
+    )
 
 
 class _LineBreak:

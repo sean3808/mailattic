@@ -155,9 +155,21 @@ class FakeImapConnection:
 class FakeImapClient:
     def __init__(self, connection: FakeImapConnection) -> None:
         self._conn = connection
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
 
     def select_folder(self, folder_name: str) -> None:
         self._conn.select(folder_name, readonly=True)
+
+    def search_uids_by_message_id(self, term: str) -> list[int]:
+        typ, data = self._conn.uid("SEARCH", "HEADER", "Message-ID", f'"{term}"')
+        if typ != "OK":
+            raise RuntimeError(f"UID SEARCH failed with status {typ!r}: {data}")
+        raw = data[0] if data and data[0] else b""
+        assert isinstance(raw, bytes)
+        return sorted(int(u) for u in raw.decode("ascii").split() if u.isdigit())
 
     def fetch_rfc822(self, uid: int) -> bytes:
         typ, data = self._conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
@@ -1019,3 +1031,132 @@ def test_pst_item_raising_during_scan_fails_if_target_not_found(
     )
     assert result.status == "failed"
     assert "could not be read" in (result.detail or "").lower()
+
+
+_DEFAULT_CLIENT_RFC822 = (
+    b"From: Charlie <charlie@example.com>\r\n"
+    b"To: sean3808@mailattic.test\r\n"
+    b"Subject: Closing Client\r\n"
+    b"Message-ID: <closing1@example.com>\r\n"
+    b"\r\n"
+    b"Body"
+)
+
+
+def _seed_closing_client_message(tmp_path: Path) -> tuple[Path, int]:
+    return _seed_imap_message(
+        tmp_path,
+        uid=5,
+        message_id="<closing1@example.com>",
+        subject="Closing Client",
+    )
+
+
+def test_default_created_imap_client_is_closed_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mailattic import original_export
+
+    db_path, db_id = _seed_closing_client_message(tmp_path)
+    client = FakeImapClient(
+        FakeImapConnection(
+            rfc822_by_uid={5: _DEFAULT_CLIENT_RFC822},
+            uids_by_header={"closing1@example.com": [5]},
+        )
+    )
+    monkeypatch.setattr(
+        original_export, "_load_default_imap_client", lambda *a, **k: client
+    )
+
+    result = export_original_message(
+        db_path, db_id, destination_dir=tmp_path / "exports"
+    )
+
+    assert result.status == "exported"
+    assert client.close_calls == 1
+
+
+def test_default_created_imap_client_is_closed_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mailattic import original_export
+
+    db_path, db_id = _seed_closing_client_message(tmp_path)
+    connection = FakeImapConnection(rfc822_by_uid={})
+
+    def raise_search(*args: str) -> tuple[str, list[object]]:
+        raise imaplib.IMAP4.error("SEARCH protocol failure")
+
+    connection.uid = raise_search  # type: ignore[assignment]
+    client = FakeImapClient(connection)
+    monkeypatch.setattr(
+        original_export, "_load_default_imap_client", lambda *a, **k: client
+    )
+
+    result = export_original_message(
+        db_path, db_id, destination_dir=tmp_path / "exports"
+    )
+
+    assert result.status == "failed"
+    assert client.close_calls == 1
+
+
+def test_injected_imap_client_is_never_closed(tmp_path: Path) -> None:
+    db_path, db_id = _seed_closing_client_message(tmp_path)
+    client = FakeImapClient(
+        FakeImapConnection(
+            rfc822_by_uid={5: _DEFAULT_CLIENT_RFC822},
+            uids_by_header={"closing1@example.com": [5]},
+        )
+    )
+
+    result = export_original_message(
+        db_path, db_id, destination_dir=tmp_path / "exports", imap_client=client
+    )
+
+    assert result.status == "exported"
+    assert client.close_calls == 0
+
+
+def test_message_id_identifier_matching_two_stored_rows_is_refused(
+    tmp_path: Path,
+) -> None:
+    # Two stored rows whose Message-IDs differ only in angle brackets are one
+    # identity; the lookup must refuse rather than export an arbitrary one.
+    _seed_imap_message(
+        tmp_path, uid=1, message_id="<dup@example.com>", subject="First copy"
+    )
+    db_path, _ = _seed_imap_message(
+        tmp_path, uid=2, message_id="dup@example.com", subject="Second copy"
+    )
+    client = FakeImapClient(FakeImapConnection(rfc822_by_uid={}))
+
+    result = export_original_message(
+        db_path,
+        "dup@example.com",
+        destination_dir=tmp_path / "exports",
+        imap_client=client,
+    )
+
+    assert result.status == "failed"
+    assert "Ambiguous Message-ID" in (result.detail or "")
+    assert not (tmp_path / "exports").exists()
+
+
+def test_message_id_identifier_resolves_single_stored_row(tmp_path: Path) -> None:
+    db_path, _ = _seed_closing_client_message(tmp_path)
+    client = FakeImapClient(
+        FakeImapConnection(
+            rfc822_by_uid={5: _DEFAULT_CLIENT_RFC822},
+            uids_by_header={"closing1@example.com": [5]},
+        )
+    )
+
+    result = export_original_message(
+        db_path,
+        "closing1@example.com",
+        destination_dir=tmp_path / "exports",
+        imap_client=client,
+    )
+
+    assert result.status == "exported"

@@ -1639,6 +1639,50 @@ def _send_receipt_states(
     ]
 
 
+def _validate_host_dest_dir(dest_dir: str) -> Path:
+    """Length-cap and absolute-path check shared by the export tools."""
+    if len(dest_dir) > _MAIL_ATTACHMENT_EXPORT_DEST_DIR_MAX_CHARS:
+        raise build_tool_error(
+            ValueError,
+            "dest_dir is longer than {max_chars} characters. Choose a "
+            "shorter absolute host path.",
+            max_chars=_MAIL_ATTACHMENT_EXPORT_DEST_DIR_MAX_CHARS,
+        )
+    destination = Path(dest_dir)
+    if not destination.is_absolute():
+        raise build_tool_error(
+            ValueError,
+            "dest_dir must be an absolute host path; received {dest_dir}. "
+            "Pass the host path of a folder you can read back.",
+            dest_dir=dest_dir,
+        )
+    return destination
+
+
+def _run_writer_export[T](dest_dir: str, export: Callable[[], T]) -> T:
+    """Run a writer export, mapping its destination refusals to tool errors."""
+    try:
+        return export()
+    except ValueError as exc:
+        # The writer's refusals: inside the attachment store, or a folder
+        # whose files open by themselves (#205).
+        raise build_tool_error(
+            ValueError,
+            "dest_dir {dest_dir} is refused: {reason}",
+            dest_dir=dest_dir,
+            reason=str(exc),
+        ) from exc
+    except OSError as exc:
+        # Only the up-front directory creation raises; per-file failures
+        # come back as failed items.
+        raise build_tool_error(
+            ValueError,
+            "dest_dir {dest_dir} could not be created: {detail}",
+            dest_dir=dest_dir,
+            detail=str(exc),
+        ) from exc
+
+
 def create_server(
     *,
     database_path: str | Path | None = None,
@@ -2320,21 +2364,7 @@ def create_server(
                 max_ids=_MAIL_ATTACHMENT_EXPORT_MAX_IDS,
                 count=len(attachment_ids),
             )
-        if len(dest_dir) > _MAIL_ATTACHMENT_EXPORT_DEST_DIR_MAX_CHARS:
-            raise build_tool_error(
-                ValueError,
-                "dest_dir is longer than {max_chars} characters. Choose a "
-                "shorter absolute host path.",
-                max_chars=_MAIL_ATTACHMENT_EXPORT_DEST_DIR_MAX_CHARS,
-            )
-        destination = Path(dest_dir)
-        if not destination.is_absolute():
-            raise build_tool_error(
-                ValueError,
-                "dest_dir must be an absolute host path; received {dest_dir}. "
-                "Pass the host path of a folder you can read back.",
-                dest_dir=dest_dir,
-            )
+        destination = _validate_host_dest_dir(dest_dir)
         requested_ids = list(dict.fromkeys(attachment_ids))
         try:
             rows = reader.get_attachments_by_ids(requested_ids)
@@ -2345,29 +2375,13 @@ def create_server(
         except Exception as exc:
             raise _unexpected_tool_error("reading attachment metadata", exc) from exc
         rows_by_id = {cast(int, row["attachment_id"]): row for row in rows}
-        try:
-            outcomes = writer.export_attachments(
+        outcomes = _run_writer_export(
+            dest_dir,
+            lambda: writer.export_attachments(
                 [rows_by_id[i] for i in requested_ids if i in rows_by_id],
                 destination,
-            )
-        except ValueError as exc:
-            # The writer's refusals: inside the attachment store, or a folder
-            # whose files open by themselves (#205).
-            raise build_tool_error(
-                ValueError,
-                "dest_dir {dest_dir} is refused: {reason}",
-                dest_dir=dest_dir,
-                reason=str(exc),
-            ) from exc
-        except OSError as exc:
-            # Only the up-front directory creation raises; per-file failures
-            # come back as `failed` items.
-            raise build_tool_error(
-                ValueError,
-                "dest_dir {dest_dir} could not be created: {detail}",
-                dest_dir=dest_dir,
-                detail=str(exc),
-            ) from exc
+            ),
+        )
         outcomes_by_id = {outcome.attachment_id: outcome for outcome in outcomes}
 
         truncated_fields: dict[str, int] = {}
@@ -2431,29 +2445,10 @@ def create_server(
         message_id: StrictInt | StrictStr,
         dest_dir: StrictStr,
     ) -> Annotated[CallToolResult, dict[str, object]]:
-        if len(dest_dir) > _MAIL_ATTACHMENT_EXPORT_DEST_DIR_MAX_CHARS:
-            raise build_tool_error(
-                ValueError,
-                "dest_dir is longer than {max_chars} characters. Choose a "
-                "shorter absolute host path.",
-                max_chars=_MAIL_ATTACHMENT_EXPORT_DEST_DIR_MAX_CHARS,
-            )
-        destination = Path(dest_dir)
-        if not destination.is_absolute():
-            raise build_tool_error(
-                ValueError,
-                "dest_dir must be an absolute host path; received {dest_dir}. "
-                "Pass the host path of a folder you can read back.",
-                dest_dir=dest_dir,
-            )
+        destination = _validate_host_dest_dir(dest_dir)
 
-        resolved_id: int | None = None
-        if isinstance(message_id, int):
-            resolved_id = message_id
-        elif isinstance(message_id, str):
-            if _is_canonical_stored_id_string(message_id):
-                resolved_id = int(message_id)
-            else:
+        if isinstance(message_id, str):
+            if not _is_canonical_stored_id_string(message_id):
                 raise build_tool_error(
                     ValueError,
                     "mail_original_export received {received} which is not a valid "
@@ -2461,16 +2456,10 @@ def create_server(
                     "string form.",
                     received=message_id,
                 )
-
-        if resolved_id is None:
-            raise build_tool_error(
-                ValueError,
-                "Stored message id {message_id} was not found.",
-                message_id=message_id,
-            )
+            message_id = int(message_id)
 
         try:
-            message = reader.get_message(resolved_id)
+            message = reader.get_message(message_id)
         except KeyError as exc:
             raise build_tool_error(
                 ValueError,
@@ -2486,22 +2475,9 @@ def create_server(
                 "retrieving message", exc, message_id=message_id
             ) from exc
 
-        try:
-            result = writer.export_original(message, destination)
-        except ValueError as exc:
-            raise build_tool_error(
-                ValueError,
-                "dest_dir {dest_dir} is refused: {reason}",
-                dest_dir=dest_dir,
-                reason=str(exc),
-            ) from exc
-        except OSError as exc:
-            raise build_tool_error(
-                ValueError,
-                "dest_dir {dest_dir} could not be created: {detail}",
-                dest_dir=dest_dir,
-                detail=str(exc),
-            ) from exc
+        result = _run_writer_export(
+            dest_dir, lambda: writer.export_original(message, destination)
+        )
 
         payload = result.to_dict()
         delivered = _build_success_result("mail_original_export", payload)

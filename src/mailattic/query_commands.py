@@ -773,13 +773,11 @@ def _handle_export_original(args: argparse.Namespace) -> int:
         )
         return 2
 
-    dest_dir = (args.copy_to or Path.cwd()).resolve()
-
     try:
         result = export_original_message(
             database_path=args.database,
             identifier=args.identifier,
-            destination_dir=dest_dir,
+            destination_dir=args.copy_to or Path.cwd(),
             overwrite=args.overwrite,
             skip_existing=args.skip_existing,
         )
@@ -795,9 +793,7 @@ def _handle_export_original(args: argparse.Namespace) -> int:
 
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
-        return (
-            0 if result.status in ("exported", "skipped-existing", "not_found") else 1
-        )
+        return 0 if result.status != "failed" else 1
 
     if result.status == "exported":
         print(f"Exported: {result.dest_path}")
