@@ -10,8 +10,8 @@ Issue #53, D-20261105-1, GLOSSARY.md:
 
 from __future__ import annotations
 
-import contextlib
 import email
+import imaplib
 import re
 import uuid
 from collections.abc import Callable, Mapping
@@ -119,8 +119,16 @@ def _verify_outlook_item(item: Any, message: Mapping[str, object]) -> bool:
     if accessor:
         try:
             item_msg_id = accessor.GetProperty(PR_INTERNET_MESSAGE_ID)
-        except Exception:
+        except (KeyError, IndexError):
             item_msg_id = None
+        except Exception as exc:
+            hresult = getattr(exc, "hresult", None)
+            if hresult is None and len(getattr(exc, "args", ())) > 0:
+                hresult = exc.args[0]
+            if hresult == -2147221233:  # MAPI_E_NOT_FOUND (0x8004010F)
+                item_msg_id = None
+            else:
+                raise
 
     if db_msg_id:
         if not item_msg_id:
@@ -200,6 +208,7 @@ def _find_pst_item(
     logical_locator = str(message.get("logical_locator") or "").strip()
     db_msg_id = message.get("message_id")
     folder_path = str(message.get("folder_path") or "").strip()
+    unreadable_count = 0
 
     # 1. Try logical_locator (EntryID)
     if logical_locator:
@@ -217,16 +226,33 @@ def _find_pst_item(
 
     try:
         root_folder = store.GetRootFolder()
-    except Exception:
-        root_folder = None
+    except Exception as exc:
+        return None, f"PST root folder access failed: {exc}"
+
+    if root_folder is None:
+        return None, "PST root folder is unavailable"
 
     # 2. Try locating inside folder_path first
-    if root_folder is not None and folder_path:
-        target_folder = _find_pst_folder_by_path(root_folder, folder_path)
+    if folder_path:
+        target_folder = None
+        try:
+            target_folder = _find_pst_folder_by_path(root_folder, folder_path)
+        except Exception:
+            unreadable_count += 1
+
         if target_folder is not None:
-            items = getattr(target_folder, "Items", None)
+            items = None
+            try:
+                items = getattr(target_folder, "Items", None)
+            except Exception:
+                unreadable_count += 1
+
             if items is not None:
-                count = int(getattr(items, "Count", 0))
+                try:
+                    count = int(getattr(items, "Count", 0))
+                except Exception:
+                    unreadable_count += 1
+                    count = 0
                 folder_candidates: list[Any] = []
                 for i in range(1, count + 1):
                     try:
@@ -234,6 +260,7 @@ def _find_pst_item(
                         if _verify_outlook_item(item, message):
                             folder_candidates.append(item)
                     except Exception:
+                        unreadable_count += 1
                         continue
                 if len(folder_candidates) == 1:
                     return folder_candidates[0], None
@@ -250,63 +277,99 @@ def _find_pst_item(
                     )
 
     # 3. Fall back to scanning store by Message-ID
-    if not db_msg_id or root_folder is None:
+    if not db_msg_id:
+        if unreadable_count > 0:
+            return (
+                None,
+                f"Target item not found and {unreadable_count} items "
+                "could not be read due to errors",
+            )
         return None, None
 
     candidates: list[tuple[Any, str]] = []  # (item, folder_name)
 
     def scan_folder(folder: Any, current_path: str) -> None:
+        nonlocal unreadable_count
         fname = str(getattr(folder, "Name", ""))
         full_p = f"{current_path}/{fname}" if current_path else fname
-        items = getattr(folder, "Items", None)
+        try:
+            items = getattr(folder, "Items", None)
+        except Exception:
+            unreadable_count += 1
+            items = None
+
         if items is not None:
-            count = int(getattr(items, "Count", 0))
+            try:
+                count = int(getattr(items, "Count", 0))
+            except Exception:
+                unreadable_count += 1
+                count = 0
             for i in range(1, count + 1):
                 try:
                     item = items.Item(i)
                     if _verify_outlook_item(item, message):
                         candidates.append((item, full_p))
                 except Exception:
+                    unreadable_count += 1
                     continue
-        child_folders = getattr(folder, "Folders", None)
+        try:
+            child_folders = getattr(folder, "Folders", None)
+        except Exception:
+            unreadable_count += 1
+            child_folders = None
+
         if child_folders is not None:
-            count = int(getattr(child_folders, "Count", 0))
+            try:
+                count = int(getattr(child_folders, "Count", 0))
+            except Exception:
+                unreadable_count += 1
+                count = 0
             for i in range(1, count + 1):
                 try:
                     scan_folder(child_folders.Item(i), full_p)
                 except Exception:
+                    unreadable_count += 1
                     continue
 
-    with contextlib.suppress(Exception):
+    try:
         scan_folder(root_folder, "")
+    except Exception as exc:
+        return None, f"PST folder scan failed: {exc}"
 
-    if not candidates:
-        return None, None
+    if candidates:
+        if len(candidates) == 1:
+            return candidates[0][0], None
 
-    if len(candidates) == 1:
-        return candidates[0][0], None
+        # Disambiguate by folder_path if provided
+        if folder_path:
+            norm_target = folder_path.casefold().replace("\\", "/")
+            matching_candidates = [
+                c[0]
+                for c in candidates
+                if norm_target in c[1].casefold() or c[1].casefold() in norm_target
+            ]
+            if len(matching_candidates) == 1:
+                return matching_candidates[0], None
 
-    # Disambiguate by folder_path if provided
-    if folder_path:
-        norm_target = folder_path.casefold().replace("\\", "/")
-        matching_candidates = [
-            c[0]
-            for c in candidates
-            if norm_target in c[1].casefold() or c[1].casefold() in norm_target
-        ]
-        if len(matching_candidates) == 1:
-            return matching_candidates[0], None
+        # Multiple candidates: check if bodies are identical (D-20261106-1)
+        items_only = [c[0] for c in candidates]
+        first_body = getattr(items_only[0], "Body", None) or ""
+        all_identical = all(
+            (getattr(c, "Body", None) or "") == first_body for c in items_only[1:]
+        )
+        if all_identical:
+            return items_only[0], None
 
-    # Multiple candidates: check if bodies are identical (D-20261106-1)
-    items_only = [c[0] for c in candidates]
-    first_body = getattr(items_only[0], "Body", None) or ""
-    all_identical = all(
-        (getattr(c, "Body", None) or "") == first_body for c in items_only[1:]
-    )
-    if all_identical:
-        return items_only[0], None
+        return None, "Ambiguous Message-ID: multiple differing items found in PST"
 
-    return None, "Ambiguous Message-ID: multiple differing items found in PST"
+    if unreadable_count > 0:
+        return (
+            None,
+            f"Target item not found and {unreadable_count} items "
+            "could not be read due to errors",
+        )
+
+    return None, None
 
 
 def _load_default_outlook_reader() -> Any | None:
@@ -533,11 +596,10 @@ def _find_imap_rfc822(
     try:
         wire_name = encode_mutf7(folder_path)
         client.select_folder(wire_name)
-    except (OSError, EOFError, TimeoutError) as exc:
-        return None, f"IMAP connection or transport failure: {exc}"
-    except Exception:
-        with contextlib.suppress(Exception):
-            client.select_folder("INBOX")
+    except Exception as exc:
+        return None, f"Failed to SELECT folder {folder_path!r} on IMAP server: {exc}"
+
+    unreadable_count = 0
 
     # 1. Try UID from logical_locator
     locator = str(message.get("logical_locator") or "")
@@ -548,14 +610,26 @@ def _find_imap_rfc822(
             rfc822 = client.fetch_rfc822(uid)
             if rfc822 and _verify_imap_rfc822(rfc822, message):
                 return rfc822, None
-        except (OSError, EOFError, TimeoutError) as exc:
-            return None, f"IMAP connection or transport failure: {exc}"
+        except (
+            imaplib.IMAP4.abort,
+            imaplib.IMAP4.error,
+            OSError,
+            EOFError,
+            TimeoutError,
+        ) as exc:
+            return None, f"IMAP error fetching UID {uid}: {exc}"
         except Exception:
-            pass
+            unreadable_count += 1
 
     # 2. Try Message-ID search
     db_msg_id = message.get("message_id")
     if not db_msg_id:
+        if unreadable_count > 0:
+            return (
+                None,
+                f"Target item not found and {unreadable_count} items "
+                "could not be read due to errors",
+            )
         return None, None
 
     clean_id = normalize_message_id(str(db_msg_id))
@@ -565,7 +639,9 @@ def _find_imap_rfc822(
         try:
             conn = getattr(client, "_conn", client)
             typ, data = conn.uid("SEARCH", "HEADER", "Message-ID", search_term)
-            if typ == "OK" and data and data[0]:
+            if typ != "OK":
+                return None, f"IMAP SEARCH failed with status {typ!r}: {data}"
+            if data and data[0]:
                 raw = (
                     data[0].decode("ascii", errors="replace")
                     if isinstance(data[0], bytes)
@@ -574,12 +650,24 @@ def _find_imap_rfc822(
                 raw_uids = [int(u) for u in raw.split() if u.isdigit()]
                 if raw_uids:
                     break
-        except (OSError, EOFError, TimeoutError) as exc:
-            return None, f"IMAP connection or transport failure: {exc}"
-        except Exception:
-            continue
+        except (
+            imaplib.IMAP4.abort,
+            imaplib.IMAP4.error,
+            OSError,
+            EOFError,
+            TimeoutError,
+        ) as exc:
+            return None, f"IMAP SEARCH protocol error: {exc}"
+        except Exception as exc:
+            return None, f"IMAP SEARCH failed: {exc}"
 
     if not raw_uids:
+        if unreadable_count > 0:
+            return (
+                None,
+                f"Target item not found and {unreadable_count} items "
+                "could not be read due to errors",
+            )
         return None, None
 
     candidates: list[bytes] = []
@@ -588,24 +676,40 @@ def _find_imap_rfc822(
             candidate_bytes = client.fetch_rfc822(uid)
             if candidate_bytes and _verify_imap_rfc822(candidate_bytes, message):
                 candidates.append(candidate_bytes)
-        except (OSError, EOFError, TimeoutError) as exc:
-            return None, f"IMAP connection or transport failure: {exc}"
+        except (
+            imaplib.IMAP4.abort,
+            OSError,
+            EOFError,
+            TimeoutError,
+        ) as exc:
+            return (
+                None,
+                f"IMAP abort or connection failure fetching UID {uid}: {exc}",
+            )
         except Exception:
+            unreadable_count += 1
             continue
 
-    if not candidates:
-        return None, None
+    if candidates:
+        if len(candidates) == 1:
+            return candidates[0], None
 
-    if len(candidates) == 1:
-        return candidates[0], None
+        if all(c == candidates[0] for c in candidates[1:]):
+            return candidates[0], None
 
-    if all(c == candidates[0] for c in candidates[1:]):
-        return candidates[0], None
+        return (
+            None,
+            "Ambiguous Message-ID: multiple differing messages found on IMAP server",
+        )
 
-    return (
-        None,
-        "Ambiguous Message-ID: multiple differing messages found on IMAP server",
-    )
+    if unreadable_count > 0:
+        return (
+            None,
+            f"Target item not found and {unreadable_count} items "
+            "could not be read due to errors",
+        )
+
+    return None, None
 
 
 def _load_default_imap_client(env_file: Path | None = None) -> Any | None:

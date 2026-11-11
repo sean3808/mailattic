@@ -10,6 +10,7 @@ Retrieves one stored message's original from its source:
 
 from __future__ import annotations
 
+import imaplib
 from pathlib import Path
 from typing import Any
 
@@ -824,3 +825,197 @@ def test_unsupported_outbound_source_returns_not_found(tmp_path: Path) -> None:
     assert result.subject == "Outbound Email"
     assert result.sent_at == "2026-05-01T10:00:00+08:00"
     assert "does not support original export" in (result.detail or "")
+
+
+def test_imap_search_raising_imap_error_fails(tmp_path: Path) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        uid=99999,
+        message_id="<search_err@example.com>",
+        subject="Search Err",
+    )
+    fake_conn = FakeImapConnection(rfc822_by_uid={})
+
+    def raise_search(*args: str) -> tuple[str, list[object]]:
+        if args and args[0].upper() == "SEARCH":
+            raise imaplib.IMAP4.error("SEARCH protocol failure")
+        return "OK", [b""]
+
+    fake_conn.uid = raise_search  # type: ignore[assignment]
+    imap_client = FakeImapClient(fake_conn)
+    imap_client.fetch_rfc822 = lambda uid: None  # type: ignore[assignment]
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        imap_client=imap_client,
+    )
+    assert result.status == "failed"
+    assert "SEARCH protocol failure" in (result.detail or "")
+
+
+def test_imap_fetch_raising_imap_abort_fails(tmp_path: Path) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        uid=42,
+        message_id="<abort@example.com>",
+        subject="Fetch Abort",
+    )
+    fake_conn = FakeImapConnection(rfc822_by_uid={})
+    imap_client = FakeImapClient(fake_conn)
+
+    def raise_fetch(uid: int) -> bytes:
+        raise imaplib.IMAP4.abort("socket connection broken")
+
+    imap_client.fetch_rfc822 = raise_fetch  # type: ignore[assignment]
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        imap_client=imap_client,
+    )
+    assert result.status == "failed"
+    assert "socket connection broken" in (result.detail or "")
+
+
+def test_imap_select_folder_failing_fails_without_inbox_fallback(
+    tmp_path: Path,
+) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        folder_name="Archive",
+        message_id="<select_fail@example.com>",
+        subject="Select Fail",
+    )
+    fake_conn = FakeImapConnection(rfc822_by_uid={})
+    imap_client = FakeImapClient(fake_conn)
+
+    def raise_select(folder_name: str) -> None:
+        raise imaplib.IMAP4.error(f"NO folder {folder_name} does not exist")
+
+    imap_client.select_folder = raise_select  # type: ignore[assignment]
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        imap_client=imap_client,
+    )
+    assert result.status == "failed"
+    assert "Archive" in (result.detail or "")
+    assert fake_conn.selected_folder != "INBOX"
+
+
+def test_pst_root_folder_access_raising_fails(tmp_path: Path) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        subject="Root Folder Err",
+    )
+
+    class FailingStore(FakeOutlookStore):
+        def GetRootFolder(self) -> FakeOutlookFolder:
+            raise RuntimeError("Root folder COM access error")
+
+    root = FakeOutlookFolder("Root", [])
+    store = FailingStore(pst_file, root)
+    namespace = FakeOutlookNamespace([store], items_by_id={})
+    reader = FakeOutlookReader(namespace)
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        outlook_reader=reader,
+    )
+    assert result.status == "failed"
+    assert "Root folder COM access error" in (result.detail or "")
+
+
+def test_pst_item_raising_during_scan_succeeds_if_target_found_elsewhere(
+    tmp_path: Path,
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        folder_path="Inbox",
+        entry_id="none",
+        message_id="<find_me@example.com>",
+        subject="Find Me",
+    )
+
+    corrupt_item = FakeOutlookItem("c1", "Corrupt")
+
+    def raise_corrupt(*args: object) -> object:
+        raise RuntimeError("Corrupt MAPI properties")
+
+    corrupt_item.PropertyAccessor.GetProperty = raise_corrupt  # type: ignore[assignment]
+
+    good_item = FakeOutlookItem(
+        "g1",
+        "Find Me",
+        message_id="<find_me@example.com>",
+    )
+
+    inbox = FakeOutlookFolder("Inbox", [corrupt_item, good_item])
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = FakeCollection(inbox)
+    store = FakeOutlookStore(pst_file, root)
+    namespace = FakeOutlookNamespace([store], items_by_id={})
+    reader = FakeOutlookReader(namespace)
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        outlook_reader=reader,
+    )
+    assert result.status == "exported"
+    assert result.dest_path is not None
+
+
+def test_pst_item_raising_during_scan_fails_if_target_not_found(
+    tmp_path: Path,
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        folder_path="Inbox",
+        entry_id="none",
+        message_id="<target@example.com>",
+        subject="Target",
+    )
+
+    corrupt_item = FakeOutlookItem("c1", "Corrupt")
+
+    def raise_corrupt(*args: object) -> object:
+        raise RuntimeError("Corrupt MAPI properties")
+
+    corrupt_item.PropertyAccessor.GetProperty = raise_corrupt  # type: ignore[assignment]
+
+    inbox = FakeOutlookFolder("Inbox", [corrupt_item])
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = FakeCollection(inbox)
+    store = FakeOutlookStore(pst_file, root)
+    namespace = FakeOutlookNamespace([store], items_by_id={})
+    reader = FakeOutlookReader(namespace)
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        outlook_reader=reader,
+    )
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "").lower()
