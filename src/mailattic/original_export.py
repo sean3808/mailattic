@@ -11,6 +11,7 @@ Issue #53, D-20261105-1, GLOSSARY.md:
 from __future__ import annotations
 
 import email
+import email.policy
 import imaplib
 import re
 import uuid
@@ -30,8 +31,11 @@ from .attachment_store import (
 from .mutf7 import encode_mutf7
 from .outlook_pst import (
     PR_INTERNET_MESSAGE_ID,
+    PR_SENDER_SMTP_ADDRESS,
+    _coerce_optional_text,
     _com_wall_clock_to_aware,
     _normalized_windows_path,
+    _optional_property,
 )
 from .query import (
     connect_database,
@@ -144,19 +148,28 @@ def _nothing_found(unreadable_count: int) -> tuple[None, str | None]:
     return None, None
 
 
-def _pick_unique[T](
-    candidates: Sequence[T],
-    key: Callable[[T], object],
-    ambiguity_message: str,
+def _single_match[T](
+    candidates: Sequence[T], ambiguity_message: str
 ) -> tuple[T | None, str | None]:
-    """The single candidate, or the first when all share one *key*; else the
-    ambiguity error (D-20261106-1: identical copies are one message)."""
+    """The one verified candidate; more than one is ambiguous even if they look
+    like copies (#53 ruling 5: Sean finds it by hand rather than the tool
+    guessing which copy is the original)."""
     if not candidates:
         return None, None
-    first_key = key(candidates[0])
-    if all(key(c) == first_key for c in candidates[1:]):
+    if len(candidates) == 1:
         return candidates[0], None
-    return None, ambiguity_message
+    return None, f"{ambiguity_message} ({len(candidates)} matches)"
+
+
+def _no_message_id_unresolved(where: str) -> tuple[None, str]:
+    """A message without a Message-ID whose recorded location did not give it
+    back: never searched for by subject/sender/time, never reported as
+    not_found (#53 ruling 4)."""
+    return None, (
+        f"This message has no Message-ID and its recorded {where} no longer "
+        "points to it, so it is not searched for elsewhere; find it by hand "
+        "using the subject, sender and date."
+    )
 
 
 def _verify_outlook_item(item: Any, message: Mapping[str, object]) -> bool:
@@ -187,10 +200,17 @@ def _verify_outlook_item(item: Any, message: Mapping[str, object]) -> bool:
 
     # Without a Message-ID a subject alone cannot identify a message (a reused
     # EntryID or UID can point at another message with the same subject).
-    sender = None
+    # Same sender derivation as PST ingest (OutlookComReader), so an Exchange
+    # sender compares by its SMTP address rather than never matching.
     sender_type = str(getattr(item, "SenderEmailType", None) or "").strip()
     if sender_type.casefold() == "smtp":
         sender = getattr(item, "SenderEmailAddress", None)
+    else:
+        sender = (
+            _coerce_optional_text(_optional_property(accessor, PR_SENDER_SMTP_ADDRESS))
+            if accessor
+            else None
+        )
     return _matches_without_message_id(
         message,
         subject=getattr(item, "Subject", None),
@@ -287,7 +307,8 @@ def _find_pst_folder_by_path(
     that cannot be read is counted in *tally*."""
     parts = [p.strip() for p in re.split(r"[/\\]", folder_path) if p.strip()]
     if not parts:
-        return None
+        # PST ingest records a message in the store root as "/".
+        return root_folder
     current = root_folder
     for part in parts:
         child_folders = getattr(current, "Folders", None)
@@ -355,44 +376,7 @@ def _same_folder(a: Any, b: Any) -> bool:
         return False
 
 
-def _normalized_folder_path(path: str) -> str:
-    return path.casefold().replace("\\", "/").strip("/")
-
-
-_PST_AMBIGUOUS = "Ambiguous Message-ID: multiple differing items found in PST"
-
-
-def _pst_copy_key(item: Any) -> object:
-    """What two PST items must share to count as copies of one original.
-
-    The export hands over the whole .msg, so the body alone is not enough
-    (unlike body re-derivation, D-20261106-1): headers and attachments must
-    agree too. An item whose fields cannot be read gets a key equal to nothing,
-    so it can only ever make the choice ambiguous.
-    """
-    try:
-        attachments = getattr(item, "Attachments", None)
-        attachment_keys = (
-            tuple(
-                (str(getattr(a, "FileName", "")), int(getattr(a, "Size", 0)))
-                for a in (
-                    attachments.Item(i)
-                    for i in range(1, int(getattr(attachments, "Count", 0)) + 1)
-                )
-            )
-            if attachments is not None
-            else ()
-        )
-        return (
-            getattr(item, "Subject", None) or "",
-            getattr(item, "Body", None) or "",
-            getattr(item, "HTMLBody", None) or "",
-            str(getattr(item, "SenderEmailAddress", None) or ""),
-            str(getattr(item, "SentOn", None) or ""),
-            attachment_keys,
-        )
-    except Exception:
-        return object()
+_PST_AMBIGUOUS = "Ambiguous: the message was found more than once in the PST"
 
 
 def _find_pst_item(
@@ -400,13 +384,20 @@ def _find_pst_item(
     store: Any,
     message: Mapping[str, object],
 ) -> tuple[Any | None, str | None]:
-    """Locate the target item in *store*, returning (item, error_or_ambiguity)."""
+    """Locate the target item in *store*, returning (item, error_or_ambiguity).
+
+    (None, None) — i.e. not_found — is returned only after the whole store was
+    searched with nothing unreadable; every other miss carries an error.
+    """
     logical_locator = str(message.get("logical_locator") or "").strip()
     db_msg_id = message.get("message_id")
     folder_path = str(message.get("folder_path") or "").strip()
     tally = _ScanTally()
 
-    # 1. Try logical_locator (EntryID)
+    # 1. Try logical_locator (EntryID). Outlook raises the same way for an
+    # EntryID that no longer exists (the normal case after a PST is
+    # reorganised) as for one it cannot read, so this is not counted; the
+    # searches below count real read errors.
     if logical_locator:
         try:
             store_id = getattr(store, "StoreID", None)
@@ -419,6 +410,9 @@ def _find_pst_item(
                 return candidate, None
         except Exception:
             pass
+
+    if not db_msg_id:
+        return _no_message_id_unresolved("Outlook location")
 
     try:
         root_folder = store.GetRootFolder()
@@ -439,24 +433,16 @@ def _find_pst_item(
         if target_folder is not None:
             folder_candidates = _matching_items(target_folder, message, tally)
             if folder_candidates:
-                return _pick_unique(folder_candidates, _pst_copy_key, _PST_AMBIGUOUS)
+                return _single_match(folder_candidates, _PST_AMBIGUOUS)
 
-    # 3. Fall back to scanning store by Message-ID
-    if not db_msg_id:
-        return _nothing_found(tally.unreadable)
+    # 3. Fall back to scanning the whole store by Message-ID
+    candidates: list[Any] = []
 
-    candidates: list[tuple[Any, str]] = []  # (item, folder_name)
-
-    def scan_folder(folder: Any, current_path: str, *, is_root: bool = False) -> None:
-        fname = str(getattr(folder, "Name", ""))
-        # Paths are relative to the store root, like the stored folder_path.
-        full_p = "" if is_root else "/".join(p for p in (current_path, fname) if p)
+    def scan_folder(folder: Any) -> None:
         # The folder_path pass already read this folder's Items (and found no
         # match); re-reading would count its unreadable items twice.
         if target_folder is None or not _same_folder(folder, target_folder):
-            candidates.extend(
-                (item, full_p) for item in _matching_items(folder, message, tally)
-            )
+            candidates.extend(_matching_items(folder, message, tally))
         try:
             child_folders = getattr(folder, "Folders", None)
         except Exception:
@@ -471,27 +457,18 @@ def _find_pst_item(
                 count = 0
             for i in range(1, count + 1):
                 try:
-                    scan_folder(child_folders.Item(i), full_p)
+                    scan_folder(child_folders.Item(i))
                 except Exception:
                     tally.unreadable += 1
                     continue
 
     try:
-        scan_folder(root_folder, "", is_root=True)
+        scan_folder(root_folder)
     except Exception as exc:
         return None, f"PST folder scan failed: {exc}"
 
     if candidates:
-        # Disambiguate by folder_path if provided
-        if len(candidates) > 1 and folder_path:
-            norm_target = _normalized_folder_path(folder_path)
-            matching_candidates = [
-                c[0] for c in candidates if _normalized_folder_path(c[1]) == norm_target
-            ]
-            if len(matching_candidates) == 1:
-                return matching_candidates[0], None
-
-        return _pick_unique([c[0] for c in candidates], _pst_copy_key, _PST_AMBIGUOUS)
+        return _single_match(candidates, _PST_AMBIGUOUS)
 
     return _nothing_found(tally.unreadable)
 
@@ -557,12 +534,17 @@ def export_from_pst(
     if reader is None:
         return replace(base, detail="Outlook is not running or unavailable.")
 
+    # The Outlook loader already discriminates its failures (CODING_STANDARDS
+    # A1) and raises RuntimeError only for "not running" / "pywin32 missing";
+    # any other error is an adapter defect and propagates unrelabelled.
+    # Plain attribute access: getattr() with a default would swallow an
+    # AttributeError raised inside the property and carry on with the reader.
     try:
-        namespace = getattr(reader, "namespace", reader)
-        if namespace is None:
-            raise RuntimeError("Outlook namespace is None")
-    except Exception as exc:
+        namespace = reader.namespace
+    except RuntimeError as exc:
         return replace(base, detail=f"Outlook COM is unavailable: {exc}")
+    if namespace is None:
+        return replace(base, detail="Outlook COM is unavailable: no namespace.")
 
     pst_source = str(message.get("pst_source") or "").strip()
     store, store_problem = _resolve_pst_store(namespace, pst_source)
@@ -596,29 +578,32 @@ def export_from_pst(
 
 
 def _verify_imap_rfc822(rfc822: bytes, message: Mapping[str, object]) -> bool:
-    """Verify that fetched RFC822 bytes match the stored message."""
+    """Verify that fetched RFC822 bytes match the stored message.
+
+    A parse error propagates: the caller counts it as unreadable, so it can
+    never be read as "not this message" and end as not_found.
+    """
     db_msg_id = message.get("message_id")
-    try:
-        parsed = email.message_from_bytes(rfc822)
-        raw_msg_id = parsed.get("Message-ID")
-        if db_msg_id:
-            if not raw_msg_id:
-                return False
-            return normalize_message_id(str(raw_msg_id)) == normalize_message_id(
-                str(db_msg_id)
-            )
-        try:
-            sent_at = parsedate_to_datetime(str(parsed.get("Date") or ""))
-        except (TypeError, ValueError):
-            sent_at = None
-        return _matches_without_message_id(
-            message,
-            subject=parsed.get("Subject"),
-            sender=parseaddr(str(parsed.get("From") or ""))[1],
-            sent_at=sent_at,
+    # The default policy decodes RFC 2047 words and unfolds headers, matching
+    # the decoded subject ingest stored.
+    parsed = email.message_from_bytes(rfc822, policy=email.policy.default)
+    raw_msg_id = parsed.get("Message-ID")
+    if db_msg_id:
+        if not raw_msg_id:
+            return False
+        return normalize_message_id(str(raw_msg_id)) == normalize_message_id(
+            str(db_msg_id)
         )
-    except Exception:
-        return False
+    try:
+        sent_at = parsedate_to_datetime(str(parsed.get("Date") or ""))
+    except (TypeError, ValueError):
+        sent_at = None
+    return _matches_without_message_id(
+        message,
+        subject=str(parsed.get("Subject") or ""),
+        sender=parseaddr(str(parsed.get("From") or ""))[1],
+        sent_at=sent_at,
+    )
 
 
 def _find_imap_rfc822(
@@ -658,7 +643,9 @@ def _find_imap_rfc822(
     # 2. Try Message-ID search
     db_msg_id = message.get("message_id")
     if not db_msg_id:
-        return _nothing_found(unreadable_count)
+        if unreadable_count:
+            return _nothing_found(unreadable_count)
+        return _no_message_id_unresolved("server UID")
 
     # HEADER search is a substring match, so the bare id also finds the
     # bracketed header value.
@@ -698,10 +685,9 @@ def _find_imap_rfc822(
             continue
 
     if candidates:
-        return _pick_unique(
+        return _single_match(
             candidates,
-            lambda c: c,
-            "Ambiguous Message-ID: multiple differing messages found on IMAP server",
+            "Ambiguous: the message was found more than once on the IMAP server",
         )
 
     return _nothing_found(unreadable_count)

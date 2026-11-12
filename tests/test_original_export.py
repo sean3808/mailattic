@@ -1214,7 +1214,7 @@ def test_pst_without_message_id_different_sender_is_not_exported(
         sender_email="mallory@example.com",
         sent_on=_NO_ID_SENT_WALL_CLOCK,
     )
-    assert result.status == "not_found"
+    assert result.status == "failed"  # #53 ruling 4: never not_found
     assert not any((tmp_path / "exports").glob("*.msg"))
 
 
@@ -1226,7 +1226,7 @@ def test_pst_without_message_id_different_sent_time_is_not_exported(
         sender_email="Alice@Example.com",
         sent_on=datetime(2026, 5, 10, 16, 30, 0),
     )
-    assert result.status == "not_found"
+    assert result.status == "failed"  # #53 ruling 4: never not_found
     assert not any((tmp_path / "exports").glob("*.msg"))
 
 
@@ -1236,7 +1236,7 @@ def test_pst_without_message_id_missing_sent_time_is_not_exported(
     result = _export_pst_without_message_id(
         tmp_path, sender_email="alice@example.com", sent_on=None
     )
-    assert result.status == "not_found"
+    assert result.status == "failed"  # #53 ruling 4: never not_found
 
 
 def test_pst_without_message_id_subject_sender_and_time_match_exports(
@@ -1286,7 +1286,7 @@ def test_imap_without_message_id_different_sender_is_not_exported(
         from_header="Mallory <mallory@example.com>",
         date_header="Mon, 15 Jun 2026 09:00:00 +0800",
     )
-    assert result.status == "not_found"
+    assert result.status == "failed"  # #53 ruling 4: never not_found
     assert not any((tmp_path / "exports").glob("*.eml"))
 
 
@@ -1298,7 +1298,7 @@ def test_imap_without_message_id_different_sent_time_is_not_exported(
         from_header="Charlie <charlie@example.com>",
         date_header="Mon, 15 Jun 2026 11:00:00 +0800",
     )
-    assert result.status == "not_found"
+    assert result.status == "failed"  # #53 ruling 4: never not_found
     assert not any((tmp_path / "exports").glob("*.eml"))
 
 
@@ -1310,7 +1310,7 @@ def test_imap_without_message_id_unparsable_date_is_not_exported(
         from_header="Charlie <charlie@example.com>",
         date_header="not a date",
     )
-    assert result.status == "not_found"
+    assert result.status == "failed"  # #53 ruling 4: never not_found
 
 
 def test_imap_without_message_id_subject_sender_and_time_match_exports(
@@ -1473,7 +1473,8 @@ def test_same_body_but_different_attachments_is_ambiguous(tmp_path: Path) -> Non
     assert not any((tmp_path / "exports").glob("*.msg"))
 
 
-def test_fully_identical_copies_export_one(tmp_path: Path) -> None:
+def test_fully_identical_copies_are_still_ambiguous(tmp_path: Path) -> None:
+    # #53 ruling 5: the tool never guesses which copy is the original.
     first = FakeOutlookItem("e-1", "Copy", message_id="<copy@example.com>")
     second = FakeOutlookItem("e-2", "Copy", message_id="<copy@example.com>")
     first.Attachments = FakeCollection(_FakeAttachment("quote.pdf", 1000))
@@ -1481,7 +1482,9 @@ def test_fully_identical_copies_export_one(tmp_path: Path) -> None:
 
     result = _export_two_pst_copies(tmp_path, first, second)
 
-    assert result.status == "exported"
+    assert result.status == "failed"
+    assert "Ambiguous" in (result.detail or "")
+    assert not any((tmp_path / "exports").glob("*.msg"))
 
 
 def test_two_mounted_stores_with_the_recorded_filename_fail(tmp_path: Path) -> None:
@@ -1523,17 +1526,12 @@ class _UnreadableFolders:
         raise RuntimeError("folder offline")
 
 
-def test_unreadable_folder_on_recorded_path_without_message_id_fails(
+def test_unreadable_folder_on_recorded_path_fails_instead_of_not_found(
     tmp_path: Path,
 ) -> None:
     pst_file = str(tmp_path / "archive_2024.pst")
     db_path, db_id = _seed_pst_message(
-        tmp_path,
-        pst_path=pst_file,
-        entry_id="entry-gone",
-        message_id="",
-        subject="Shared Subject",
-        sent_at=_NO_ID_SENT_AT,
+        tmp_path, pst_path=pst_file, entry_id="entry-gone"
     )
     root = FakeOutlookFolder("Root", [])
     root.Folders = _UnreadableFolders()  # type: ignore[assignment]
@@ -1548,3 +1546,186 @@ def test_unreadable_folder_on_recorded_path_without_message_id_fails(
 
     assert result.status == "failed"
     assert "could not be read" in (result.detail or "")
+
+
+# --- Route after the review cap (#53 rulings 4-5) -----------------------------
+
+
+def test_pst_without_message_id_is_not_searched_beyond_its_entry_id(
+    tmp_path: Path,
+) -> None:
+    # The stored EntryID is stale; a matching item sits in the recorded folder.
+    # Ruling 4: no search by subject/sender/time, report failed (never
+    # not_found), keep subject/sender/date for a manual search.
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        entry_id="entry-stale",
+        message_id="",
+        subject="Shared Subject",
+        sent_at=_NO_ID_SENT_AT,
+    )
+    look_alike = FakeOutlookItem(
+        "entry-other", "Shared Subject", sent_on=_NO_ID_SENT_WALL_CLOCK
+    )
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = FakeCollection(FakeOutlookFolder("Inbox", [look_alike]))
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst_file, root)])
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "failed"
+    assert "by hand" in (result.detail or "")
+    assert result.subject == "Shared Subject"
+    assert not any((tmp_path / "exports").glob("*.msg"))
+
+
+def test_pst_root_folder_message_is_found_after_entry_id_goes_stale(
+    tmp_path: Path,
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path, pst_path=pst_file, folder_path="/", entry_id="entry-stale"
+    )
+    item = FakeOutlookItem(
+        "entry-new", "PST Message Subject", message_id="<msg101@example.com>"
+    )
+    # A same-id item in a subfolder would make the store-wide scan ambiguous;
+    # the root pass must win first.
+    other = FakeOutlookItem(
+        "entry-sub", "PST Message Subject", message_id="<msg101@example.com>"
+    )
+    root = FakeOutlookFolder("Root", [item])
+    root.Folders = FakeCollection(FakeOutlookFolder("Sub", [other]))
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst_file, root)])
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "exported"
+    assert item.saved_calls
+
+
+def test_pst_without_message_id_exchange_sender_matches_by_smtp_property(
+    tmp_path: Path,
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        entry_id="entry-ex",
+        message_id="",
+        subject="Shared Subject",
+        sender_email="alice@example.com",
+        sent_at=_NO_ID_SENT_AT,
+    )
+    item = FakeOutlookItem("entry-ex", "Shared Subject", sent_on=_NO_ID_SENT_WALL_CLOCK)
+    item.SenderEmailType = "EX"
+    item.SenderEmailAddress = "/o=ExchangeLabs/ou=Exchange/cn=Recipients/cn=alice"
+    item.PropertyAccessor = FakeAccessor(
+        {"http://schemas.microsoft.com/mapi/proptag/0x5D01001E": "alice@example.com"}
+    )
+    root = FakeOutlookFolder("Root", [item])
+    namespace = FakeOutlookNamespace(
+        [FakeOutlookStore(pst_file, root)], items_by_id={"entry-ex": item}
+    )
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "exported"
+
+
+def test_imap_without_message_id_encoded_subject_matches(tmp_path: Path) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        uid=42,
+        message_id="",
+        subject="報價單 Quote",
+        sender_email="charlie@example.com",
+        sent_at="2026-06-15T09:00:00+08:00",
+    )
+    raw = (
+        b"From: Charlie <charlie@example.com>\r\n"
+        b"Subject: =?utf-8?b?5aCx5YO55Zau?= Quote\r\n"
+        b"Date: Mon, 15 Jun 2026 09:00:00 +0800\r\n"
+        b"\r\nBody"
+    )
+    client = FakeImapClient(FakeImapConnection(rfc822_by_uid={42: raw}))
+
+    result = export_original_message(
+        db_path, db_id, destination_dir=tmp_path / "exports", imap_client=client
+    )
+
+    assert result.status == "exported"
+
+
+def test_imap_message_found_twice_is_ambiguous(tmp_path: Path) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path, uid=999, message_id="<dup@example.com>"
+    )
+    raw = b"Message-ID: <dup@example.com>\r\nSubject: x\r\n\r\nBody"
+    client = FakeImapClient(
+        FakeImapConnection(
+            rfc822_by_uid={7: raw, 8: raw},
+            uids_by_header={"dup@example.com": [7, 8]},
+        )
+    )
+
+    result = export_original_message(
+        db_path, db_id, destination_dir=tmp_path / "exports", imap_client=client
+    )
+
+    assert result.status == "failed"
+    assert "Ambiguous" in (result.detail or "")
+
+
+class _RaisingReader:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    @property
+    def namespace(self) -> object:
+        raise self._exc
+
+
+def test_outlook_not_running_is_reported_as_unavailable(tmp_path: Path) -> None:
+    db_path, db_id = _seed_pst_message(tmp_path)
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=_RaisingReader(RuntimeError("Outlook is not running.")),
+    )
+
+    assert result.status == "failed"
+    assert "Outlook is not running" in (result.detail or "")
+
+
+def test_outlook_adapter_defect_is_not_relabelled_unavailable(
+    tmp_path: Path,
+) -> None:
+    db_path, db_id = _seed_pst_message(tmp_path)
+
+    with pytest.raises(AttributeError):
+        export_original_message(
+            db_path,
+            db_id,
+            destination_dir=tmp_path / "exports",
+            outlook_reader=_RaisingReader(AttributeError("adapter bug")),
+        )
