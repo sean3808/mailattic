@@ -561,10 +561,13 @@ def export_from_pst(
     if store is None:
         if store_problem:
             return replace(base, detail=store_problem)
+        # Not mounted is not "really not there" (#53 ruling 6).
         return replace(
             base,
-            status="not_found",
-            detail=f"PST source not mounted in Outlook: {pst_source}",
+            detail=(
+                f"PST source not open in Outlook: {pst_source}. Open it in "
+                "Outlook and retry."
+            ),
         )
 
     item, err = _find_pst_item(namespace, store, message)
@@ -814,10 +817,24 @@ def export_original_message(
         src_label = str(
             message.get("pst_source") or message.get("source_input_mode") or "unknown"
         )
+        input_mode = str(message.get("source_input_mode") or "").strip().casefold()
+        # #53 ruling 2: mail sent through bes reports not_found for now (its
+        # server location is not recorded; tracked separately). Every other
+        # unsupported source has no retrievable original, which is not the
+        # same as "really not there" (ruling 6), so it is failed with the reason.
+        if input_mode == "outbound" or src_label.casefold().startswith("outbound-"):
+            return replace(
+                _base_result(message, "msg", "pst"),
+                status="not_found",
+                detail=f"Source {src_label!r} does not support original export.",
+            )
         return replace(
             _base_result(message, "msg", "pst"),
-            status="not_found",
-            detail=f"Source {src_label!r} does not support original export.",
+            detail=(
+                f"Source {src_label!r} (e.g. a web-archive scrape) has no "
+                "retrievable original; find it by hand using the subject, "
+                "sender and date."
+            ),
         )
 
     fmt: Literal["msg", "eml"] = "msg" if source_type == "pst" else "eml"

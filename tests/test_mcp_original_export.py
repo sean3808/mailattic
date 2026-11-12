@@ -186,7 +186,12 @@ def test_mcp_original_export_neither_found_reports_fields(
     db_path, pst_id, _ = _seed_db(tmp_path)
     dest_dir = tmp_path / "host_exports"
 
-    namespace = FakeOutlookNamespace([], items_by_id={})
+    # Mounted and searched completely, message absent (#53 ruling 6: an
+    # unmounted PST is failed, not not_found).
+    namespace = FakeOutlookNamespace(
+        [FakeOutlookStore("C:\\mail\\archive_2024.pst", FakeOutlookFolder("Root"))],
+        items_by_id={},
+    )
     reader = FakeOutlookReader(namespace)
     from mailattic import original_export
 

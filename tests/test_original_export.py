@@ -363,8 +363,11 @@ def test_neither_found_returns_subject_sender_date_without_error(
         sent_at="2024-01-15T10:00:00+08:00",
     )
 
-    # Empty namespace with no stores matching the PST
-    namespace = FakeOutlookNamespace([], items_by_id={})
+    # The PST is mounted and searched completely; the message is not in it.
+    # (A PST that is not mounted is "failed", #53 ruling 6.)
+    namespace = FakeOutlookNamespace(
+        [FakeOutlookStore(pst_file, FakeOutlookFolder("Root"))], items_by_id={}
+    )
     reader = FakeOutlookReader(namespace)
 
     dest_dir = tmp_path / "exports"
@@ -627,7 +630,12 @@ def test_cli_export_original_neither_found(
         sender_email="vendor@example.com",
         sent_at="2026-04-01T10:00:00+08:00",
     )
-    namespace = FakeOutlookNamespace([], items_by_id={})
+    # Mounted and searched completely, message absent (#53 ruling 6: an
+    # unmounted PST is failed, not not_found).
+    namespace = FakeOutlookNamespace(
+        [FakeOutlookStore("C:/mail/archive_2024.pst", FakeOutlookFolder("Root"))],
+        items_by_id={},
+    )
     reader = FakeOutlookReader(namespace)
     monkeypatch.setattr(original_export, "_load_default_outlook_reader", lambda: reader)
 
@@ -1806,3 +1814,64 @@ def test_direct_hit_whose_identity_cannot_be_read_is_not_not_found(
 
     assert result.status == "failed"
     assert "could not be read" in (result.detail or "")
+
+
+# --- #53 ruling 6: not_found only when the message is really not there --------
+
+
+def test_pst_not_open_in_outlook_fails_with_instruction(tmp_path: Path) -> None:
+    pst_file = str(tmp_path / "missing_archive.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path, pst_path=pst_file, subject="Old Deleted Memo"
+    )
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(FakeOutlookNamespace([], items_by_id={})),
+    )
+
+    assert result.status == "failed"
+    assert "missing_archive.pst" in (result.detail or "")
+    assert "Open" in (result.detail or "")
+    assert result.subject == "Old Deleted Memo"
+
+
+def test_web_archive_message_fails_with_reason(tmp_path: Path) -> None:
+    db_path = initialize_database(tmp_path / "mail.db")
+    conn = connect_database(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO messages (subject, sender_name, sender_email, sent_at, "
+            "body_text, message_id, pst_source, folder_path, logical_locator, "
+            "source_input_mode, source_requested_from, dedup_key, dedup_basis) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "Scraped Notice",
+                "Vendor",
+                "vendor@example.com",
+                "2019-03-01T10:00:00+08:00",
+                "body",
+                "<scraped@example.com>",
+                "archive:webmail",
+                "Inbox",
+                "archive-1",
+                "archive",
+                "archive:webmail",
+                "message-id:<scraped@example.com>",
+                "message-id",
+            ),
+        )
+        conn.commit()
+        db_id = conn.execute("SELECT id FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+
+    result = export_original_message(
+        db_path, db_id, destination_dir=tmp_path / "exports"
+    )
+
+    assert result.status == "failed"
+    assert "archive" in (result.detail or "").lower()
+    assert result.subject == "Scraped Notice"

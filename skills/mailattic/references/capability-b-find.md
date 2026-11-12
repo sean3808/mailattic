@@ -289,7 +289,7 @@ bes export-original <db_id> --copy-to <dir>
 ```
 
 - When the message cannot be found in its source, it outputs the subject, sender, and sent date without raising an error.
-- Read the status before telling the user anything. `not_found` means the source was searched completely and the message is really not there. `failed` means the tool could not be sure: part of the source could not be read, the message was found more than once (the tool never guesses which copy is the original), Outlook is not running, or the mail has no Message-ID and its recorded Outlook location no longer resolves. Relay `failed` as "could not be retrieved automatically; find it by hand in Outlook using the subject, sender and date", never as "the mail does not exist".
+- Read the status before telling the user anything. `not_found` means the source was searched completely and the message is really not there. `failed` means the tool could not be sure: part of the source could not be read, the message was found more than once (the tool never guesses which copy is the original), Outlook is not running, the PST is not open in Outlook (the detail names it; open it and retry), the mail came from the archive scrape (no retrievable original), or the mail has no Message-ID and its recorded Outlook location no longer resolves. Relay `failed` as "could not be retrieved automatically; find it by hand in Outlook using the subject, sender and date", never as "the mail does not exist".
 - Mail sent through bes reports `not_found` for now (its server location is not recorded).
 - `--skip-existing`: leaves existing files untouched and skips them.
 - `--overwrite`: replaces existing files in destination directory.
