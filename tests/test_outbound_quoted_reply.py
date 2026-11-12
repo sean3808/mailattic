@@ -365,6 +365,21 @@ class TestReplyTextPipeTableRendering:
         assert html_body.index("</table>") < html_body.index("Thanks")
         assert "A | B" not in html_body
 
+    def test_header_only_table_then_blank_line_renders_zero_row_table(
+        self,
+    ) -> None:
+        # #63: a table is header + separator + zero or more body rows. Text
+        # directly under the separator stays plain ("keep when unsure", see
+        # test_mismatched_cell_counts_stay_plain_text); a blank line first
+        # makes it unambiguous.
+        reply = "A | B\n---|---\n\nThanks"
+        _, html_body = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert html_body.count("<table") == 1
+        assert html_body.count("<tr") == 1  # header only
+        assert html_body.index("</table>") < html_body.index("Thanks")
+        assert "A | B" not in html_body
+
     def test_pipeless_follow_up_text_is_escaped(self) -> None:
         reply = "A | B\n---|---\nx | y\n<i>Thanks</i> & bye"
         _, html_body = build_quoted_reply_bodies(_make_original(), reply)

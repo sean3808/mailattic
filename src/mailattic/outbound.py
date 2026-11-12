@@ -612,8 +612,11 @@ def _authored_text_to_html(text: str) -> str:
                 while j < len(lines) and "|" in lines[j]:
                     rows.append(_split_table_row(lines[j]))
                     j += 1
-                # Header+separator straight into a pipe-less text line has no
-                # body row at all: keep it as plain text rather than guess.
+                # Zero body rows is still a table (#63: "zero or more body
+                # rows") when a blank line or the end follows the separator.
+                # A non-blank pipe-less line right after it is either a body
+                # row with the wrong cell count or prose; #63 "keep when
+                # unsure" (PC-230) leaves that block as plain text.
                 bodyless = not rows and j < len(lines) and bool(lines[j].strip())
                 if not bodyless and all(len(r) == len(header) for r in rows):
                     aligns = [_align(c) for c in sep_cells]
@@ -621,7 +624,7 @@ def _authored_text_to_html(text: str) -> str:
                     parts.append(_render_pipe_table(header, aligns, rows))
                     i = j
                     continue
-                # Mismatched (or missing) body rows: the whole block stays plain text.
+                # Mismatched (or unsure) body rows: the whole block stays plain text.
                 pending.extend(lines[i:j])
                 i = j
                 continue
