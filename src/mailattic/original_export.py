@@ -438,7 +438,8 @@ def _find_pst_item(
             else namespace.GetItemFromID(entry)
         )
         if item is None:
-            return None
+            # Not opened is not "verified as another message" (ruling 3).
+            raise LookupError(f"Outlook returned no item for EntryID {entry}")
         try:
             return item if _verify_outlook_item(item, message) else None
         except Exception as exc:

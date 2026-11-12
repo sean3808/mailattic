@@ -2277,6 +2277,17 @@ def test_rejected_prefix_row_in_recorded_folder_falls_back_to_store(
     assert result.dest_path.read_bytes().endswith(b"other")
 
 
+def test_none_row_that_outlook_returns_as_nothing_is_not_not_found(
+    tmp_path: Path,
+) -> None:
+    item = _hidden_copy("ghost")
+    _, namespace, run = _table_case(tmp_path, [item])
+    namespace._items_by_id["ghost"] = None  # GetItemFromID gives None, no raise
+    result = run()
+    assert result.status == "failed"
+    assert result.dest_path is None
+
+
 def test_table_hit_without_store_id_is_confirmed(tmp_path: Path) -> None:
     _, namespace, run = _table_case(
         tmp_path, [FakeOutlookItem("a", "Target", "<target@example.com>")]
