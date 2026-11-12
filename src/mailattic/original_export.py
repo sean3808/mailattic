@@ -385,9 +385,12 @@ def _matching_entries(
                 else:
                     tally.unreadable += 1
             elif msg_id:
-                normalized = normalize_message_id(str(msg_id))
+                raw_id = str(msg_id)
+                normalized = normalize_message_id(raw_id)
+                # A table string column can be cut at 255 characters; a
+                # prefix match is only a candidate, confirmed later in full.
                 if normalized == expected or (
-                    len(str(msg_id)) >= 255 and expected.startswith(normalized)
+                    len(raw_id) >= 255 and expected.startswith(normalized)
                 ):
                     if not entry_id:
                         tally.unreadable += 1
@@ -396,17 +399,12 @@ def _matching_entries(
     return matches
 
 
-def _same_folder(a: Any, b: Any) -> bool:
-    if a is b:
-        return True
-    try:
-        entry_a = getattr(a, "EntryID", None)
-        return entry_a is not None and entry_a == getattr(b, "EntryID", None)
-    except Exception:
-        return False
-
-
 _PST_AMBIGUOUS = "Ambiguous: the message was found more than once in the PST"
+
+
+class _VerificationError(Exception):
+    """An item was opened but checking its identity raised (a read error),
+    as opposed to the EntryID lookup itself failing."""
 
 
 def _find_pst_item(
@@ -424,11 +422,12 @@ def _find_pst_item(
     folder_path = str(message.get("folder_path") or "").strip()
     tally = _ScanTally()
 
-    class VerificationError(Exception):
-        pass
+    try:
+        store_id = getattr(store, "StoreID", None)
+    except Exception:
+        store_id = None  # same fallback as a store without a StoreID
 
     def open_verified(entry: str) -> Any | None:
-        store_id = getattr(store, "StoreID", None)
         item = (
             namespace.GetItemFromID(entry, store_id)
             if store_id
@@ -439,7 +438,7 @@ def _find_pst_item(
         try:
             return item if _verify_outlook_item(item, message) else None
         except Exception as exc:
-            raise VerificationError from exc
+            raise _VerificationError from exc
 
     # 1. Try logical_locator (EntryID). Outlook raises the same way for an
     # EntryID that no longer exists (the normal case after a PST is
@@ -450,7 +449,7 @@ def _find_pst_item(
         candidate = None
         try:
             candidate = open_verified(logical_locator)
-        except VerificationError:
+        except _VerificationError:
             tally.unreadable += 1
         except Exception:
             pass
@@ -503,11 +502,25 @@ def _find_pst_item(
 
     # 3. Fall back to scanning the whole store by Message-ID
     candidates: list[str] = []
+    try:
+        target_entry = getattr(target_folder, "EntryID", None)
+    except Exception:
+        target_entry = None
+
+    def is_target(folder: Any) -> bool:
+        if target_folder is None:
+            return False
+        if folder is target_folder:
+            return True
+        try:
+            return target_entry is not None and folder.EntryID == target_entry
+        except Exception:
+            return False
 
     def scan_folder(folder: Any) -> None:
         # The folder_path pass already read this folder's table (and found no
         # match); re-reading would count its unreadable items twice.
-        if target_folder is None or not _same_folder(folder, target_folder):
+        if not is_target(folder):
             candidates.extend(_matching_entries(folder, expected, tally, missing))
         try:
             child_folders = getattr(folder, "Folders", None)
@@ -541,6 +554,8 @@ def _find_pst_item(
             item = open_verified(entry)
             if item is not None:
                 candidates.append(entry)
+                if len(candidates) > 1:
+                    break  # already ambiguous; reading the rest changes nothing
         except Exception:
             tally.unreadable += 1
     if candidates:
