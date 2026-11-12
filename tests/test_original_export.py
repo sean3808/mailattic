@@ -2142,10 +2142,11 @@ def test_truncated_table_id_requires_full_verification(
     item.table_message_id = full[:255]
     _, _, run = _table_case(tmp_path, [item], full)
     result = run()
-    assert result.status == ("exported" if match else "failed")
+    # A prefix-only row whose full Message-ID differs is not the message, and
+    # the rest of the store holds nothing else: not_found, as a full read says.
+    assert result.status == ("exported" if match else "not_found")
     if not match:
         assert result.dest_path is None
-        assert "could not be confirmed" in (result.detail or "")
 
 
 def test_fake_namespace_only_opens_emitted_rows(tmp_path: Path) -> None:
@@ -2180,6 +2181,100 @@ def test_malformed_table_row_propagates(tmp_path: Path) -> None:
     folder.GetTable = get_table
     with pytest.raises(ValueError):
         run()
+
+
+def _two_folder_case(
+    tmp_path: Path,
+    recorded_items: list[FakeOutlookItem],
+    other_items: list[FakeOutlookItem],
+    message_id: str = "<target@example.com>",
+):
+    pst = str(tmp_path / "archive.pst")
+    db, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst,
+        folder_path="Inbox",
+        entry_id="stale",
+        message_id=message_id,
+    )
+    root = FakeOutlookFolder("Root")
+    root.Folders = FakeCollection(
+        FakeOutlookFolder("Inbox", recorded_items),
+        FakeOutlookFolder("Other", other_items),
+    )
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst, root)])
+    return export_original_message(
+        db,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+
+def _hidden_copy(entry_id: str, message_id: str = "<target@example.com>"):
+    """A real copy whose Message-ID the table cannot give (shows as None)."""
+    item = FakeOutlookItem(entry_id, "Target", message_id)
+    item.table_message_id = None
+    return item
+
+
+@pytest.mark.parametrize("hidden_in", ["recorded", "other"])
+def test_copy_hidden_from_table_still_counts_toward_ambiguity(
+    tmp_path: Path, hidden_in: str
+) -> None:
+    visible = FakeOutlookItem("visible", "Target", "<target@example.com>")
+    copy = _hidden_copy("hidden")
+    if hidden_in == "recorded":
+        # Ruling 5: two matches inside the recorded folder are ambiguous.
+        result = _two_folder_case(tmp_path, [visible, copy], [])
+    else:
+        # Moved message: one table hit plus one hidden copy elsewhere.
+        result = _two_folder_case(tmp_path, [], [visible, copy])
+    assert result.status == "failed"
+    assert result.dest_path is None
+    assert "Ambiguous" in (result.detail or "")
+
+
+def test_hidden_copy_in_recorded_folder_wins_over_copy_elsewhere(
+    tmp_path: Path,
+) -> None:
+    # Ruling 5's exception: exactly one match in the recorded folder is
+    # exported even though another copy exists elsewhere in the PST.
+    result = _two_folder_case(
+        tmp_path,
+        [_hidden_copy("recorded")],
+        [FakeOutlookItem("other", "Target", "<target@example.com>")],
+    )
+    assert result.status == "exported"
+    assert result.dest_path is not None
+    assert result.dest_path.read_bytes().endswith(b"recorded")
+
+
+def test_truncated_rows_sharing_a_prefix_export_the_full_match(
+    tmp_path: Path,
+) -> None:
+    full = "<" + "a" * 260 + "@example.com>"
+    right = FakeOutlookItem("right", "Target", full)
+    wrong = FakeOutlookItem("wrong", "Target", full[:255] + "zz@example.com>")
+    right.table_message_id = wrong.table_message_id = full[:255]
+    result = _two_folder_case(tmp_path, [wrong, right], [], full)
+    assert result.status == "exported"
+    assert result.dest_path is not None
+    assert result.dest_path.read_bytes().endswith(b"right")
+
+
+def test_rejected_prefix_row_in_recorded_folder_falls_back_to_store(
+    tmp_path: Path,
+) -> None:
+    full = "<" + "a" * 260 + "@example.com>"
+    decoy = FakeOutlookItem("decoy", "Target", full[:255] + "zz@example.com>")
+    decoy.table_message_id = full[:255]
+    result = _two_folder_case(
+        tmp_path, [decoy], [FakeOutlookItem("other", "Target", full)], full
+    )
+    assert result.status == "exported"
+    assert result.dest_path is not None
+    assert result.dest_path.read_bytes().endswith(b"other")
 
 
 def test_table_hit_without_store_id_is_confirmed(tmp_path: Path) -> None:

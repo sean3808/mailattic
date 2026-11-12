@@ -355,9 +355,14 @@ _TABLE_BATCH_ROWS = 512
 
 def _matching_entries(
     folder: Any, expected: str, tally: _ScanTally, missing: list[str]
-) -> list[str]:
-    """Find matching Message-IDs in batches without opening every item."""
-    matches: list[str] = []
+) -> list[tuple[str, bool]]:
+    """Find matching Message-IDs in batches without opening every item.
+
+    Returns (EntryID, exact) pairs: exact is False for a 255-character
+    prefix match, which is only a candidate until its full Message-ID is read.
+    Rows whose Message-ID the table could not give are appended to *missing*.
+    """
+    matches: list[tuple[str, bool]] = []
     try:
         table = folder.GetTable()
         table.Columns.RemoveAll()
@@ -389,13 +394,12 @@ def _matching_entries(
                 normalized = normalize_message_id(raw_id)
                 # A table string column can be cut at 255 characters; a
                 # prefix match is only a candidate, confirmed later in full.
-                if normalized == expected or (
-                    len(raw_id) >= 255 and expected.startswith(normalized)
-                ):
+                exact = normalized == expected
+                if exact or (len(raw_id) >= 255 and expected.startswith(normalized)):
                     if not entry_id:
                         tally.unreadable += 1
                     else:
-                        matches.append(str(entry_id))
+                        matches.append((str(entry_id), exact))
     return matches
 
 
@@ -470,17 +474,43 @@ def _find_pst_item(
     if root_folder is None:
         return None, "PST root folder is unavailable"
 
-    def resolve(entries: list[str]) -> tuple[Any | None, str | None]:
-        entry, error = _single_match(entries, _PST_AMBIGUOUS)
-        if error or entry is None:
-            return None, error
-        try:
-            item = open_verified(entry)
+    unconfirmed = (None, "A matching table row was found but could not be confirmed.")
+
+    def confirm(hits: list[tuple[str, bool]]) -> list[Any] | None:
+        """Open every table hit and keep those whose full identity verifies.
+
+        A prefix-only hit whose full Message-ID differs is simply not a match.
+        An exact hit that cannot be opened, or opens as a different message,
+        contradicts the table: None (ruling 1, unsure means fail).
+        """
+        found: list[Any] = []
+        for entry, exact in hits:
+            try:
+                item = open_verified(entry)
+            except Exception:
+                return None
             if item is not None:
-                return item, None
-        except Exception:
-            pass
-        return None, "A matching table row was found but could not be confirmed."
+                found.append(item)
+            elif exact:
+                return None
+        return found
+
+    def hidden(entries: list[str], already: int) -> list[Any]:
+        """Open rows whose Message-ID the table could not give: one of them may
+        be another copy, which the uniqueness check (ruling 5) must count.
+        Stops once two matches exist in total, since that is already ambiguous."""
+        found: list[Any] = []
+        for entry in entries:
+            if already + len(found) > 1:
+                break
+            try:
+                item = open_verified(entry)
+            except Exception:
+                tally.unreadable += 1
+                continue
+            if item is not None:
+                found.append(item)
+        return found
 
     # 2. Try locating inside folder_path first
     target_folder = None
@@ -492,16 +522,27 @@ def _find_pst_item(
 
         if target_folder is not None:
             unreadable_before = tally.unreadable
-            folder_candidates = _matching_entries(
-                target_folder, expected, tally, missing
-            )
-            if folder_candidates:
-                if tally.unreadable > unreadable_before:
+            missing_before = len(missing)
+            folder_hits = _matching_entries(target_folder, expected, tally, missing)
+            # Only a table that could not be read in full blocks the export; an
+            # item that cannot be opened below is counted, as before the table
+            # read, without blocking a match found beside it.
+            table_incomplete = tally.unreadable > unreadable_before
+            # The recorded folder's unreadable-ID rows are settled here, so the
+            # whole-store pass below does not open them a second time.
+            folder_missing = missing[missing_before:]
+            del missing[missing_before:]
+            folder_found = confirm(folder_hits)
+            if folder_found is None:
+                return unconfirmed
+            folder_found += hidden(folder_missing, len(folder_found))
+            if folder_found:
+                if table_incomplete:
                     return _nothing_found(tally.unreadable)
-                return resolve(folder_candidates)
+                return _single_match(folder_found, _PST_AMBIGUOUS)
 
     # 3. Fall back to scanning the whole store by Message-ID
-    candidates: list[str] = []
+    candidates: list[tuple[str, bool]] = []
     try:
         target_entry = getattr(target_folder, "EntryID", None)
     except Exception:
@@ -546,20 +587,12 @@ def _find_pst_item(
 
     scan_folder(root_folder)
 
-    if candidates:
-        return resolve(candidates)
-
-    for entry in missing:
-        try:
-            item = open_verified(entry)
-            if item is not None:
-                candidates.append(entry)
-                if len(candidates) > 1:
-                    break  # already ambiguous; reading the rest changes nothing
-        except Exception:
-            tally.unreadable += 1
-    if candidates:
-        return resolve(candidates)
+    found = confirm(candidates)
+    if found is None:
+        return unconfirmed
+    found += hidden(missing, len(found))
+    if found:
+        return _single_match(found, _PST_AMBIGUOUS)
 
     return _nothing_found(tally.unreadable)
 
