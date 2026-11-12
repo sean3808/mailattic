@@ -1421,3 +1421,130 @@ def test_unreadable_store_with_matching_other_store_still_exports(
     )
 
     assert result.status == "exported"
+
+
+# --- Codex round 2: same body is not "same message"; same-name stores; -------
+# --- unreadable folder on the folder_path walk -------------------------------
+
+
+class _FakeAttachment:
+    def __init__(self, file_name: str, size: int) -> None:
+        self.FileName = file_name
+        self.Size = size
+
+
+def _export_two_pst_copies(
+    tmp_path: Path, first: FakeOutlookItem, second: FakeOutlookItem
+) -> Any:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        entry_id="entry-gone",
+        message_id="<copy@example.com>",
+        subject="Copy",
+    )
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = FakeCollection(
+        # Neither copy sits in the recorded folder ("Inbox"), so the
+        # store-wide Message-ID scan has to choose between them.
+        FakeOutlookFolder("Old", [first]),
+        FakeOutlookFolder("Archive", [second]),
+    )
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst_file, root)])
+    return export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+
+def test_same_body_but_different_attachments_is_ambiguous(tmp_path: Path) -> None:
+    first = FakeOutlookItem("e-1", "Copy", message_id="<copy@example.com>")
+    second = FakeOutlookItem("e-2", "Copy", message_id="<copy@example.com>")
+    first.Attachments = FakeCollection(_FakeAttachment("quote.pdf", 1000))
+    second.Attachments = FakeCollection(_FakeAttachment("other.pdf", 2000))
+
+    result = _export_two_pst_copies(tmp_path, first, second)
+
+    assert result.status == "failed"
+    assert "Ambiguous" in (result.detail or "")
+    assert not any((tmp_path / "exports").glob("*.msg"))
+
+
+def test_fully_identical_copies_export_one(tmp_path: Path) -> None:
+    first = FakeOutlookItem("e-1", "Copy", message_id="<copy@example.com>")
+    second = FakeOutlookItem("e-2", "Copy", message_id="<copy@example.com>")
+    first.Attachments = FakeCollection(_FakeAttachment("quote.pdf", 1000))
+    second.Attachments = FakeCollection(_FakeAttachment("quote.pdf", 1000))
+
+    result = _export_two_pst_copies(tmp_path, first, second)
+
+    assert result.status == "exported"
+
+
+def test_two_mounted_stores_with_the_recorded_filename_fail(tmp_path: Path) -> None:
+    recorded = str(tmp_path / "old" / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path, pst_path=recorded, entry_id="entry-gone"
+    )
+    item = FakeOutlookItem(
+        "e-x", "PST Message Subject", message_id="<msg101@example.com>"
+    )
+    namespace = FakeOutlookNamespace(
+        [
+            FakeOutlookStore(
+                str(tmp_path / "a" / "archive_2024.pst"), FakeOutlookFolder("Root")
+            ),
+            FakeOutlookStore(
+                str(tmp_path / "b" / "archive_2024.pst"),
+                FakeOutlookFolder("Root", [item]),
+            ),
+        ]
+    )
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "failed"
+    assert "2" in (result.detail or "")
+    assert not any((tmp_path / "exports").glob("*.msg"))
+
+
+class _UnreadableFolders:
+    Count = 1
+
+    def Item(self, index: int) -> object:  # noqa: N802
+        raise RuntimeError("folder offline")
+
+
+def test_unreadable_folder_on_recorded_path_without_message_id_fails(
+    tmp_path: Path,
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        entry_id="entry-gone",
+        message_id="",
+        subject="Shared Subject",
+        sent_at=_NO_ID_SENT_AT,
+    )
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = _UnreadableFolders()  # type: ignore[assignment]
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst_file, root)])
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")

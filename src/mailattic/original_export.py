@@ -235,13 +235,17 @@ def _parse_aware_datetime(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
-def _resolve_pst_store(namespace: Any, pst_source: str) -> tuple[Any | None, int]:
-    """The mounted store for *pst_source* and how many stores could not be read."""
+def _resolve_pst_store(
+    namespace: Any, pst_source: str
+) -> tuple[Any | None, str | None]:
+    """The mounted store for *pst_source*, or (None, why it is a failure rather
+    than "not mounted"): stores that could not be read, or several mounted PSTs
+    sharing the recorded filename when the recorded path itself is gone."""
     expected_path = _normalized_windows_path(pst_source)
     expected_name = Path(pst_source).name.casefold()
     stores = getattr(namespace, "Stores", None)
     if stores is None:
-        return None, 0
+        return None, None
 
     entries: list[tuple[Any, str, str]] = []  # (store, normalized path, name)
     unreadable = 0
@@ -259,15 +263,28 @@ def _resolve_pst_store(namespace: Any, pst_source: str) -> tuple[Any | None, int
     # Exact normalized path match first, then filename (PST path relocated).
     for store, path, _ in entries:
         if path == expected_path:
-            return store, unreadable
-    for store, _, name in entries:
-        if name == expected_name:
-            return store, unreadable
-    return None, unreadable
+            return store, None
+    same_name = [store for store, _, name in entries if name == expected_name]
+    if len(same_name) == 1:
+        return same_name[0], None
+    if len(same_name) > 1:
+        return None, (
+            f"PST source {pst_source} is not mounted at its recorded path and "
+            f"{len(same_name)} mounted PSTs share its filename; cannot tell which"
+        )
+    if unreadable:
+        return None, (
+            f"PST source {pst_source} not found and {unreadable} "
+            f"store(s) mounted in Outlook could not be read"
+        )
+    return None, None
 
 
-def _find_pst_folder_by_path(root_folder: Any, folder_path: str) -> Any | None:
-    """Navigate Outlook folder hierarchy matching *folder_path*."""
+def _find_pst_folder_by_path(
+    root_folder: Any, folder_path: str, tally: _ScanTally
+) -> Any | None:
+    """Navigate Outlook folder hierarchy matching *folder_path*; a subfolder
+    that cannot be read is counted in *tally*."""
     parts = [p.strip() for p in re.split(r"[/\\]", folder_path) if p.strip()]
     if not parts:
         return None
@@ -285,6 +302,7 @@ def _find_pst_folder_by_path(root_folder: Any, folder_path: str) -> Any | None:
                     found = sub
                     break
             except Exception:
+                tally.unreadable += 1
                 continue
         if found is None:
             return None
@@ -344,6 +362,39 @@ def _normalized_folder_path(path: str) -> str:
 _PST_AMBIGUOUS = "Ambiguous Message-ID: multiple differing items found in PST"
 
 
+def _pst_copy_key(item: Any) -> object:
+    """What two PST items must share to count as copies of one original.
+
+    The export hands over the whole .msg, so the body alone is not enough
+    (unlike body re-derivation, D-20261106-1): headers and attachments must
+    agree too. An item whose fields cannot be read gets a key equal to nothing,
+    so it can only ever make the choice ambiguous.
+    """
+    try:
+        attachments = getattr(item, "Attachments", None)
+        attachment_keys = (
+            tuple(
+                (str(getattr(a, "FileName", "")), int(getattr(a, "Size", 0)))
+                for a in (
+                    attachments.Item(i)
+                    for i in range(1, int(getattr(attachments, "Count", 0)) + 1)
+                )
+            )
+            if attachments is not None
+            else ()
+        )
+        return (
+            getattr(item, "Subject", None) or "",
+            getattr(item, "Body", None) or "",
+            getattr(item, "HTMLBody", None) or "",
+            str(getattr(item, "SenderEmailAddress", None) or ""),
+            str(getattr(item, "SentOn", None) or ""),
+            attachment_keys,
+        )
+    except Exception:
+        return object()
+
+
 def _find_pst_item(
     namespace: Any,
     store: Any,
@@ -354,9 +405,6 @@ def _find_pst_item(
     db_msg_id = message.get("message_id")
     folder_path = str(message.get("folder_path") or "").strip()
     tally = _ScanTally()
-
-    def body_of(item: Any) -> object:
-        return getattr(item, "Body", None) or ""
 
     # 1. Try logical_locator (EntryID)
     if logical_locator:
@@ -384,14 +432,14 @@ def _find_pst_item(
     target_folder = None
     if folder_path:
         try:
-            target_folder = _find_pst_folder_by_path(root_folder, folder_path)
+            target_folder = _find_pst_folder_by_path(root_folder, folder_path, tally)
         except Exception:
             tally.unreadable += 1
 
         if target_folder is not None:
             folder_candidates = _matching_items(target_folder, message, tally)
             if folder_candidates:
-                return _pick_unique(folder_candidates, body_of, _PST_AMBIGUOUS)
+                return _pick_unique(folder_candidates, _pst_copy_key, _PST_AMBIGUOUS)
 
     # 3. Fall back to scanning store by Message-ID
     if not db_msg_id:
@@ -443,7 +491,7 @@ def _find_pst_item(
             if len(matching_candidates) == 1:
                 return matching_candidates[0], None
 
-        return _pick_unique([c[0] for c in candidates], body_of, _PST_AMBIGUOUS)
+        return _pick_unique([c[0] for c in candidates], _pst_copy_key, _PST_AMBIGUOUS)
 
     return _nothing_found(tally.unreadable)
 
@@ -517,16 +565,10 @@ def export_from_pst(
         return replace(base, detail=f"Outlook COM is unavailable: {exc}")
 
     pst_source = str(message.get("pst_source") or "").strip()
-    store, unreadable_stores = _resolve_pst_store(namespace, pst_source)
+    store, store_problem = _resolve_pst_store(namespace, pst_source)
     if store is None:
-        if unreadable_stores:
-            return replace(
-                base,
-                detail=(
-                    f"PST source {pst_source} not found and {unreadable_stores} "
-                    f"store(s) mounted in Outlook could not be read"
-                ),
-            )
+        if store_problem:
+            return replace(base, detail=store_problem)
         return replace(
             base,
             status="not_found",
