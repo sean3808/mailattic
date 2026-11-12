@@ -331,6 +331,7 @@ def _find_pst_folder_by_path(
                 tally.unreadable += 1
                 continue
         if found is None:
+            # Skip the root's display name only when no same-name child exists.
             if (
                 index == 0
                 and tally.unreadable == unreadable_before
@@ -349,8 +350,11 @@ class _ScanTally:
     unreadable: int = 0
 
 
+_TABLE_BATCH_ROWS = 512
+
+
 def _matching_entries(
-    folder: Any, message: Mapping[str, object], tally: _ScanTally
+    folder: Any, expected: str, tally: _ScanTally, missing: list[str]
 ) -> list[str]:
     """Find matching Message-IDs in batches without opening every item."""
     matches: list[str] = []
@@ -359,16 +363,36 @@ def _matching_entries(
         table.Columns.RemoveAll()
         table.Columns.Add(PR_INTERNET_MESSAGE_ID)
         table.Columns.Add("EntryID")
-        expected = normalize_message_id(str(message["message_id"]))
-        while not table.EndOfTable:
-            for msg_id, entry_id in table.GetArray(512):
-                if msg_id and normalize_message_id(str(msg_id)) == expected:
+    except Exception:
+        tally.unreadable += 1
+        return matches
+    while True:
+        try:
+            if table.EndOfTable:
+                break
+            rows = table.GetArray(_TABLE_BATCH_ROWS)
+            ended = table.EndOfTable
+        except Exception:
+            tally.unreadable += 1
+            break
+        if not rows and not ended:
+            tally.unreadable += 1
+            break
+        for msg_id, entry_id in rows:
+            if msg_id is None:
+                if entry_id:
+                    missing.append(str(entry_id))
+                else:
+                    tally.unreadable += 1
+            elif msg_id:
+                normalized = normalize_message_id(str(msg_id))
+                if normalized == expected or (
+                    len(str(msg_id)) >= 255 and expected.startswith(normalized)
+                ):
                     if not entry_id:
                         tally.unreadable += 1
                     else:
                         matches.append(str(entry_id))
-    except Exception:
-        tally.unreadable += 1
     return matches
 
 
@@ -400,6 +424,23 @@ def _find_pst_item(
     folder_path = str(message.get("folder_path") or "").strip()
     tally = _ScanTally()
 
+    class VerificationError(Exception):
+        pass
+
+    def open_verified(entry: str) -> Any | None:
+        store_id = getattr(store, "StoreID", None)
+        item = (
+            namespace.GetItemFromID(entry, store_id)
+            if store_id
+            else namespace.GetItemFromID(entry)
+        )
+        if item is None:
+            return None
+        try:
+            return item if _verify_outlook_item(item, message) else None
+        except Exception as exc:
+            raise VerificationError from exc
+
     # 1. Try logical_locator (EntryID). Outlook raises the same way for an
     # EntryID that no longer exists (the normal case after a PST is
     # reorganised) as for one it cannot read, so a failed lookup is not
@@ -408,23 +449,19 @@ def _find_pst_item(
     if logical_locator:
         candidate = None
         try:
-            store_id = getattr(store, "StoreID", None)
-            candidate = (
-                namespace.GetItemFromID(logical_locator, store_id)
-                if store_id
-                else namespace.GetItemFromID(logical_locator)
-            )
+            candidate = open_verified(logical_locator)
+        except VerificationError:
+            tally.unreadable += 1
         except Exception:
-            pass  # stale or unreadable EntryID: see the comment above
+            pass
         if candidate is not None:
-            try:
-                if _verify_outlook_item(candidate, message):
-                    return candidate, None
-            except Exception:
-                tally.unreadable += 1
+            return candidate, None
 
     if not db_msg_id:
         return _no_message_id_unresolved("Outlook location", tally.unreadable)
+
+    expected = normalize_message_id(str(db_msg_id))
+    missing: list[str] = []
 
     try:
         root_folder = store.GetRootFolder()
@@ -439,13 +476,12 @@ def _find_pst_item(
         if error or entry is None:
             return None, error
         try:
-            item = namespace.GetItemFromID(entry, store.StoreID)
-            if item is not None and _verify_outlook_item(item, message):
+            item = open_verified(entry)
+            if item is not None:
                 return item, None
         except Exception:
             pass
-        tally.unreadable += 1
-        return _nothing_found(tally.unreadable)
+        return None, "A matching table row was found but could not be confirmed."
 
     # 2. Try locating inside folder_path first
     target_folder = None
@@ -456,8 +492,13 @@ def _find_pst_item(
             tally.unreadable += 1
 
         if target_folder is not None:
-            folder_candidates = _matching_entries(target_folder, message, tally)
+            unreadable_before = tally.unreadable
+            folder_candidates = _matching_entries(
+                target_folder, expected, tally, missing
+            )
             if folder_candidates:
+                if tally.unreadable > unreadable_before:
+                    return _nothing_found(tally.unreadable)
                 return resolve(folder_candidates)
 
     # 3. Fall back to scanning the whole store by Message-ID
@@ -467,7 +508,7 @@ def _find_pst_item(
         # The folder_path pass already read this folder's table (and found no
         # match); re-reading would count its unreadable items twice.
         if target_folder is None or not _same_folder(folder, target_folder):
-            candidates.extend(_matching_entries(folder, message, tally))
+            candidates.extend(_matching_entries(folder, expected, tally, missing))
         try:
             child_folders = getattr(folder, "Folders", None)
         except Exception:
@@ -484,16 +525,24 @@ def _find_pst_item(
                 count = 0
             for i in range(1, count + 1):
                 try:
-                    scan_folder(child_folders.Item(i))
+                    child = child_folders.Item(i)
                 except Exception:
                     tally.unreadable += 1
                     continue
+                scan_folder(child)
 
-    try:
-        scan_folder(root_folder)
-    except Exception as exc:
-        return None, f"PST folder scan failed: {exc}"
+    scan_folder(root_folder)
 
+    if candidates:
+        return resolve(candidates)
+
+    for entry in missing:
+        try:
+            item = open_verified(entry)
+            if item is not None:
+                candidates.append(entry)
+        except Exception:
+            tally.unreadable += 1
     if candidates:
         return resolve(candidates)
 

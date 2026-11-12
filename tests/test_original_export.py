@@ -11,16 +11,19 @@ Retrieves one stored message's original from its source:
 from __future__ import annotations
 
 import imaplib
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from mailattic import original_export
 from mailattic.models import MaildirSource, PstSource, build_normalized_message
 from mailattic.original_export import (
     export_original_message,
 )
+from mailattic.outlook_pst import PR_INTERNET_MESSAGE_ID
 from mailattic.storage import (
     connect_database,
     initialize_database,
@@ -73,7 +76,7 @@ class FakeOutlookItem:
         self.ReceivedTime = None
         props: dict[str, object] = {}
         if message_id:
-            props["http://schemas.microsoft.com/mapi/proptag/0x1035001E"] = message_id
+            props[PR_INTERNET_MESSAGE_ID] = message_id
         self.PropertyAccessor = FakeAccessor(props)
         self.saved_calls: list[tuple[str, int]] = []
 
@@ -92,38 +95,40 @@ class FakeOutlookFolder:
     def GetTable(self):
         if self.Items is None:
             raise RuntimeError("unreadable folder")
-        return FakeTable(self._items)
+        self.table = FakeTable(self._items, self.registry)
+        return self.table
 
 
 class FakeTable:
-    def __init__(self, items):
+    def __init__(self, items, registry):
         self.items = items
+        self.registry = registry
         self.Columns = self
-        self.EndOfTable = False
+        self.EndOfTable = not items
+        self.columns = []
+        self.position = 0
+        self.calls = 0
 
     def RemoveAll(self):
-        pass
+        self.columns.clear()
 
     def Add(self, name):
-        pass
+        self.columns.append(name)
 
     def GetArray(self, count):
-        if getattr(self, "failed", False):
-            raise RuntimeError("Corrupt MAPI properties")
-        self.EndOfTable = True
+        self.calls += 1
         rows = []
-        for item in self.items:
+        for item in self.items[self.position : self.position + count]:
             try:
-                value = item.PropertyAccessor.GetProperty(
-                    "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
-                )
-            except KeyError:
-                value = None
+                value = item.PropertyAccessor.GetProperty(PR_INTERNET_MESSAGE_ID)
             except Exception:
-                self.failed = True
-                self.EndOfTable = False
-                continue
-            rows.append((value, item.EntryID))
+                value = None
+            value = getattr(item, "table_message_id", value)
+            self.registry[item.EntryID] = item
+            values = {PR_INTERNET_MESSAGE_ID: value, "EntryID": item.EntryID}
+            rows.append(tuple(values[name] for name in self.columns))
+        self.position += len(rows)
+        self.EndOfTable = self.position >= len(self.items)
         return rows
 
 
@@ -145,6 +150,17 @@ class FakeOutlookNamespace:
     ) -> None:
         self.Stores = FakeCollection(*stores)
         self._items_by_id = items_by_id or {}
+        self._emitted = {}
+
+        def attach(folder):
+            folder.registry = self._emitted
+            if folder.Folders:
+                for child in folder.Folders:
+                    attach(child)
+
+        for store in stores:
+            with suppress(Exception):
+                attach(store.GetRootFolder())
 
     def GetItemFromID(
         self, entry_id: str, store_id: str | None = None
@@ -152,24 +168,8 @@ class FakeOutlookNamespace:
         if entry_id in self._items_by_id:
             return self._items_by_id[entry_id]
 
-        def find(folder):
-            for item in folder._items:
-                if item.EntryID == entry_id:
-                    return item
-            if folder.Folders:
-                for child in folder.Folders:
-                    found = find(child)
-                    if found:
-                        return found
-            return None
-
-        for store in self.Stores:
-            try:
-                found = find(store.GetRootFolder())
-                if found:
-                    return found
-            except Exception:
-                pass
+        if entry_id in self._emitted:
+            return self._emitted[entry_id]
         raise RuntimeError(f"Item not found: {entry_id}")
 
 
@@ -2012,9 +2012,9 @@ def test_pst_bulk_lookup_cases(
     if case == "unreadable":
         other.GetTable = lambda: (_ for _ in ()).throw(RuntimeError("unreadable"))
     if case == "normalized":
-        recorded_item.PropertyAccessor._values[
-            "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
-        ] = "target@example.com"
+        recorded_item.PropertyAccessor._values[PR_INTERNET_MESSAGE_ID] = (
+            "target@example.com"
+        )
     namespace = FakeOutlookNamespace([FakeOutlookStore(pst, root)])
     if case == "verification":
         namespace._items_by_id["recorded"] = FakeOutlookItem(
@@ -2034,3 +2034,157 @@ def test_pst_bulk_lookup_cases(
         assert result.dest_path is None
         if case.startswith("ambiguous"):
             assert "Ambiguous" in (result.detail or "")
+
+
+def _table_case(
+    tmp_path: Path,
+    items: list[FakeOutlookItem],
+    message_id: str = "<target@example.com>",
+):
+    pst = str(tmp_path / "archive.pst")
+    db, db_id = _seed_pst_message(
+        tmp_path, pst_path=pst, entry_id="stale", message_id=message_id
+    )
+    folder = FakeOutlookFolder("Inbox", items)
+    root = FakeOutlookFolder("Root")
+    root.Folders = FakeCollection(folder)
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst, root)])
+
+    def run():
+        return export_original_message(
+            db,
+            db_id,
+            destination_dir=tmp_path / "exports",
+            outlook_reader=FakeOutlookReader(namespace),
+        )
+
+    return folder, namespace, run
+
+
+def test_table_columns_and_multiple_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(original_export, "_TABLE_BATCH_ROWS", 1)
+    folder, _, run = _table_case(
+        tmp_path,
+        [
+            FakeOutlookItem("a", "Other", "<other@example.com>"),
+            FakeOutlookItem("b", "Target", "<target@example.com>"),
+        ],
+    )
+    result = run()
+    assert result.status == "exported"
+    assert folder.table.columns == [PR_INTERNET_MESSAGE_ID, "EntryID"]
+    assert folder.table.position == 2
+    assert folder.table.calls == 2
+
+
+@pytest.mark.parametrize("failure", ["empty", "partial"])
+def test_recorded_table_incomplete_fails(tmp_path: Path, failure: str) -> None:
+    folder, _, run = _table_case(
+        tmp_path,
+        [
+            FakeOutlookItem("a", "Target", "<target@example.com>"),
+            FakeOutlookItem("b", "Target", "<target@example.com>"),
+        ],
+    )
+    original = folder.GetTable
+
+    def get_table():
+        table = original()
+        get_array = table.GetArray
+        calls = 0
+
+        def get_batch(count):
+            nonlocal calls
+            calls += 1
+            if failure == "empty":
+                return []
+            if calls > 1:
+                raise RuntimeError("table failure")
+            return get_array(1)
+
+        table.GetArray = get_batch
+        return table
+
+    folder.GetTable = get_table
+    result = run()
+    assert result.status == "failed"
+    assert result.dest_path is None
+
+
+@pytest.mark.parametrize("case", ["hidden", "error", "missing"])
+def test_none_table_row_fallback(tmp_path: Path, case: str) -> None:
+    item = FakeOutlookItem(
+        "a", "Target", "<target@example.com>" if case == "hidden" else None
+    )
+    item.table_message_id = None
+    if case == "error":
+
+        def fail(name):
+            raise RuntimeError("unreadable property")
+
+        item.PropertyAccessor.GetProperty = fail
+    _, _, run = _table_case(tmp_path, [item])
+    result = run()
+    assert (
+        result.status
+        == {"hidden": "exported", "error": "failed", "missing": "not_found"}[case]
+    )
+
+
+@pytest.mark.parametrize("match", [True, False])
+def test_truncated_table_id_requires_full_verification(
+    tmp_path: Path, match: bool
+) -> None:
+    full = "<" + "a" * 260 + "@example.com>"
+    item = FakeOutlookItem("a", "Target", full if match else "<wrong@example.com>")
+    item.table_message_id = full[:255]
+    _, _, run = _table_case(tmp_path, [item], full)
+    result = run()
+    assert result.status == ("exported" if match else "failed")
+    if not match:
+        assert result.dest_path is None
+        assert "could not be confirmed" in (result.detail or "")
+
+
+def test_fake_namespace_only_opens_emitted_rows(tmp_path: Path) -> None:
+    item = FakeOutlookItem("a", "Target", "<target@example.com>")
+    folder, namespace, _ = _table_case(tmp_path, [item])
+    with pytest.raises(RuntimeError):
+        namespace.GetItemFromID("a")
+    table = folder.GetTable()
+    table.Columns.RemoveAll()
+    table.Columns.Add(PR_INTERNET_MESSAGE_ID)
+    table.Columns.Add("EntryID")
+    table.GetArray(1)
+    assert namespace.GetItemFromID("a") is item
+
+
+def test_malformed_table_row_propagates(tmp_path: Path) -> None:
+    folder, _, run = _table_case(
+        tmp_path, [FakeOutlookItem("a", "Target", "<target@example.com>")]
+    )
+    original = folder.GetTable
+
+    def get_table():
+        table = original()
+
+        def malformed(count):
+            table.EndOfTable = True
+            return [("bad",)]
+
+        table.GetArray = malformed
+        return table
+
+    folder.GetTable = get_table
+    with pytest.raises(ValueError):
+        run()
+
+
+def test_table_hit_without_store_id_is_confirmed(tmp_path: Path) -> None:
+    _, namespace, run = _table_case(
+        tmp_path, [FakeOutlookItem("a", "Target", "<target@example.com>")]
+    )
+    del namespace.Stores.Item(1).StoreID
+    assert run().status == "exported"
