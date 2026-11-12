@@ -386,6 +386,37 @@ def test_native_imap_client_search_uids_after_excludes_reversed_range_endpoint(
     assert uids == []
 
 
+def test_native_imap_client_search_by_message_id_quotes_special_characters() -> None:
+    """A Message-ID holding a quote or backslash must reach the server as one
+    well-formed quoted string, never as broken IMAP syntax."""
+    sent: list[tuple[str, tuple[Any, ...]]] = []
+
+    class _RecordingConn:
+        def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+            sent.append((command, args))
+            return "OK", [b"7"]
+
+    client = NativeImapClient(_TEST_ENV, _connection=_RecordingConn())
+    uids = client.search_uids_by_message_id('<"a b"@example.com>')
+
+    assert uids == [7]
+    assert sent == [("SEARCH", ("HEADER", "Message-ID", r'"<\"a b\"@example.com>"'))]
+
+
+def test_native_imap_client_search_by_message_id_escapes_backslash() -> None:
+    sent: list[tuple[str, tuple[Any, ...]]] = []
+
+    class _RecordingConn:
+        def uid(self, command: str, *args: Any) -> tuple[str, list[Any]]:
+            sent.append((command, args))
+            return "OK", [b""]
+
+    client = NativeImapClient(_TEST_ENV, _connection=_RecordingConn())
+    client.search_uids_by_message_id(r"<a\b@example.com>")
+
+    assert sent[0][1][2] == r'"<a\\b@example.com>"'
+
+
 def test_native_imap_client_fetch_uses_body_peek() -> None:
     """Verify BODY.PEEK[] (not RFC822) is passed so \\Seen is never set (D5)."""
     conn = _MockImapConn(fetch_map={5: b"From: x\r\n\r\nbody"})

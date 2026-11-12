@@ -463,7 +463,7 @@ class NativeImapClient:
         also finds the bracketed header value. Raises ``RuntimeError`` on a
         non-OK response.
         """
-        typ, data = self._conn.uid("SEARCH", "HEADER", "Message-ID", f'"{term}"')
+        typ, data = self._conn.uid("SEARCH", "HEADER", "Message-ID", _imap_quote(term))
         if typ != "OK":
             raise RuntimeError(f"UID SEARCH failed with status {typ!r}: {data}")
         return _parse_search_uids(data)

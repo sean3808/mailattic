@@ -581,9 +581,10 @@ def _authored_text_to_html(text: str) -> str:
     """Convert agent-authored plain text to an HTML fragment.
 
     Markdown pipe tables become inline-styled ``<table>`` elements; everything
-    else is escaped with line breaks as ``<br>`` (same as :func:`_esc`).  A
-    candidate block whose separator or body rows do not match the header's cell
-    count is kept as plain text rather than guessing a column.
+    else is escaped with line breaks as ``<br>`` (same as :func:`_esc`).  A table
+    block ends at the first line without a pipe.  A candidate block whose
+    separator or body rows do not match the header's cell count is kept as plain
+    text rather than guessing a column.
     """
     lines = text.split("\n")
     parts: list[str] = []
@@ -606,16 +607,21 @@ def _authored_text_to_html(text: str) -> str:
             ):
                 j = i + 2
                 rows: list[list[str]] = []
-                while j < len(lines) and lines[j].strip():
+                # A table block ends at the first line without a pipe: such a
+                # line is never a row and renders as normal text after it.
+                while j < len(lines) and "|" in lines[j]:
                     rows.append(_split_table_row(lines[j]))
                     j += 1
-                if all(len(r) == len(header) for r in rows):
+                # Header+separator straight into a pipe-less text line has no
+                # body row at all: keep it as plain text rather than guess.
+                bodyless = not rows and j < len(lines) and bool(lines[j].strip())
+                if not bodyless and all(len(r) == len(header) for r in rows):
                     aligns = [_align(c) for c in sep_cells]
                     flush()
                     parts.append(_render_pipe_table(header, aligns, rows))
                     i = j
                     continue
-                # Mismatched body rows: the whole block stays plain text.
+                # Mismatched (or missing) body rows: the whole block stays plain text.
                 pending.extend(lines[i:j])
                 i = j
                 continue

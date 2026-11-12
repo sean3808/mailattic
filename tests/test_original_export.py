@@ -11,6 +11,7 @@ Retrieves one stored message's original from its source:
 from __future__ import annotations
 
 import imaplib
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,7 @@ class FakeOutlookItem:
         message_id: str | None = None,
         body: str = "Body text",
         sender_email: str = "sender@example.com",
+        sent_on: datetime | None = None,
     ) -> None:
         self.Class = 43
         self.EntryID = entry_id
@@ -67,7 +69,7 @@ class FakeOutlookItem:
         self.Body = body
         self.SenderEmailAddress = sender_email
         self.SenderEmailType = "SMTP"
-        self.SentOn = None
+        self.SentOn = sent_on
         self.ReceivedTime = None
         props: dict[str, object] = {}
         if message_id:
@@ -1157,6 +1159,265 @@ def test_message_id_identifier_resolves_single_stored_row(tmp_path: Path) -> Non
         "closing1@example.com",
         destination_dir=tmp_path / "exports",
         imap_client=client,
+    )
+
+    assert result.status == "exported"
+
+
+# --- No Message-ID: subject alone must never identify a message -------------
+
+_NO_ID_SENT_AT = "2026-05-10T14:30:00+08:00"
+_NO_ID_SENT_WALL_CLOCK = datetime(2026, 5, 10, 14, 30, 0)
+
+
+def _export_pst_without_message_id(
+    tmp_path: Path,
+    *,
+    sender_email: str,
+    sent_on: datetime | None,
+) -> Any:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        entry_id="entry-reused",
+        message_id="",
+        subject="Shared Subject",
+        sender_email="alice@example.com",
+        sent_at=_NO_ID_SENT_AT,
+    )
+    item = FakeOutlookItem(
+        "entry-reused",
+        "Shared Subject",
+        sender_email=sender_email,
+        sent_on=sent_on,
+    )
+    inbox = FakeOutlookFolder("Inbox", [item])
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = FakeCollection(inbox)
+    namespace = FakeOutlookNamespace(
+        [FakeOutlookStore(pst_file, root)], items_by_id={"entry-reused": item}
+    )
+    return export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+
+def test_pst_without_message_id_different_sender_is_not_exported(
+    tmp_path: Path,
+) -> None:
+    result = _export_pst_without_message_id(
+        tmp_path,
+        sender_email="mallory@example.com",
+        sent_on=_NO_ID_SENT_WALL_CLOCK,
+    )
+    assert result.status == "not_found"
+    assert not any((tmp_path / "exports").glob("*.msg"))
+
+
+def test_pst_without_message_id_different_sent_time_is_not_exported(
+    tmp_path: Path,
+) -> None:
+    result = _export_pst_without_message_id(
+        tmp_path,
+        sender_email="Alice@Example.com",
+        sent_on=datetime(2026, 5, 10, 16, 30, 0),
+    )
+    assert result.status == "not_found"
+    assert not any((tmp_path / "exports").glob("*.msg"))
+
+
+def test_pst_without_message_id_missing_sent_time_is_not_exported(
+    tmp_path: Path,
+) -> None:
+    result = _export_pst_without_message_id(
+        tmp_path, sender_email="alice@example.com", sent_on=None
+    )
+    assert result.status == "not_found"
+
+
+def test_pst_without_message_id_subject_sender_and_time_match_exports(
+    tmp_path: Path,
+) -> None:
+    result = _export_pst_without_message_id(
+        tmp_path,
+        sender_email="Alice@Example.com",
+        sent_on=datetime(2026, 5, 10, 14, 30, 30),
+    )
+    assert result.status == "exported"
+    assert result.dest_path is not None
+
+
+def _export_imap_without_message_id(
+    tmp_path: Path, *, from_header: str, date_header: str
+) -> Any:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        uid=42,
+        message_id="",
+        subject="Shared Subject",
+        sender_email="charlie@example.com",
+        sent_at="2026-06-15T09:00:00+08:00",
+    )
+    raw = (
+        f"From: {from_header}\r\n"
+        "To: sean3808@mailattic.test\r\n"
+        "Subject: Shared Subject\r\n"
+        f"Date: {date_header}\r\n"
+        "\r\nBody"
+    ).encode()
+    client = FakeImapClient(FakeImapConnection(rfc822_by_uid={42: raw}))
+    return export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        imap_client=client,
+    )
+
+
+def test_imap_without_message_id_different_sender_is_not_exported(
+    tmp_path: Path,
+) -> None:
+    result = _export_imap_without_message_id(
+        tmp_path,
+        from_header="Mallory <mallory@example.com>",
+        date_header="Mon, 15 Jun 2026 09:00:00 +0800",
+    )
+    assert result.status == "not_found"
+    assert not any((tmp_path / "exports").glob("*.eml"))
+
+
+def test_imap_without_message_id_different_sent_time_is_not_exported(
+    tmp_path: Path,
+) -> None:
+    result = _export_imap_without_message_id(
+        tmp_path,
+        from_header="Charlie <charlie@example.com>",
+        date_header="Mon, 15 Jun 2026 11:00:00 +0800",
+    )
+    assert result.status == "not_found"
+    assert not any((tmp_path / "exports").glob("*.eml"))
+
+
+def test_imap_without_message_id_unparsable_date_is_not_exported(
+    tmp_path: Path,
+) -> None:
+    result = _export_imap_without_message_id(
+        tmp_path,
+        from_header="Charlie <charlie@example.com>",
+        date_header="not a date",
+    )
+    assert result.status == "not_found"
+
+
+def test_imap_without_message_id_subject_sender_and_time_match_exports(
+    tmp_path: Path,
+) -> None:
+    result = _export_imap_without_message_id(
+        tmp_path,
+        from_header="Charlie <CHARLIE@example.com>",
+        date_header="Mon, 15 Jun 2026 01:00:00 +0000",
+    )
+    assert result.status == "exported"
+
+
+# --- Folder disambiguation is exact, not substring --------------------------
+
+
+def test_folder_disambiguation_does_not_match_prefix_sibling(
+    tmp_path: Path,
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        folder_path="Inbox/A",
+        entry_id="entry-gone",
+        message_id="<target@example.com>",
+        subject="Target",
+    )
+    old_copy = FakeOutlookItem(
+        "e-old", "Target", message_id="<target@example.com>", body="one"
+    )
+    other_copy = FakeOutlookItem(
+        "e-b", "Target", message_id="<target@example.com>", body="two"
+    )
+    inbox = FakeOutlookFolder("Inbox", [])
+    inbox.Folders = FakeCollection(
+        FakeOutlookFolder("A-old", [old_copy]),
+        FakeOutlookFolder("B", [other_copy]),
+    )
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = FakeCollection(inbox)
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst_file, root)])
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "failed"
+    assert "Ambiguous" in (result.detail or "")
+    assert not any((tmp_path / "exports").glob("*.msg"))
+
+
+# --- A store that cannot be read is not "not mounted" -----------------------
+
+
+class _UnreadableStore:
+    @property
+    def FilePath(self) -> str:  # noqa: N802
+        raise RuntimeError("store offline")
+
+
+def test_unreadable_store_with_no_match_fails_instead_of_not_found(
+    tmp_path: Path,
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(tmp_path, pst_path=pst_file)
+    namespace = FakeOutlookNamespace([_UnreadableStore()])  # type: ignore[list-item]
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "failed"
+    assert "1 store" in (result.detail or "")
+
+
+def test_unreadable_store_with_matching_other_store_still_exports(
+    tmp_path: Path,
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        entry_id="entry-ok",
+        message_id="<msg101@example.com>",
+        subject="PST Message Subject",
+    )
+    item = FakeOutlookItem(
+        "entry-ok", "PST Message Subject", message_id="<msg101@example.com>"
+    )
+    root = FakeOutlookFolder("Root", [item])
+    namespace = FakeOutlookNamespace(
+        [_UnreadableStore(), FakeOutlookStore(pst_file, root)],  # type: ignore[list-item]
+        items_by_id={"entry-ok": item},
+    )
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
     )
 
     assert result.status == "exported"

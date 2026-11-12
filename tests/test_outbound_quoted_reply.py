@@ -356,6 +356,30 @@ class TestReplyTextPipeTableRendering:
         assert "<table" not in html_body
         assert block.replace("\n", "<br>") in html_body
 
+    def test_table_ends_at_first_pipeless_line_and_text_follows(self) -> None:
+        reply = "A | B\n---|---\nx | y\nThanks"
+        _, html_body = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert html_body.count("<table") == 1
+        assert html_body.count("<tr") == 2  # header + one body row
+        assert html_body.index("</table>") < html_body.index("Thanks")
+        assert "A | B" not in html_body
+
+    def test_pipeless_follow_up_text_is_escaped(self) -> None:
+        reply = "A | B\n---|---\nx | y\n<i>Thanks</i> & bye"
+        _, html_body = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert html_body.count("<table") == 1
+        assert "&lt;i&gt;Thanks&lt;/i&gt; &amp; bye" in html_body
+        assert "<i>Thanks</i>" not in html_body
+
+    def test_wrong_count_pipe_row_after_valid_rows_stays_plain_text(self) -> None:
+        block = "A | B\n---|---\nx | y\nz | w | v"
+        _, html_body = build_quoted_reply_bodies(_make_original(), block)
+
+        assert "<table" not in html_body
+        assert block.replace("\n", "<br>") in html_body
+
     def test_quoted_original_is_not_table_rendered(self) -> None:
         original = _make_original(body_text="Item | Qty\n---|---\nPEN-100 | 4")
         _, html_body = build_quoted_reply_bodies(original, "plain reply")

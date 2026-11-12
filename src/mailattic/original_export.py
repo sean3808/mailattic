@@ -16,6 +16,8 @@ import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,6 +30,7 @@ from .attachment_store import (
 from .mutf7 import encode_mutf7
 from .outlook_pst import (
     PR_INTERNET_MESSAGE_ID,
+    _com_wall_clock_to_aware,
     _normalized_windows_path,
 )
 from .query import (
@@ -182,19 +185,66 @@ def _verify_outlook_item(item: Any, message: Mapping[str, object]) -> bool:
             str(db_msg_id)
         )
 
-    db_subject = str(message.get("subject") or "").strip()
-    item_subject = str(getattr(item, "Subject", None) or "").strip()
-    return db_subject == item_subject
+    # Without a Message-ID a subject alone cannot identify a message (a reused
+    # EntryID or UID can point at another message with the same subject).
+    sender = None
+    sender_type = str(getattr(item, "SenderEmailType", None) or "").strip()
+    if sender_type.casefold() == "smtp":
+        sender = getattr(item, "SenderEmailAddress", None)
+    return _matches_without_message_id(
+        message,
+        subject=getattr(item, "Subject", None),
+        sender=sender,
+        sent_at=_com_wall_clock_to_aware(getattr(item, "SentOn", None)),
+    )
 
 
-def _resolve_pst_store(namespace: Any, pst_source: str) -> Any | None:
+_SENT_AT_TOLERANCE_SECONDS = 60
+
+
+def _matches_without_message_id(
+    message: Mapping[str, object],
+    *,
+    subject: object,
+    sender: object,
+    sent_at: datetime | None,
+) -> bool:
+    """Identity check for a stored message that has no Message-ID: subject,
+    sender address (casefold) and sent time (within a minute) must all agree.
+    A candidate missing a sender or a usable time never matches."""
+    if str(message.get("subject") or "").strip() != str(subject or "").strip():
+        return False
+    db_sender = str(message.get("sender_email") or "").strip().casefold()
+    item_sender = str(sender or "").strip().casefold()
+    if not db_sender or db_sender != item_sender:
+        return False
+    db_sent_at = _parse_aware_datetime(message.get("sent_at"))
+    if db_sent_at is None or sent_at is None or sent_at.tzinfo is None:
+        return False
+    return abs((db_sent_at - sent_at).total_seconds()) <= _SENT_AT_TOLERANCE_SECONDS
+
+
+def _parse_aware_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value or "").strip())
+        except ValueError:
+            return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _resolve_pst_store(namespace: Any, pst_source: str) -> tuple[Any | None, int]:
+    """The mounted store for *pst_source* and how many stores could not be read."""
     expected_path = _normalized_windows_path(pst_source)
     expected_name = Path(pst_source).name.casefold()
     stores = getattr(namespace, "Stores", None)
     if stores is None:
-        return None
+        return None, 0
 
     entries: list[tuple[Any, str, str]] = []  # (store, normalized path, name)
+    unreadable = 0
     for i in range(1, int(getattr(stores, "Count", 0)) + 1):
         try:
             store = stores.Item(i)
@@ -204,16 +254,16 @@ def _resolve_pst_store(namespace: Any, pst_source: str) -> Any | None:
                     (store, _normalized_windows_path(fp), Path(fp).name.casefold())
                 )
         except Exception:
-            continue
+            unreadable += 1
 
     # Exact normalized path match first, then filename (PST path relocated).
     for store, path, _ in entries:
         if path == expected_path:
-            return store
+            return store, unreadable
     for store, _, name in entries:
         if name == expected_name:
-            return store
-    return None
+            return store, unreadable
+    return None, unreadable
 
 
 def _find_pst_folder_by_path(root_folder: Any, folder_path: str) -> Any | None:
@@ -287,6 +337,10 @@ def _same_folder(a: Any, b: Any) -> bool:
         return False
 
 
+def _normalized_folder_path(path: str) -> str:
+    return path.casefold().replace("\\", "/").strip("/")
+
+
 _PST_AMBIGUOUS = "Ambiguous Message-ID: multiple differing items found in PST"
 
 
@@ -345,9 +399,10 @@ def _find_pst_item(
 
     candidates: list[tuple[Any, str]] = []  # (item, folder_name)
 
-    def scan_folder(folder: Any, current_path: str) -> None:
+    def scan_folder(folder: Any, current_path: str, *, is_root: bool = False) -> None:
         fname = str(getattr(folder, "Name", ""))
-        full_p = f"{current_path}/{fname}" if current_path else fname
+        # Paths are relative to the store root, like the stored folder_path.
+        full_p = "" if is_root else "/".join(p for p in (current_path, fname) if p)
         # The folder_path pass already read this folder's Items (and found no
         # match); re-reading would count its unreadable items twice.
         if target_folder is None or not _same_folder(folder, target_folder):
@@ -374,18 +429,16 @@ def _find_pst_item(
                     continue
 
     try:
-        scan_folder(root_folder, "")
+        scan_folder(root_folder, "", is_root=True)
     except Exception as exc:
         return None, f"PST folder scan failed: {exc}"
 
     if candidates:
         # Disambiguate by folder_path if provided
         if len(candidates) > 1 and folder_path:
-            norm_target = folder_path.casefold().replace("\\", "/")
+            norm_target = _normalized_folder_path(folder_path)
             matching_candidates = [
-                c[0]
-                for c in candidates
-                if norm_target in c[1].casefold() or c[1].casefold() in norm_target
+                c[0] for c in candidates if _normalized_folder_path(c[1]) == norm_target
             ]
             if len(matching_candidates) == 1:
                 return matching_candidates[0], None
@@ -464,8 +517,16 @@ def export_from_pst(
         return replace(base, detail=f"Outlook COM is unavailable: {exc}")
 
     pst_source = str(message.get("pst_source") or "").strip()
-    store = _resolve_pst_store(namespace, pst_source)
+    store, unreadable_stores = _resolve_pst_store(namespace, pst_source)
     if store is None:
+        if unreadable_stores:
+            return replace(
+                base,
+                detail=(
+                    f"PST source {pst_source} not found and {unreadable_stores} "
+                    f"store(s) mounted in Outlook could not be read"
+                ),
+            )
         return replace(
             base,
             status="not_found",
@@ -504,9 +565,16 @@ def _verify_imap_rfc822(rfc822: bytes, message: Mapping[str, object]) -> bool:
             return normalize_message_id(str(raw_msg_id)) == normalize_message_id(
                 str(db_msg_id)
             )
-        db_subject = str(message.get("subject") or "").strip()
-        item_subject = str(parsed.get("Subject") or "").strip()
-        return db_subject == item_subject
+        try:
+            sent_at = parsedate_to_datetime(str(parsed.get("Date") or ""))
+        except (TypeError, ValueError):
+            sent_at = None
+        return _matches_without_message_id(
+            message,
+            subject=parsed.get("Subject"),
+            sender=parseaddr(str(parsed.get("From") or ""))[1],
+            sent_at=sent_at,
+        )
     except Exception:
         return False
 
