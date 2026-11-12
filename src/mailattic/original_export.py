@@ -10,14 +10,13 @@ Issue #53, D-20261105-1, GLOSSARY.md:
 
 from __future__ import annotations
 
-import email
-import email.policy
 import imaplib
 import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
+from email.parser import BytesHeaderParser
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -37,6 +36,7 @@ from .outlook_pst import (
     _normalized_windows_path,
     _optional_property,
 )
+from .parser import _MAIL_POLICY
 from .query import (
     connect_database,
     get_message,
@@ -161,10 +161,14 @@ def _single_match[T](
     return None, f"{ambiguity_message} ({len(candidates)} matches)"
 
 
-def _no_message_id_unresolved(where: str) -> tuple[None, str]:
+def _no_message_id_unresolved(
+    where: str, unreadable_count: int
+) -> tuple[None, str | None]:
     """A message without a Message-ID whose recorded location did not give it
     back: never searched for by subject/sender/time, never reported as
-    not_found (#53 ruling 4)."""
+    not_found (#53 ruling 4). PST and IMAP share this so they report alike."""
+    if unreadable_count:
+        return _nothing_found(unreadable_count)
     return None, (
         f"This message has no Message-ID and its recorded {where} no longer "
         "points to it, so it is not searched for elsewhere; find it by hand "
@@ -409,7 +413,7 @@ def _find_pst_item(
                 else namespace.GetItemFromID(logical_locator)
             )
         except Exception:
-            candidate = None
+            pass  # stale or unreadable EntryID: see the comment above
         if candidate is not None:
             try:
                 if _verify_outlook_item(candidate, message):
@@ -418,7 +422,7 @@ def _find_pst_item(
                 tally.unreadable += 1
 
     if not db_msg_id:
-        return _no_message_id_unresolved("Outlook location")
+        return _no_message_id_unresolved("Outlook location", tally.unreadable)
 
     try:
         root_folder = store.GetRootFolder()
@@ -590,9 +594,10 @@ def _verify_imap_rfc822(rfc822: bytes, message: Mapping[str, object]) -> bool:
     never be read as "not this message" and end as not_found.
     """
     db_msg_id = message.get("message_id")
-    # The default policy decodes RFC 2047 words and unfolds headers, matching
-    # the decoded subject ingest stored.
-    parsed = email.message_from_bytes(rfc822, policy=email.policy.default)
+    # Ingest's own policy (field-tolerant, #288) decodes RFC 2047 words and
+    # unfolds headers the same way the stored subject was decoded; only the
+    # headers are parsed, never the MIME body.
+    parsed = BytesHeaderParser(policy=_MAIL_POLICY).parsebytes(rfc822)
     raw_msg_id = parsed.get("Message-ID")
     if db_msg_id:
         if not raw_msg_id:
@@ -649,9 +654,7 @@ def _find_imap_rfc822(
     # 2. Try Message-ID search
     db_msg_id = message.get("message_id")
     if not db_msg_id:
-        if unreadable_count:
-            return _nothing_found(unreadable_count)
-        return _no_message_id_unresolved("server UID")
+        return _no_message_id_unresolved("server UID", unreadable_count)
 
     # HEADER search is a substring match, so the bare id also finds the
     # bracketed header value.
