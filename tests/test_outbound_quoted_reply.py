@@ -18,6 +18,7 @@ from mailattic.outbound import (
     build_quoted_reply_bodies,
 )
 from mailattic.outbound_commands import _handle_draft_reply
+from mailattic.parser import PLAIN_TABLE_FIDELITY_WARNING, TABLE_FIDELITY_WARNING
 from mailattic.storage import (
     connect_database,
     initialize_database,
@@ -272,6 +273,134 @@ class TestHtmlEscaping:
         _, html_body = build_quoted_reply_bodies(original, "reply")
 
         assert "<hr>" in html_body
+
+
+class TestTableFidelityWarningNotQuoted:
+    """The table fidelity warning is a note for agents reading the store, not
+    part of what the sender wrote: quoting it would send it to the recipient."""
+
+    @pytest.mark.parametrize(
+        "warning", [PLAIN_TABLE_FIDELITY_WARNING, TABLE_FIDELITY_WARNING]
+    )
+    def test_warning_line_is_dropped_but_body_is_kept(self, warning: str) -> None:
+        original = _make_original(
+            body_text=f"{warning}\nDear Sean,\nItem | Qty\nPEN-100 | 4"
+        )
+        plain, html_body = build_quoted_reply_bodies(original, "reply")
+
+        for rendered_body in (plain, html_body):
+            assert "[表格失真提示]" not in rendered_body
+            assert "Dear Sean," in rendered_body
+            assert "PEN-100 | 4" in rendered_body
+
+    def test_sender_text_quoting_the_prefix_is_kept(self) -> None:
+        # Only the exact warning lines are ours; anything else is the sender's.
+        line = "[表格失真提示] is what the archive tool shows"
+        plain, _ = build_quoted_reply_bodies(_make_original(body_text=line), "r")
+
+        assert line in plain
+
+
+class TestReplyTextPipeTableRendering:
+    """A Markdown pipe table the agent wrote in the reply text becomes an HTML
+    table; the quoted original and the plain part are never table-rendered."""
+
+    TABLE = "Item | Qty\n:---|---:\nPEN-100 | 4\nPEN-200 | 7"
+
+    def test_pipe_table_renders_one_tr_per_row_with_escaped_cells(self) -> None:
+        reply = f"Intro line\n{self.TABLE}\n\nClosing line"
+        _, html_body = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert html_body.count("<table") == 1
+        assert html_body.count("<tr") == 3
+        assert "PEN-100" in html_body
+        assert "PEN-200" in html_body
+        assert "Intro line" in html_body
+        assert "Closing line" in html_body
+        assert "Item | Qty" not in html_body
+
+    def test_border_styling_is_inline(self) -> None:
+        _, html_body = build_quoted_reply_bodies(_make_original(), self.TABLE)
+
+        assert "<style" not in html_body
+        assert "border-collapse: collapse" in html_body
+        assert "border: 1px solid" in html_body
+        assert "<td style=" in html_body
+        assert "<th style=" in html_body
+
+    def test_markup_in_a_cell_is_escaped(self) -> None:
+        _, html_body = build_quoted_reply_bodies(
+            _make_original(), "A | B\n---|---\n<b>x</b> | y"
+        )
+
+        assert "&lt;b&gt;x&lt;/b&gt;" in html_body
+        assert "<b>x</b>" not in html_body
+
+    def test_plain_part_keeps_source_text(self) -> None:
+        reply = f"Intro\n{self.TABLE}"
+        plain, _ = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert plain.startswith(reply + "\n\n")
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            "A | B\n---|---|---\nx | y",  # separator wider than header
+            "A | B\n---|---\nx | y | z",  # body row wider than header
+            "A | B\n---|---\nx",  # body row narrower than header
+        ],
+    )
+    def test_mismatched_cell_counts_stay_plain_text(self, block: str) -> None:
+        _, html_body = build_quoted_reply_bodies(_make_original(), block)
+
+        assert "<table" not in html_body
+        assert block.replace("\n", "<br>") in html_body
+
+    def test_table_ends_at_first_pipeless_line_and_text_follows(self) -> None:
+        reply = "A | B\n---|---\nx | y\nThanks"
+        _, html_body = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert html_body.count("<table") == 1
+        assert html_body.count("<tr") == 2  # header + one body row
+        assert html_body.index("</table>") < html_body.index("Thanks")
+        assert "A | B" not in html_body
+
+    def test_header_only_table_then_blank_line_renders_zero_row_table(
+        self,
+    ) -> None:
+        # #63: a table is header + separator + zero or more body rows. Text
+        # directly under the separator stays plain ("keep when unsure", see
+        # test_mismatched_cell_counts_stay_plain_text); a blank line first
+        # makes it unambiguous.
+        reply = "A | B\n---|---\n\nThanks"
+        _, html_body = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert html_body.count("<table") == 1
+        assert html_body.count("<tr") == 1  # header only
+        assert html_body.index("</table>") < html_body.index("Thanks")
+        assert "A | B" not in html_body
+
+    def test_pipeless_follow_up_text_is_escaped(self) -> None:
+        reply = "A | B\n---|---\nx | y\n<i>Thanks</i> & bye"
+        _, html_body = build_quoted_reply_bodies(_make_original(), reply)
+
+        assert html_body.count("<table") == 1
+        assert "&lt;i&gt;Thanks&lt;/i&gt; &amp; bye" in html_body
+        assert "<i>Thanks</i>" not in html_body
+
+    def test_wrong_count_pipe_row_after_valid_rows_stays_plain_text(self) -> None:
+        block = "A | B\n---|---\nx | y\nz | w | v"
+        _, html_body = build_quoted_reply_bodies(_make_original(), block)
+
+        assert "<table" not in html_body
+        assert block.replace("\n", "<br>") in html_body
+
+    def test_quoted_original_is_not_table_rendered(self) -> None:
+        original = _make_original(body_text="Item | Qty\n---|---\nPEN-100 | 4")
+        _, html_body = build_quoted_reply_bodies(original, "plain reply")
+
+        assert "<table" not in html_body
+        assert "Item | Qty<br>---|---<br>PEN-100 | 4" in html_body
 
 
 # ---------------------------------------------------------------------------

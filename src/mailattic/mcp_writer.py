@@ -37,6 +37,10 @@ from .attachment_store import (
     resolve_store_root,
 )
 from .imap_runtime import load_env_file
+from .original_export import (
+    OriginalExportResult,
+    export_original_message,
+)
 from .outbound import (
     ENV_VAR_SMTP_ENV_FILE,
     DraftNewResult,
@@ -227,6 +231,19 @@ class MailWriter:
         ``skipped-blocked-type``; its payload is not read and nothing is
         written for it (#205).
         """
+        resolved = self._guarded_destination(destination_dir)
+        return export_attachments(
+            attachment_rows=list(attachment_rows),
+            store_root=self.attachment_root,
+            destination_dir=resolved,
+            skip_existing=True,
+            verify_content_hash=True,
+            refuse_filename=_refuse_runnable_filename,
+        ).items
+
+    def _guarded_destination(self, destination_dir: Path) -> Path:
+        """Resolve and create *destination_dir*, refusing the attachment store
+        and folders whose files open by themselves (``ValueError``)."""
         resolved = destination_dir.expanduser().resolve()
         in_store = ValueError(
             "it is inside the attachment store, which this tool never "
@@ -245,14 +262,30 @@ class MailWriter:
                 "(Startup, an Office startup folder, or Office Templates/"
                 "Addins). Choose an ordinary folder."
             )
-        return export_attachments(
-            attachment_rows=list(attachment_rows),
-            store_root=self.attachment_root,
+        return resolved
+
+    def export_original(
+        self,
+        message: Mapping[str, object],
+        destination_dir: Path,
+        *,
+        outlook_reader: Any | None = None,
+        imap_client: Any | None = None,
+        env_file: Path | None = None,
+    ) -> OriginalExportResult:
+        """Export original message (.msg for PST, .eml for IMAP) to destination."""
+        resolved = self._guarded_destination(destination_dir)
+        return export_original_message(
+            database_path=self.database_path,
+            identifier=int(message["id"]),
             destination_dir=resolved,
             skip_existing=True,
-            verify_content_hash=True,
+            outlook_reader=outlook_reader,
+            imap_client=imap_client,
+            env_file=env_file,
             refuse_filename=_refuse_runnable_filename,
-        ).items
+            message=message,
+        )
 
     def _resolve_sender_and_env(self) -> tuple[Mapping[str, str], str]:
         # #268 (overturns #189's "settings load only at send time"): From is

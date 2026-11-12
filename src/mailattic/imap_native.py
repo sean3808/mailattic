@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from .imap_runtime import SyncExecutionResult, _append_sync_log, resolve_imap_security
 from .imap_state import ImapSyncState
@@ -445,15 +446,7 @@ class NativeImapClient:
             typ, data = self._conn.uid("SEARCH", f"UID {watermark + 1}:*")
         if typ != "OK":
             raise RuntimeError("UID SEARCH failed")
-        raw = data[0] if data and data[0] else b""
-        uid_str = (
-            raw.decode("ascii", errors="replace")
-            if isinstance(raw, bytes)
-            else str(raw)
-        ).strip()
-        if not uid_str:
-            return []
-        uids = sorted(int(u) for u in uid_str.split() if u.isdigit())
+        uids = _parse_search_uids(data)
         # RFC 9051 section 6.4.9: a "watermark+1:*" range has its endpoints
         # reversed when watermark+1 exceeds the mailbox's current max UID, so
         # the server may legally answer with a UID at or below the watermark.
@@ -462,6 +455,18 @@ class NativeImapClient:
         if watermark is not None:
             uids = [u for u in uids if u > watermark]
         return uids
+
+    def search_uids_by_message_id(self, term: str) -> list[int]:
+        """Return UIDs in the selected folder whose Message-ID header contains *term*.
+
+        HEADER search is a substring match, so the bare id (no angle brackets)
+        also finds the bracketed header value. Raises ``RuntimeError`` on a
+        non-OK response.
+        """
+        typ, data = self._conn.uid("SEARCH", "HEADER", "Message-ID", _imap_quote(term))
+        if typ != "OK":
+            raise RuntimeError(f"UID SEARCH failed with status {typ!r}: {data}")
+        return _parse_search_uids(data)
 
     def fetch_rfc822(self, uid: int) -> bytes:
         """Fetch RFC822 body using BODY.PEEK[] to avoid setting \\Seen (D5)."""
@@ -494,6 +499,15 @@ class NativeImapClient:
         for method in (self._conn.close, self._conn.logout):
             with contextlib.suppress(Exception):
                 method()
+
+
+def _parse_search_uids(data: Any) -> list[int]:
+    """Sorted UIDs from the first line of a UID SEARCH response."""
+    raw = data[0] if data and data[0] else b""
+    uid_str = (
+        raw.decode("ascii", errors="replace") if isinstance(raw, bytes) else str(raw)
+    ).strip()
+    return sorted(int(u) for u in uid_str.split() if u.isdigit())
 
 
 def _imap_quote(folder_name: str) -> str:

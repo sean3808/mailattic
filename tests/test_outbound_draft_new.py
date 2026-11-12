@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import email
 from datetime import UTC, datetime
+from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -441,3 +443,61 @@ def test_send_batch_accepts_new_thread_draft_alongside_reply_draft(
     batch_stdout = capsys.readouterr().out
     assert f"Sent: draft_id={reply_draft_id}" in batch_stdout
     assert f"Sent: draft_id={new_draft_id}" in batch_stdout
+
+
+def _draft_new_html_part(tmp_path: Path, body: str) -> tuple[str, str]:
+    db_path = initialize_database(tmp_path / "test.db")
+    _seed_recipient_history(db_path)
+    env_file = _write_smtp_env(tmp_path)
+    body_file = tmp_path / "body.txt"
+    body_file.write_text(body, encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "draft-new",
+            "--to",
+            "Alice <known_to@example.com>",
+            "--subject",
+            "Table draft",
+            "--body-from",
+            str(body_file),
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(env_file),
+        ]
+    )
+    assert _handle_draft_new(args) == 0
+    (draft_path,) = (tmp_path / "outbound" / "drafts").glob("*.eml")
+    parsed = email.message_from_bytes(draft_path.read_bytes(), policy=policy.default)
+    plain = parsed.get_body(preferencelist=("plain",))
+    html_part = parsed.get_body(preferencelist=("html",))
+    assert plain is not None and html_part is not None
+    crlf, lf = chr(13) + chr(10), chr(10)
+    return (
+        plain.get_content().replace(crlf, lf),
+        html_part.get_content().replace(crlf, lf),
+    )
+
+
+def test_draft_new_body_pipe_table_renders_as_html_table(tmp_path: Path) -> None:
+    body = "Hello\nItem | Qty\n:---:|---:\nPEN-100 | 4\n<b>x</b> | 7\n\nBye"
+
+    plain, html_body = _draft_new_html_part(tmp_path, body)
+
+    assert plain.rstrip("\n") == body
+    assert html_body.count("<table") == 1
+    assert html_body.count("<tr") == 3
+    assert "border: 1px solid" in html_body
+    assert "<style" not in html_body
+    assert "&lt;b&gt;x&lt;/b&gt;" in html_body
+    assert "PEN-100" in html_body
+
+
+def test_draft_new_body_mismatched_table_stays_plain_text(tmp_path: Path) -> None:
+    body = "Item | Qty\n---|---\nPEN-100"
+
+    plain, html_body = _draft_new_html_part(tmp_path, body)
+
+    assert plain.rstrip("\n") == body
+    assert "<table" not in html_body
+    assert "Item | Qty<br>---|---<br>PEN-100" in html_body

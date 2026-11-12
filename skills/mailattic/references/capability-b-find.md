@@ -280,6 +280,21 @@ bes thread <db_id> --format text
 
 `--format text` does the HTML cleaning through `query.render_text()`. Multiple mails are separated by `--- (N of M, msg-id=...) ---`.
 
+### Original export (`bes export-original`)
+
+When reading a mail with a table fidelity warning, or when the user needs to inspect the original layout/formatting in Outlook, use `bes export-original` to retrieve the original file from its source (PST via Outlook COM saved as `.msg`, or mail server via IMAP saved as `.eml`):
+
+```bash
+bes export-original <db_id> --copy-to <dir>
+```
+
+- When the message cannot be found in its source, it outputs the subject, sender, and sent date without raising an error.
+- Read the status before telling the user anything. `not_found` means the source was searched completely and the message is really not there. `failed` means the tool could not be sure: part of the source could not be read, the message was found more than once (the tool never guesses which copy is the original), Outlook is not running, the PST is not open in Outlook (the detail names it; open it and retry), the mail came from the archive scrape (no retrievable original), or the mail has no Message-ID and its recorded Outlook location no longer resolves. Relay `failed` as "could not be retrieved automatically; find it by hand in Outlook using the subject, sender and date", never as "the mail does not exist".
+- Mail sent through bes reports `not_found` for now (its server location is not recorded).
+- `--skip-existing`: leaves existing files untouched and skips them.
+- `--overwrite`: replaces existing files in destination directory.
+- `--json`: outputs machine-readable JSON outcome.
+
 ## Attachment-first search / export (`bes attachments`)
 
 When the user's memory anchor is "that PDF / attachment file name / language version" rather than the mail subject, go straight to the attachment surface; do not search message-first and then page through attachments by hand:

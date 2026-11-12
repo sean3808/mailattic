@@ -1570,6 +1570,7 @@ class McpServerTests(unittest.TestCase):
                 "mail_attachments",
                 "mail_sync_status",
                 "mail_attachment_export",
+                "mail_original_export",
                 "mail_draft_reply",
                 "mail_draft_new",
                 "mail_send",
@@ -1800,6 +1801,7 @@ class McpServerTests(unittest.TestCase):
                     name
                     not in {
                         "mail_attachment_export",
+                        "mail_original_export",
                         "mail_draft_reply",
                         "mail_draft_new",
                         "mail_send",

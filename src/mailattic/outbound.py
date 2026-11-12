@@ -65,7 +65,7 @@ from .models import (
     NormalizedMessage,
 )
 from .mutf7 import encode_mutf7
-from .parser import subject_from_raw_headers
+from .parser import strip_table_fidelity_warnings, subject_from_raw_headers
 from .query import (
     RecipientFamiliarity,
     check_recipient_familiarity,
@@ -538,6 +538,102 @@ def _esc(s: str) -> str:
     return html.escape(s).replace("\n", "<br>")
 
 
+_TABLE_SEPARATOR_CELL = re.compile(r"^:?-+:?$")
+_TABLE_CELL_BORDER = "border: 1px solid #808080; padding: 4px 8px;"
+
+
+def _split_table_row(line: str) -> list[str]:
+    """Split a pipe-table row into stripped cells (outer pipes optional)."""
+    stripped = line.strip()
+    stripped = stripped.removeprefix("|").removesuffix("|")
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _align(separator_cell: str) -> str:
+    """CSS text-align for a pipe-table separator cell ("" for the default)."""
+    if separator_cell.startswith(":") and separator_cell.endswith(":"):
+        return "center"
+    return "right" if separator_cell.endswith(":") else ""
+
+
+def _render_pipe_table(
+    header: list[str], aligns: list[str], rows: list[list[str]]
+) -> str:
+    def cell(tag: str, text: str, align: str) -> str:
+        align_css = f" text-align: {align};" if align else ""
+        return (
+            f'<{tag} style="{_TABLE_CELL_BORDER}{align_css}">'
+            f"{html.escape(text)}</{tag}>"
+        )
+
+    def row(tag: str, cells: list[str]) -> str:
+        inner = "".join(cell(tag, c, a) for c, a in zip(cells, aligns, strict=True))
+        return f"<tr>{inner}</tr>"
+
+    body = "".join(row("td", r) for r in rows)
+    return (
+        '<table style="border-collapse: collapse; border: 1px solid #808080;">'
+        f"{row('th', header)}{body}</table>"
+    )
+
+
+def _authored_text_to_html(text: str) -> str:
+    """Convert agent-authored plain text to an HTML fragment.
+
+    Markdown pipe tables become inline-styled ``<table>`` elements; everything
+    else is escaped with line breaks as ``<br>`` (same as :func:`_esc`).  A table
+    block ends at the first line without a pipe.  A candidate block whose
+    separator or body rows do not match the header's cell count is kept as plain
+    text rather than guessing a column.
+    """
+    lines = text.split("\n")
+    parts: list[str] = []
+    pending: list[str] = []
+
+    def flush() -> None:
+        if pending:
+            parts.append(_esc("\n".join(pending)))
+            pending.clear()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        sep = lines[i + 1] if i + 1 < len(lines) else ""
+        if "|" in line and "|" in sep:
+            header = _split_table_row(line)
+            sep_cells = _split_table_row(sep)
+            if len(sep_cells) == len(header) and all(
+                _TABLE_SEPARATOR_CELL.match(c) for c in sep_cells
+            ):
+                j = i + 2
+                rows: list[list[str]] = []
+                # A table block ends at the first line without a pipe: such a
+                # line is never a row and renders as normal text after it.
+                while j < len(lines) and "|" in lines[j]:
+                    rows.append(_split_table_row(lines[j]))
+                    j += 1
+                # Zero body rows is still a table (#63: "zero or more body
+                # rows") when a blank line or the end follows the separator.
+                # A non-blank pipe-less line right after it is either a body
+                # row with the wrong cell count or prose; #63 "keep when
+                # unsure" (PC-230) leaves that block as plain text.
+                bodyless = not rows and j < len(lines) and bool(lines[j].strip())
+                if not bodyless and all(len(r) == len(header) for r in rows):
+                    aligns = [_align(c) for c in sep_cells]
+                    flush()
+                    parts.append(_render_pipe_table(header, aligns, rows))
+                    i = j
+                    continue
+                # Mismatched (or unsure) body rows: the whole block stays plain text.
+                pending.extend(lines[i:j])
+                i = j
+                continue
+        pending.append(line)
+        i += 1
+    flush()
+    return "".join(parts)
+
+
 def build_quoted_reply_bodies(
     original: dict[str, object],
     reply_text: str,
@@ -580,6 +676,10 @@ def build_quoted_reply_bodies(
     # Same cleaner as the display path, so style text already stored in an
     # older body is not quoted back to the recipient (#294).
     body_text_val = render_text(str(original.get("body_text") or ""))
+    # The table fidelity warning is a note to agents reading the store, not
+    # sender text; quoting it would mail it to the recipient. Exact lines only,
+    # so sender text that merely mentions the prefix is kept.
+    body_text_val = strip_table_fidelity_warnings(body_text_val)
 
     # Plain-text body: reply + separator line + header block + original body
     separator = "_" * 32
@@ -605,7 +705,7 @@ def build_quoted_reply_bodies(
     # HTML body: escaped reply + quoted block div with <hr> separator and <b> labels
     cc_row = f"<b>Cc:</b> {_esc(cc_val)}<br>\n" if cc_val else ""
     html_body = (
-        _esc(reply_text)
+        _authored_text_to_html(reply_text)
         + "\n<div>\n<hr>\n"
         + f"<b>From:</b> {_esc(from_val)}<br>\n"
         + f"<b>Sent:</b> {_esc(sent_val)}<br>\n"
@@ -1270,7 +1370,7 @@ def assemble_draft_new(
     msg["Date"] = formatdate(localtime=True)
 
     plain_body = body_text
-    html_body = _esc(plain_body)
+    html_body = _authored_text_to_html(plain_body)
     if font_style:
         html_body = f'<div style="{font_style}">\n{html_body}\n</div>'
 
