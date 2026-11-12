@@ -808,7 +808,12 @@ def _handle_export_original(args: argparse.Namespace) -> int:
         print(f"Date:    {result.sent_at}")
         return 0
 
+    # Same three fields as not_found: a failed export is often one Sean has to
+    # find by hand in Outlook (#53 ruling 4).
     print(f"Export failed: {result.detail}", file=sys.stderr)
+    print(f"Subject: {result.subject}", file=sys.stderr)
+    print(f"Sender:  {result.sender}", file=sys.stderr)
+    print(f"Date:    {result.sent_at}", file=sys.stderr)
     return 1
 
 

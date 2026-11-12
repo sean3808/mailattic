@@ -1729,3 +1729,80 @@ def test_outlook_adapter_defect_is_not_relabelled_unavailable(
             destination_dir=tmp_path / "exports",
             outlook_reader=_RaisingReader(AttributeError("adapter bug")),
         )
+
+
+# --- Review after route change -----------------------------------------------
+
+
+def test_cli_export_original_failed_prints_subject_sender_and_date(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mailattic import original_export
+    from mailattic.cli import main
+
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst_file,
+        entry_id="entry-stale",
+        message_id="",
+        subject="Missing Quotation",
+        sender_email="vendor@example.com",
+        sent_at="2026-04-01T10:00:00+08:00",
+    )
+    reader = FakeOutlookReader(
+        FakeOutlookNamespace([FakeOutlookStore(pst_file, FakeOutlookFolder("Root"))])
+    )
+    monkeypatch.setattr(original_export, "_load_default_outlook_reader", lambda: reader)
+
+    exit_code = main(
+        [
+            "export-original",
+            str(db_id),
+            "--database",
+            str(db_path),
+            "--copy-to",
+            str(tmp_path / "cli_exports"),
+        ]
+    )
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "Export failed" in err
+    assert "Missing Quotation" in err
+    assert "vendor@example.com" in err
+    assert "2026-04-01T10:00:00+08:00" in err
+
+
+class _BrokenIdentityAccessor:
+    def GetProperty(self, name: str) -> object:  # noqa: N802
+        raise RuntimeError("property store offline")
+
+
+def test_direct_hit_whose_identity_cannot_be_read_is_not_not_found(
+    tmp_path: Path,
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path, pst_path=pst_file, entry_id="entry-unreadable"
+    )
+    item = FakeOutlookItem("entry-unreadable", "PST Message Subject")
+    item.PropertyAccessor = _BrokenIdentityAccessor()  # type: ignore[assignment]
+    # The item is not in any folder the scan reaches, so only the direct hit
+    # saw it; its read error must still keep the result away from not_found.
+    namespace = FakeOutlookNamespace(
+        [FakeOutlookStore(pst_file, FakeOutlookFolder("Root"))],
+        items_by_id={"entry-unreadable": item},
+    )
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")

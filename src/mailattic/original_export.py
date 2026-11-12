@@ -396,9 +396,11 @@ def _find_pst_item(
 
     # 1. Try logical_locator (EntryID). Outlook raises the same way for an
     # EntryID that no longer exists (the normal case after a PST is
-    # reorganised) as for one it cannot read, so this is not counted; the
-    # searches below count real read errors.
+    # reorganised) as for one it cannot read, so a failed lookup is not
+    # counted; the searches below count real read errors. An item that was
+    # returned but cannot be verified is a real read error and is counted.
     if logical_locator:
+        candidate = None
         try:
             store_id = getattr(store, "StoreID", None)
             candidate = (
@@ -406,10 +408,14 @@ def _find_pst_item(
                 if store_id
                 else namespace.GetItemFromID(logical_locator)
             )
-            if candidate is not None and _verify_outlook_item(candidate, message):
-                return candidate, None
         except Exception:
-            pass
+            candidate = None
+        if candidate is not None:
+            try:
+                if _verify_outlook_item(candidate, message):
+                    return candidate, None
+            except Exception:
+                tally.unreadable += 1
 
     if not db_msg_id:
         return _no_message_id_unresolved("Outlook location")
