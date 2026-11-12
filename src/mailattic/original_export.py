@@ -353,6 +353,9 @@ def _matching_items(
         tally.unreadable += 1
         return []
     if items is None:
+        # A real Outlook folder always has an Items collection (possibly
+        # empty); a missing one means the folder was not looked at.
+        tally.unreadable += 1
         return []
     try:
         count = int(getattr(items, "Count", 0))
@@ -456,10 +459,12 @@ def _find_pst_item(
         try:
             child_folders = getattr(folder, "Folders", None)
         except Exception:
-            tally.unreadable += 1
             child_folders = None
-
-        if child_folders is not None:
+        if child_folders is None:
+            # Same as Items: a missing Folders collection means the subtree
+            # was not searched, so the scan is incomplete.
+            tally.unreadable += 1
+        else:
             try:
                 count = int(getattr(child_folders, "Count", 0))
             except Exception:

@@ -272,3 +272,58 @@ def test_mcp_original_export_refuses_rfc_message_id(tmp_path: Path) -> None:
             )
         )
     assert "not a valid stored id" in str(exc_info.value)
+
+
+def test_mcp_original_export_huge_subject_still_reports_written_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The file is written before the response is assembled; an oversized
+    # stored subject must be capped in the response, not turn a completed
+    # export into a tool error that hides the written path.
+    import sqlite3
+
+    db_path, pst_id, _ = _seed_db(tmp_path)
+    huge_subject = "Q" * 200_000
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE messages SET subject = ? WHERE id = ?", (huge_subject, pst_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    fake_item = FakeOutlookItem(
+        entry_id="entry-pst-1",
+        subject=huge_subject,
+        message_id="<pst_quote@example.com>",
+    )
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = FakeCollection(FakeOutlookFolder("Inbox", [fake_item]))
+    namespace = FakeOutlookNamespace(
+        [FakeOutlookStore("C:/mail/archive_2024.pst", root)],
+        items_by_id={"entry-pst-1": fake_item},
+    )
+    from mailattic import original_export
+
+    monkeypatch.setattr(
+        original_export,
+        "_load_default_outlook_reader",
+        lambda: FakeOutlookReader(namespace),
+    )
+
+    server = create_server(database_path=db_path)
+    result = asyncio.run(
+        server.call_tool(
+            "mail_original_export",
+            {"message_id": pst_id, "dest_dir": str(tmp_path / "host_exports")},
+        )
+    )
+
+    assert not result.is_error
+    structured = result.structured_content
+    assert structured is not None
+    assert structured["status"] == "exported"
+    assert Path(str(structured["dest_path"])).exists()
+    assert len(str(structured["subject"])) < len(huge_subject)
+    assert structured["truncated_fields"]["subject"] == len(huge_subject)

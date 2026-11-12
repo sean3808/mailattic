@@ -253,6 +253,10 @@ _MAIL_SEND_DESCRIPTION = (
 _MAIL_ATTACHMENT_EXPORT_MAX_IDS = 50
 _MAIL_ATTACHMENT_EXPORT_DEST_DIR_MAX_CHARS = 200
 _EXPORT_DETAIL_CAP = 80
+# Original export detail carries the manual next step (open the PST in Outlook,
+# find it by hand), so it gets more room than the attachment-export detail.
+_ORIGINAL_EXPORT_DETAIL_CAP = 500
+_ORIGINAL_EXPORT_SENDER_CAP = 2 * _DISPLAY_NAME_CAP
 _CONTACT_HISTORY_LEGAL_INVOCATIONS = (
     "Use exactly one of contact='<email>' or domain='<example.com>'."
 )
@@ -2479,12 +2483,35 @@ def create_server(
             dest_dir, lambda: writer.export_original(message, destination)
         )
 
+        # The file is already written here, so the presentation fields are
+        # capped (as in mail_attachment_export) rather than turning a completed
+        # export into an error that hides its status and path.
         payload = result.to_dict()
+        truncated_fields: dict[str, int] = {}
+        payload["subject"] = _cap_presentation_string(
+            payload.get("subject"), _SUBJECT_CAP, "subject", truncated_fields
+        )
+        payload["sender"] = _cap_presentation_string(
+            payload.get("sender"),
+            _ORIGINAL_EXPORT_SENDER_CAP,
+            "sender",
+            truncated_fields,
+        )
+        payload["detail"] = _cap_presentation_string(
+            payload.get("detail"),
+            _ORIGINAL_EXPORT_DETAIL_CAP,
+            "detail",
+            truncated_fields,
+        )
+        if truncated_fields:
+            payload["truncated_fields"] = truncated_fields
         delivered = _build_success_result("mail_original_export", payload)
         if measure_call_tool_result_chars(delivered) > MCP_RESPONSE_BUDGET_CHARS:
+            # Backstop only: the caps above keep this unreachable.
             raise build_tool_error(
                 ValueError,
-                "mail_original_export result exceeds delivery budget.",
+                "mail_original_export result exceeds delivery budget; the file "
+                "may already be written in the destination folder.",
             )
         return delivered
 

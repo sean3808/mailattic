@@ -1875,3 +1875,28 @@ def test_web_archive_message_fails_with_reason(tmp_path: Path) -> None:
     assert result.status == "failed"
     assert "archive" in (result.detail or "").lower()
     assert result.subject == "Scraped Notice"
+
+
+@pytest.mark.parametrize("missing", ["Items", "Folders"])
+def test_folder_without_items_or_subfolders_is_unreadable_not_empty(
+    tmp_path: Path, missing: str
+) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(
+        tmp_path, pst_path=pst_file, entry_id="entry-stale"
+    )
+    odd = FakeOutlookFolder("Odd", [])
+    setattr(odd, missing, None)
+    root = FakeOutlookFolder("Root", [])
+    root.Folders = FakeCollection(odd)
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst_file, root)])
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
