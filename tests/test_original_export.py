@@ -89,6 +89,43 @@ class FakeOutlookFolder:
         self.Items = FakeCollection(*self._items)
         self.Folders = FakeCollection()
 
+    def GetTable(self):
+        if self.Items is None:
+            raise RuntimeError("unreadable folder")
+        return FakeTable(self._items)
+
+
+class FakeTable:
+    def __init__(self, items):
+        self.items = items
+        self.Columns = self
+        self.EndOfTable = False
+
+    def RemoveAll(self):
+        pass
+
+    def Add(self, name):
+        pass
+
+    def GetArray(self, count):
+        if getattr(self, "failed", False):
+            raise RuntimeError("Corrupt MAPI properties")
+        self.EndOfTable = True
+        rows = []
+        for item in self.items:
+            try:
+                value = item.PropertyAccessor.GetProperty(
+                    "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
+                )
+            except KeyError:
+                value = None
+            except Exception:
+                self.failed = True
+                self.EndOfTable = False
+                continue
+            rows.append((value, item.EntryID))
+        return rows
+
 
 class FakeOutlookStore:
     def __init__(self, file_path: str, root_folder: FakeOutlookFolder) -> None:
@@ -114,6 +151,25 @@ class FakeOutlookNamespace:
     ) -> FakeOutlookItem | None:
         if entry_id in self._items_by_id:
             return self._items_by_id[entry_id]
+
+        def find(folder):
+            for item in folder._items:
+                if item.EntryID == entry_id:
+                    return item
+            if folder.Folders:
+                for child in folder.Folders:
+                    found = find(child)
+                    if found:
+                        return found
+            return None
+
+        for store in self.Stores:
+            try:
+                found = find(store.GetRootFolder())
+                if found:
+                    return found
+            except Exception:
+                pass
         raise RuntimeError(f"Item not found: {entry_id}")
 
 
@@ -1900,3 +1956,81 @@ def test_folder_without_items_or_subfolders_is_unreadable_not_empty(
 
     assert result.status == "failed"
     assert "could not be read" in (result.detail or "")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected", "selected"),
+    [
+        ("root_prefix", "exported", "recorded"),
+        ("same_name_child", "exported", "recorded"),
+        ("moved", "exported", "other"),
+        ("ambiguous_store", "failed", None),
+        ("ambiguous_recorded", "failed", None),
+        ("unreadable", "failed", None),
+        ("verification", "failed", None),
+        ("normalized", "exported", "recorded"),
+    ],
+)
+def test_pst_bulk_lookup_cases(
+    tmp_path: Path, case: str, expected: str, selected: str | None
+) -> None:
+    pst = str(tmp_path / "archive.pst")
+    path = "Root/Inbox" if case in {"root_prefix", "same_name_child"} else "Inbox"
+    db, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst,
+        folder_path=path,
+        entry_id="stale",
+        message_id="<target@example.com>",
+    )
+    recorded_item = FakeOutlookItem("recorded", "Target", "<target@example.com>")
+    other_item = FakeOutlookItem("other", "Target", "<target@example.com>")
+    recorded = FakeOutlookFolder(
+        "Inbox",
+        [] if case in {"moved", "ambiguous_store", "unreadable"} else [recorded_item],
+    )
+    other = FakeOutlookFolder(
+        "Other",
+        [other_item]
+        if case in {"root_prefix", "same_name_child", "moved", "ambiguous_store"}
+        else [],
+    )
+    root = FakeOutlookFolder("Root")
+    if case == "same_name_child":
+        child = FakeOutlookFolder("Root")
+        child.Folders = FakeCollection(recorded)
+        root.Folders = FakeCollection(child, other)
+    else:
+        root.Folders = FakeCollection(recorded, other)
+    if case == "ambiguous_store":
+        third = FakeOutlookFolder(
+            "Third", [FakeOutlookItem("third", "Target", "<target@example.com>")]
+        )
+        root.Folders = FakeCollection(recorded, other, third)
+    if case == "ambiguous_recorded":
+        recorded._items.append(other_item)
+    if case == "unreadable":
+        other.GetTable = lambda: (_ for _ in ()).throw(RuntimeError("unreadable"))
+    if case == "normalized":
+        recorded_item.PropertyAccessor._values[
+            "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
+        ] = "target@example.com"
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst, root)])
+    if case == "verification":
+        namespace._items_by_id["recorded"] = FakeOutlookItem(
+            "wrong", "Wrong", "<wrong@example.com>"
+        )
+    result = export_original_message(
+        db,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+    assert result.status == expected
+    if selected:
+        assert result.dest_path is not None
+        assert result.dest_path.read_bytes().endswith(selected.encode())
+    else:
+        assert result.dest_path is None
+        if case.startswith("ambiguous"):
+            assert "Ambiguous" in (result.detail or "")
