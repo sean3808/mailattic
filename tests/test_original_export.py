@@ -2545,3 +2545,5 @@ def test_table_missing_rows_blocks_recorded_folder_export(tmp_path: Path) -> Non
     result = _two_folder_case(tmp_path, [visible, hidden], [])
     assert result.status == "failed"
     assert result.dest_path is None
+    assert "not found" not in (result.detail or "").lower()
+    assert "uniqueness" in (result.detail or "").lower()

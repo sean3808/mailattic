@@ -282,6 +282,7 @@ def _resolve_pst_store(
     try:
         stores = getattr(namespace, "Stores", None)
         store_count = int(getattr(stores, "Count", 0)) if stores is not None else 0
+    # Any store-list read failure must report failed, including adapter errors.
     except Exception as exc:
         return None, f"Stores mounted in Outlook could not be read: {exc}"
     if stores is None:
@@ -597,7 +598,10 @@ def _find_pst_item(
             folder_found += hidden(folder_missing, len(folder_found))
             if folder_found:
                 if table_incomplete:
-                    return _nothing_found(tally.unreadable)
+                    return None, (
+                        "A matching item was found, but the folder could not be "
+                        "fully read, so its uniqueness could not be proven."
+                    )
                 return _single_match(folder_found, _PST_AMBIGUOUS)
 
     # 3. Fall back to scanning the whole store by Message-ID
