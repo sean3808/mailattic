@@ -390,8 +390,13 @@ def _matching_entries(
     is returned as a hit (None when it has no usable EntryID, so the caller
     reports it as found but unconfirmed). Every other row -- None, blank,
     non-text, possibly truncated, or any shape not foreseen -- goes to *missing*
-    to be opened, or is counted unreadable when it cannot be opened. A table
-    that yields fewer rows than the folder holds is counted unreadable.
+    to be opened, or is counted unreadable when it cannot be opened.
+
+    The listing itself must also show that every item was seen: each row a
+    2-tuple with its own EntryID, and as many rows as the folder holds items.
+    A listing that fails this is counted unreadable. Beyond that, a row's values
+    are trusted to belong to that row, as the per-item scan before #71 trusted
+    Outlook's item listing.
     """
     hits: list[str | None] = []
     try:
@@ -403,6 +408,7 @@ def _matching_entries(
         tally.unreadable += 1
         return hits
     seen = 0
+    listed: set[str] = set()
     complete = False
     while True:
         try:
@@ -419,18 +425,25 @@ def _matching_entries(
             break
         for row in rows:
             seen += 1
-            try:
-                msg_id, entry_id = row
-            except Exception:
-                tally.unreadable += 1  # a row that cannot be read proves nothing
+            # Real tables give each row as a 2-tuple with a distinct EntryID
+            # (all ~65k rows of 3 PSTs, #71); anything else means this listing
+            # cannot show that every item was seen.
+            if not isinstance(row, tuple) or len(row) != 2:
+                tally.unreadable += 1
                 continue
+            msg_id, entry_id = row
             entry = _usable_entry_id(entry_id)
+            if entry is not None:
+                if entry in listed:
+                    tally.unreadable += 1
+                    continue
+                listed.add(entry)
             if isinstance(msg_id, str) and len(msg_id) < _TABLE_TRUNCATION_RISK:
                 normalized = normalize_message_id(msg_id)
                 if normalized == expected:
                     hits.append(entry)
                     continue
-                if normalized:
+                if normalized and entry is not None:
                     continue  # proven to be another message
             if entry is None:
                 tally.unreadable += 1

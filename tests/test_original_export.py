@@ -2213,7 +2213,17 @@ class _RaisingRow:
 
 @pytest.mark.parametrize(
     "batch",
-    [[("bad",)], [("a", "b", "c")], [None], [42], None, 42, [_RaisingRow()]],
+    [
+        [("bad",)],
+        [("a", "b", "c")],
+        [None],
+        [42],
+        None,
+        42,
+        [_RaisingRow()],
+        [{"<other@example.com>": None, "a": None}],
+        [["<other@example.com>", "a"]],
+    ],
     ids=[
         "one_column",
         "three_columns",
@@ -2222,6 +2232,8 @@ class _RaisingRow:
         "none_batch",
         "int_batch",
         "row_read_raises",
+        "dict_row",
+        "list_row",
     ],
 )
 def test_malformed_table_batch_is_unreadable_not_raised(
@@ -2477,6 +2489,39 @@ def test_item_without_message_id_is_verified_different(tmp_path: Path) -> None:
     # really not the target, so a store holding only it is not_found.
     _, _, run = _table_case(tmp_path, [FakeOutlookItem("sent", "Sent mail")])
     assert run().status == "not_found"
+
+
+def test_duplicated_row_hiding_another_item_is_unreadable(tmp_path: Path) -> None:
+    # Row count matches Items.Count, but one row is listed twice and the
+    # target never appears: the listing does not show every item was seen.
+    other = FakeOutlookItem("other", "Other", "<other@example.com>")
+    target = FakeOutlookItem("target", "Target", "<target@example.com>")
+    folder, _, run = _table_case(tmp_path, [other, target])
+    original = folder.GetTable
+
+    def get_table():
+        table = original()
+
+        def duplicated(count):
+            table.EndOfTable = True
+            return (("<other@example.com>", "other"), ("<other@example.com>", "other"))
+
+        table.GetArray = duplicated
+        return table
+
+    folder.GetTable = get_table
+    result = run()
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
+def test_other_message_row_without_entry_id_is_unreadable(tmp_path: Path) -> None:
+    item = FakeOutlookItem("a", "Other", "<other@example.com>")
+    item.table_entry_id = ""
+    _, _, run = _table_case(tmp_path, [item])
+    result = run()
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
 
 
 @pytest.mark.parametrize("where", ["recorded", "other"])
