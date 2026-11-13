@@ -128,6 +128,12 @@ def test_ci_docs_identify_hosted_full_as_merge_evidence() -> None:
     assert "`hosted-full` job is merge evidence" in docs
     assert "every non-draft pull request and push to main" in docs
     assert "release evidence still uses local Full" in docs
+    assert (
+        "does not replace local Full evidence for merge readiness or release"
+        not in docs
+    )
+    assert "supplemental environment-compatibility probe" not in docs
+    assert "No status check is required for merge" not in docs
     assert "operational failure" in docs
     assert "No test is executed." not in docs
 

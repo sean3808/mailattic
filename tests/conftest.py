@@ -86,6 +86,7 @@ def is_protected_credentials_path(path: str | Path | os.PathLike[str]) -> bool:
 _orig_create_connection = socket.create_connection
 _orig_socket_connect = socket.socket.connect
 _orig_path_open = Path.open
+_orig_path_exists = Path.exists
 _orig_builtin_open = builtins.open
 _orig_load_env_file = imap_runtime.load_env_file
 
@@ -141,6 +142,12 @@ def _guarded_path_open(self: Path, *args: Any, **kwargs: Any) -> Any:
     return _orig_path_open(self, *args, **kwargs)
 
 
+def _guarded_path_exists(self: Path, *args: Any, **kwargs: Any) -> bool:
+    if self.name in _PROTECTED_BASENAMES and is_protected_credentials_path(self):
+        _raise_credentials_violation(self, action="check")
+    return _orig_path_exists(self, *args, **kwargs)
+
+
 def _guarded_builtin_open(file: Any, *args: Any, **kwargs: Any) -> Any:
     if isinstance(file, str | Path | os.PathLike):
         basename = os.path.basename(os.fspath(file))
@@ -173,6 +180,7 @@ def _sync_modules_load_env_file() -> None:
 socket.create_connection = _guarded_create_connection
 socket.socket.connect = _guarded_socket_connect
 Path.open = _guarded_path_open
+Path.exists = _guarded_path_exists
 builtins.open = _guarded_builtin_open
 imap_runtime.load_env_file = _guarded_load_env_file
 

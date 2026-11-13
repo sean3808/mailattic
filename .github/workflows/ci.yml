@@ -28,8 +28,8 @@ concurrency:
 
 jobs:
   static:
-    # Draft pull requests do not run: agents push often and Windows minutes bill
-    # at 2x. Marking a pull request ready for review triggers the run.
+    # Draft pull requests do not run: agents push often. Marking a pull request
+    # ready for review triggers the run.
     if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     # windows-latest only, and no matrix. Pyright is configured with
     # pythonPlatform = "Windows" and a .venv/Scripts/python.exe interpreter path,

@@ -4,7 +4,7 @@ date: 2026-08-20
 status: accepted
 title: 三個 CI 基礎設施選項明文排除，「Free 方案」是所有 CI 決策的固定前提
 superseded_by: D-20261113-1
-supersede_note: 公開 repo 改變費用與必要檢查的前提，理由 (1)(2) 被部分取代；理由 (3) 仍有效
+supersede_note: 公開 repo 改變 Context 的額度與保護限制；選項 1 不再需要，選項 2 已實現，選項 3 仍有效
 ---
 
 > **2026-10-03 註記**：`/session-merge-queue` 已退役（`#207`），三個排除選項的決定不變。文中「四道 gate 由該 session 自己執行」改讀為：合併前的把關是 `/closeout` 加上 Sean 的合併授權。

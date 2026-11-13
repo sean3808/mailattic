@@ -16,6 +16,7 @@ import pytest
 from mailattic import archive_scrape, rebuild, storage
 from mailattic.imap_runtime import load_env_file
 from mailattic.imap_sync import DEFAULT_ENV_FILE
+from tests import conftest as mailbox_guard
 from tests.conftest import (
     TestConnectionGuardError,
     TestCredentialsGuardError,
@@ -191,3 +192,18 @@ def test_credentials_guard_blocks_mail_server_env_path(
     msg = str(exc_info.value)
     assert "[MailboxGuard: Credentials]" in msg
     assert "mail-server\\.env" in msg or "mail-server/.env" in msg
+
+
+def test_credentials_guard_blocks_missing_protected_mail_server_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = (tmp_path / "mail-server" / ".env").resolve()
+    assert not missing.exists()
+    monkeypatch.setattr(mailbox_guard, "_PROTECTED_CREDENTIALS_PATHS", {missing})
+    monkeypatch.setattr(archive_scrape, "CREDENTIALS_ENV_PATH", missing)
+    monkeypatch.delenv("MAIL_SERVER_ENV_PATH", raising=False)
+
+    with pytest.raises(
+        TestCredentialsGuardError, match=r"\[MailboxGuard: Credentials\]"
+    ):
+        archive_scrape.load_credentials()

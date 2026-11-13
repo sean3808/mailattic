@@ -604,6 +604,4 @@ Neither green signal means anything more than stated above, and in particular:
   `scripts/release.ps1` stages 3-4; see
   [`docs/global-install-and-release.md`](../global-install-and-release.md).
 
-The required `hosted-full` status check is to be configured on main after the
-workflow has landed and reported on a PR (#70). Until then, its result is
-merge evidence that a human reads, not an enforced gate.
+The `hosted-full` status check is required on main for merge (#70).

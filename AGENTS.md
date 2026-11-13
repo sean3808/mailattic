@@ -22,7 +22,7 @@ uv run bes <subcommand> [flags]            # CLI, runs the working tree
 
 # The launcher is the only pytest entry (a contract test patrols raw calls outside it)
 pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route Quick            # daily; not release evidence
-pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route Full             # development / fallback / release evidence; hosted-full on the PR is merge evidence
+pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route Full             # closeout (until #73) / development / fallback / release; hosted-full on the PR is merge evidence
 pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route FullSequential   # when parallelism is suspect
 pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route Targeted tests\test_query.py::test_x
 
