@@ -2181,7 +2181,23 @@ def test_fake_namespace_only_opens_emitted_rows(tmp_path: Path) -> None:
     assert namespace.GetItemFromID("a") is item
 
 
-def test_malformed_table_row_propagates(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "batch",
+    [[("bad",)], [("a", "b", "c")], [None], [42], None, 42],
+    ids=[
+        "one_column",
+        "three_columns",
+        "none_row",
+        "int_row",
+        "none_batch",
+        "int_batch",
+    ],
+)
+def test_malformed_table_batch_is_unreadable_not_raised(
+    tmp_path: Path, batch: object
+) -> None:
+    # Like every other COM read problem: a reported failure with its reason
+    # (ruling 3), not an exception escaping the export.
     folder, _, run = _table_case(
         tmp_path, [FakeOutlookItem("a", "Target", "<target@example.com>")]
     )
@@ -2192,14 +2208,15 @@ def test_malformed_table_row_propagates(tmp_path: Path) -> None:
 
         def malformed(count):
             table.EndOfTable = True
-            return [("bad",)]
+            return batch
 
         table.GetArray = malformed
         return table
 
     folder.GetTable = get_table
-    with pytest.raises(ValueError):
-        run()
+    result = run()
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
 
 
 def _two_folder_case(

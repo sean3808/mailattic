@@ -405,7 +405,7 @@ def _matching_entries(
             if table.EndOfTable:
                 complete = True
                 break
-            rows = table.GetArray(_TABLE_BATCH_ROWS)
+            rows = list(table.GetArray(_TABLE_BATCH_ROWS))
             ended = table.EndOfTable
         except Exception:
             tally.unreadable += 1
@@ -413,8 +413,13 @@ def _matching_entries(
         if not rows and not ended:
             tally.unreadable += 1
             break
-        for msg_id, entry_id in rows:
+        for row in rows:
             seen += 1
+            try:
+                msg_id, entry_id = row
+            except (TypeError, ValueError):
+                tally.unreadable += 1  # a row of the wrong shape proves nothing
+                continue
             entry = _usable_entry_id(entry_id)
             if isinstance(msg_id, str) and len(msg_id) < _TABLE_TRUNCATION_RISK:
                 normalized = normalize_message_id(msg_id)
