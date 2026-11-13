@@ -96,6 +96,12 @@ def test_hosted_windows_full_is_merge_evidence_and_canonical() -> None:
     assert events["push"]["branches"] == ["main"]
     assert hosted_full["runs-on"] == "windows-latest"
 
+    assert hosted_full["steps"][1] == {
+        "name": "Record tested tree",
+        "shell": "bash",
+        "run": "echo \"::notice title=tested-tree::$(git rev-parse 'HEAD^{tree}')\"",
+    }
+
     run_steps = [step["run"] for step in hosted_full["steps"] if "run" in step]
     assert "uv sync --locked" in run_steps
     assert "pwsh -NoProfile -File scripts/invoke-pytest.ps1 -Route Full" in run_steps

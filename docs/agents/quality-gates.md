@@ -1,5 +1,7 @@
 # Agent quality gates
 
+Before `/closeout`, run `uv run python scripts/record_ci_green_tree.py` to record a matching successful GitHub-hosted Full run. If no record matches, closeout runs local Full as usual. A reused green tree does not run the gitignored local-only tests `tests/test_recipient_rebuild_audit.py` and `tests/test_recipient_rebuild_apply.py`; run them with `-Route Targeted` when a change touches recipient rebuild.
+
 The mechanical checks an agent runs to substantiate a completion claim. Each
 one answers a single question, runs in seconds, and reports through an exit
 code plus output you have to read.
