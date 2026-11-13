@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -53,6 +53,10 @@ def main() -> int:
         completed_at, job = max(jobs, key=lambda item: item[0])
         if job["conclusion"] != "success":
             raise ValueError("most recently completed hosted-full job did not succeed")
+        # The closeout reader ignores records older than 30 days; refuse instead of
+        # appending a line it would silently skip.
+        if datetime.now(UTC) - completed_at > timedelta(days=30):
+            raise ValueError("hosted-full job finished more than 30 days ago")
         annotations = [
             annotation
             for page in api(

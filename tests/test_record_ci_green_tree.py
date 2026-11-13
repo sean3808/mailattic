@@ -3,7 +3,7 @@
 import json
 import re
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -136,6 +136,7 @@ def test_linked_worktree_writes_to_common_git_directory(setup, monkeypatch):
         "missing_annotation",
         "mismatch",
         "newer_failure",
+        "stale",
     ],
 )
 def test_refusal_never_writes(setup, case, capsys):
@@ -156,6 +157,10 @@ def test_refusal_never_writes(setup, case, capsys):
         state["annotations"] = []
     elif case == "mismatch":
         state["annotations"][0]["message"] = "b" * 40
+    elif case == "stale":
+        state["jobs"][0]["completed_at"] = (
+            datetime.now(UTC) - timedelta(days=31)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
     else:
         state["jobs"].append(
             {
@@ -169,3 +174,5 @@ def test_refusal_never_writes(setup, case, capsys):
     assert path.read_bytes() == b"existing\n"
     if case == "mismatch":
         assert "does not match" in capsys.readouterr().err
+    if case == "stale":
+        assert "more than 30 days" in capsys.readouterr().err
