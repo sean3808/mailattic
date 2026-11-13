@@ -101,6 +101,30 @@ def test_success_appends_strict_reader_record(setup):
     assert path.read_bytes().endswith(b"\n")
 
 
+def test_append_after_unterminated_record_starts_new_line(setup):
+    repo, tree, _ = setup
+    path = repo / ".git" / "closeout-green-trees.jsonl"
+    path.write_bytes(b'{"old":true}')
+    assert writer.main() == 0
+    lines = path.read_bytes().splitlines()
+    assert len(lines) == 2 and lines[0] == b'{"old":true}'
+    pairs = json.loads(lines[1], object_pairs_hook=list)
+    assert len(pairs) == len(dict(pairs)) == 8
+    assert dict(pairs)["tree"] == tree
+
+
+def test_linked_worktree_writes_to_common_git_directory(setup, monkeypatch):
+    repo, tree, _ = setup
+    worktree = repo / "linked"
+    git(repo, "worktree", "add", "--detach", str(worktree))
+    monkeypatch.chdir(worktree)
+    private_dir = (worktree / git(worktree, "rev-parse", "--git-dir")).resolve()
+    assert writer.main() == 0
+    path = repo / ".git" / "closeout-green-trees.jsonl"
+    assert json.loads(path.read_text(encoding="utf-8"))["tree"] == tree
+    assert not (private_dir / "closeout-green-trees.jsonl").exists()
+
+
 @pytest.mark.parametrize(
     "case",
     [

@@ -39,21 +39,18 @@ def main() -> int:
                 for job_page in api(
                     f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100&filter=all"
                 ):
-                    jobs.extend(
-                        job
-                        for job in job_page["jobs"]
-                        if job["name"] == "hosted-full"
-                        and job["status"] == "completed"
-                        and job.get("completed_at")
-                    )
+                    for job in job_page["jobs"]:
+                        if (
+                            job["name"] == "hosted-full"
+                            and job["status"] == "completed"
+                            and job.get("completed_at")
+                        ):
+                            jobs.append(
+                                (datetime.fromisoformat(job["completed_at"]), job)
+                            )
         if not jobs:
             raise ValueError("no completed hosted-full job found")
-        job = max(
-            jobs,
-            key=lambda item: datetime.fromisoformat(
-                item["completed_at"].replace("Z", "+00:00")
-            ),
-        )
+        completed_at, job = max(jobs, key=lambda item: item[0])
         if job["conclusion"] != "success":
             raise ValueError("most recently completed hosted-full job did not succeed")
         annotations = [
@@ -72,11 +69,7 @@ def main() -> int:
             raise ValueError("tested-tree notice missing")
         if not any(a.get("message") == tree for a in notices):
             raise ValueError("tested-tree notice does not match HEAD tree")
-        finished = (
-            datetime.fromisoformat(job["completed_at"].replace("Z", "+00:00"))
-            .astimezone(UTC)
-            .strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
+        finished = completed_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         record = {
             "v": 1,
             "tree": tree,
@@ -94,20 +87,21 @@ def main() -> int:
         ):
             raise ValueError("working tree or HEAD changed during verification")
         common = Path(command("git", "rev-parse", "--git-common-dir"))
-        with (common / "closeout-green-trees.jsonl").open(
-            "a", encoding="utf-8", newline="\n"
-        ) as stream:
-            stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+        with (common / "closeout-green-trees.jsonl").open("a+b") as stream:
+            stream.seek(0, 2)
+            needs_newline = False
+            if stream.tell():
+                stream.seek(-1, 2)
+                needs_newline = stream.read(1) != b"\n"
+            line = (
+                ("\n" if needs_newline else "")
+                + json.dumps(record, separators=(",", ":"))
+                + "\n"
+            )
+            stream.write(line.encode("utf-8"))
         print("Recorded hosted-full green tree.")
         return 0
-    except (
-        OSError,
-        subprocess.CalledProcessError,
-        ValueError,
-        KeyError,
-        TypeError,
-        json.JSONDecodeError,
-    ) as exc:
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
         print(f"Cannot record green tree: {exc}", file=sys.stderr)
         return 1
 
