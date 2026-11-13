@@ -176,31 +176,43 @@ def _no_message_id_unresolved(
     )
 
 
+def _read_item_message_id(accessor: Any) -> str:
+    """The opened item's Message-ID, "" when it has none.
+
+    Raises when the value cannot be read: only a string (real Outlook returns
+    "" for an item without one, measured on 3 PSTs in #71) or MAPI_E_NOT_FOUND
+    proves what the item holds; anything else is "could not check", never
+    "verified as another message" (ruling 3).
+    """
+    if accessor is None:
+        raise LookupError("item has no PropertyAccessor")
+    try:
+        value = accessor.GetProperty(PR_INTERNET_MESSAGE_ID)
+    except Exception as exc:
+        hresult = getattr(exc, "hresult", None)
+        if hresult is None and len(getattr(exc, "args", ())) > 0:
+            hresult = exc.args[0]
+        if hresult == -2147221233:  # MAPI_E_NOT_FOUND (0x8004010F)
+            return ""
+        raise
+    if not isinstance(value, str):
+        raise TypeError(f"Message-ID read as {type(value).__name__}, not text")
+    return value
+
+
 def _verify_outlook_item(item: Any, message: Mapping[str, object]) -> bool:
-    """Check whether *item* matches *message*, strictly preventing wrong-mail export."""
+    """Check whether *item* matches *message*, strictly preventing wrong-mail export.
+
+    False means verified to be another message; a read that proves nothing raises.
+    """
     db_msg_id = message.get("message_id")
     accessor = getattr(item, "PropertyAccessor", None)
-    item_msg_id = None
-    if accessor:
-        try:
-            item_msg_id = accessor.GetProperty(PR_INTERNET_MESSAGE_ID)
-        except (KeyError, IndexError):
-            item_msg_id = None
-        except Exception as exc:
-            hresult = getattr(exc, "hresult", None)
-            if hresult is None and len(getattr(exc, "args", ())) > 0:
-                hresult = exc.args[0]
-            if hresult == -2147221233:  # MAPI_E_NOT_FOUND (0x8004010F)
-                item_msg_id = None
-            else:
-                raise
 
     if db_msg_id:
+        item_msg_id = _read_item_message_id(accessor)
         if not item_msg_id:
             return False
-        return normalize_message_id(str(item_msg_id)) == normalize_message_id(
-            str(db_msg_id)
-        )
+        return normalize_message_id(item_msg_id) == normalize_message_id(str(db_msg_id))
 
     # Without a Message-ID a subject alone cannot identify a message (a reused
     # EntryID or UID can point at another message with the same subject).
@@ -267,13 +279,18 @@ def _resolve_pst_store(
     sharing the recorded filename when the recorded path itself is gone."""
     expected_path = _normalized_windows_path(pst_source)
     expected_name = Path(pst_source).name.casefold()
-    stores = getattr(namespace, "Stores", None)
+    try:
+        stores = getattr(namespace, "Stores", None)
+        store_count = int(getattr(stores, "Count", 0)) if stores is not None else 0
+    # Any store-list read failure must report failed, including adapter errors.
+    except Exception as exc:
+        return None, f"Stores mounted in Outlook could not be read: {exc}"
     if stores is None:
         return None, None
 
     entries: list[tuple[Any, str, str]] = []  # (store, normalized path, name)
     unreadable = 0
-    for i in range(1, int(getattr(stores, "Count", 0)) + 1):
+    for i in range(1, store_count + 1):
         try:
             store = stores.Item(i)
             fp = getattr(store, "FilePath", None)
@@ -314,12 +331,13 @@ def _find_pst_folder_by_path(
         # PST ingest records a message in the store root as "/".
         return root_folder
     current = root_folder
-    for part in parts:
+    for index, part in enumerate(parts):
         child_folders = getattr(current, "Folders", None)
         if child_folders is None:
             return None
         count = int(getattr(child_folders, "Count", 0))
         found = None
+        unreadable_before = tally.unreadable
         for i in range(1, count + 1):
             try:
                 sub = child_folders.Item(i)
@@ -330,6 +348,13 @@ def _find_pst_folder_by_path(
                 tally.unreadable += 1
                 continue
         if found is None:
+            # Skip the root's display name only when no same-name child exists.
+            if (
+                index == 0
+                and tally.unreadable == unreadable_before
+                and part.casefold() == str(getattr(root_folder, "Name", "")).casefold()
+            ):
+                continue
             return None
         current = found
     return current
@@ -342,48 +367,106 @@ class _ScanTally:
     unreadable: int = 0
 
 
-def _matching_items(
-    folder: Any, message: Mapping[str, object], tally: _ScanTally
-) -> list[Any]:
-    """Items directly in *folder* that verify against *message*; anything that
-    cannot be read is counted once in *tally*."""
+_TABLE_BATCH_ROWS = 512
+
+# Table string columns are cut at 255 characters (one real row measured, #71).
+# A value this long may be a cut-off copy of the target, so it proves nothing.
+_TABLE_TRUNCATION_RISK = 250
+
+
+def _usable_entry_id(entry_id: object) -> str | None:
+    if isinstance(entry_id, str) and entry_id.strip():
+        return entry_id
+    return None
+
+
+def _matching_entries(
+    folder: Any, expected: str, tally: _ScanTally, missing: list[str]
+) -> list[str | None]:
+    """Read *folder*'s Message-IDs in batches without opening every item.
+
+    Each row is decided once. It is set aside only on positive proof that it is
+    another message: a plain, non-blank string, too short to be truncated, that
+    normalises to something other than *expected*. A row that equals *expected*
+    is returned as a hit (None when it has no usable EntryID, so the caller
+    reports it as found but unconfirmed). Every other row -- None, blank,
+    non-text, possibly truncated, or any shape not foreseen -- goes to *missing*
+    to be opened, or is counted unreadable when it cannot be opened.
+
+    The listing itself must also show that every item was seen: each row a
+    2-tuple with its own EntryID, and as many rows as the folder holds items.
+    A listing that fails this is counted unreadable. Beyond that, a row's values
+    are trusted to belong to that row, as the per-item scan before #71 trusted
+    Outlook's item listing.
+    """
+    hits: list[str | None] = []
     try:
-        items = getattr(folder, "Items", None)
+        table = folder.GetTable()
+        table.Columns.RemoveAll()
+        table.Columns.Add(PR_INTERNET_MESSAGE_ID)
+        table.Columns.Add("EntryID")
     except Exception:
         tally.unreadable += 1
-        return []
-    if items is None:
-        # A real Outlook folder always has an Items collection (possibly
-        # empty); a missing one means the folder was not looked at.
-        tally.unreadable += 1
-        return []
-    try:
-        count = int(getattr(items, "Count", 0))
-    except Exception:
-        tally.unreadable += 1
-        return []
-    matches: list[Any] = []
-    for i in range(1, count + 1):
+        return hits
+    seen = 0
+    listed: set[str] = set()
+    complete = False
+    while True:
         try:
-            item = items.Item(i)
-            if _verify_outlook_item(item, message):
-                matches.append(item)
+            if table.EndOfTable:
+                complete = True
+                break
+            rows = list(table.GetArray(_TABLE_BATCH_ROWS))
+            ended = table.EndOfTable
         except Exception:
             tally.unreadable += 1
-    return matches
-
-
-def _same_folder(a: Any, b: Any) -> bool:
-    if a is b:
-        return True
-    try:
-        entry_a = getattr(a, "EntryID", None)
-        return entry_a is not None and entry_a == getattr(b, "EntryID", None)
-    except Exception:
-        return False
+            break
+        if not rows and not ended:
+            tally.unreadable += 1
+            break
+        for row in rows:
+            seen += 1
+            # Real tables give each row as a 2-tuple with a distinct EntryID
+            # (all ~65k rows of 3 PSTs, #71); anything else means this listing
+            # cannot show that every item was seen.
+            if not isinstance(row, tuple) or len(row) != 2:
+                tally.unreadable += 1
+                continue
+            msg_id, entry_id = row
+            entry = _usable_entry_id(entry_id)
+            if entry is not None:
+                if entry in listed:
+                    tally.unreadable += 1
+                    continue
+                listed.add(entry)
+            if isinstance(msg_id, str) and len(msg_id) < _TABLE_TRUNCATION_RISK:
+                normalized = normalize_message_id(msg_id)
+                if normalized == expected:
+                    hits.append(entry)
+                    continue
+                if normalized and entry is not None:
+                    continue  # proven to be another message
+            if entry is None:
+                tally.unreadable += 1
+            else:
+                missing.append(entry)
+    if complete:
+        try:
+            item_count = int(folder.Items.Count)
+        except Exception:
+            tally.unreadable += 1
+        else:
+            if item_count != seen:
+                tally.unreadable += 1
+    return hits
 
 
 _PST_AMBIGUOUS = "Ambiguous: the message was found more than once in the PST"
+
+
+class _VerificationError(Exception):
+    """An item was opened but checking its identity raised (a read error),
+    as opposed to the EntryID lookup itself failing."""
 
 
 def _find_pst_item(
@@ -401,6 +484,25 @@ def _find_pst_item(
     folder_path = str(message.get("folder_path") or "").strip()
     tally = _ScanTally()
 
+    try:
+        store_id = getattr(store, "StoreID", None)
+    except Exception:
+        store_id = None  # same fallback as a store without a StoreID
+
+    def open_verified(entry: str) -> Any | None:
+        item = (
+            namespace.GetItemFromID(entry, store_id)
+            if store_id
+            else namespace.GetItemFromID(entry)
+        )
+        if item is None:
+            # Not opened is not "verified as another message" (ruling 3).
+            raise LookupError(f"Outlook returned no item for EntryID {entry}")
+        try:
+            return item if _verify_outlook_item(item, message) else None
+        except Exception as exc:
+            raise _VerificationError from exc
+
     # 1. Try logical_locator (EntryID). Outlook raises the same way for an
     # EntryID that no longer exists (the normal case after a PST is
     # reorganised) as for one it cannot read, so a failed lookup is not
@@ -409,23 +511,19 @@ def _find_pst_item(
     if logical_locator:
         candidate = None
         try:
-            store_id = getattr(store, "StoreID", None)
-            candidate = (
-                namespace.GetItemFromID(logical_locator, store_id)
-                if store_id
-                else namespace.GetItemFromID(logical_locator)
-            )
+            candidate = open_verified(logical_locator)
+        except _VerificationError:
+            tally.unreadable += 1
         except Exception:
-            pass  # stale or unreadable EntryID: see the comment above
+            pass
         if candidate is not None:
-            try:
-                if _verify_outlook_item(candidate, message):
-                    return candidate, None
-            except Exception:
-                tally.unreadable += 1
+            return candidate, None
 
     if not db_msg_id:
         return _no_message_id_unresolved("Outlook location", tally.unreadable)
+
+    expected = normalize_message_id(str(db_msg_id))
+    missing: list[str] = []
 
     try:
         root_folder = store.GetRootFolder()
@@ -434,6 +532,45 @@ def _find_pst_item(
 
     if root_folder is None:
         return None, "PST root folder is unavailable"
+
+    unconfirmed = (None, "A matching table row was found but could not be confirmed.")
+
+    def confirm(hits: list[str | None]) -> list[Any] | None:
+        """Open every table hit; each must verify as the target.
+
+        A hit without a usable EntryID, one that cannot be opened, or one that
+        opens as a different message contradicts the table: None (ruling 1,
+        unsure means fail), never a fall-back to a copy elsewhere (ruling 5).
+        """
+        found: list[Any] = []
+        for entry in hits:
+            if entry is None:
+                return None
+            try:
+                item = open_verified(entry)
+            except Exception:
+                return None
+            if item is None:
+                return None
+            found.append(item)
+        return found
+
+    def hidden(entries: list[str], already: int) -> list[Any]:
+        """Open rows whose Message-ID the table could not give: one of them may
+        be another copy, which the uniqueness check (ruling 5) must count.
+        Stops once two matches exist in total, since that is already ambiguous."""
+        found: list[Any] = []
+        for entry in entries:
+            if already + len(found) > 1:
+                break
+            try:
+                item = open_verified(entry)
+            except Exception:
+                tally.unreadable += 1
+                continue
+            if item is not None:
+                found.append(item)
+        return found
 
     # 2. Try locating inside folder_path first
     target_folder = None
@@ -444,24 +581,57 @@ def _find_pst_item(
             tally.unreadable += 1
 
         if target_folder is not None:
-            folder_candidates = _matching_items(target_folder, message, tally)
-            if folder_candidates:
-                return _single_match(folder_candidates, _PST_AMBIGUOUS)
+            unreadable_before = tally.unreadable
+            missing_before = len(missing)
+            folder_hits = _matching_entries(target_folder, expected, tally, missing)
+            # Only a table that could not be read in full blocks the export; an
+            # item that cannot be opened below is counted, as before the table
+            # read, without blocking a match found beside it.
+            table_incomplete = tally.unreadable > unreadable_before
+            # The recorded folder's unreadable-ID rows are settled here, so the
+            # whole-store pass below does not open them a second time.
+            folder_missing = missing[missing_before:]
+            del missing[missing_before:]
+            folder_found = confirm(folder_hits)
+            if folder_found is None:
+                return unconfirmed
+            folder_found += hidden(folder_missing, len(folder_found))
+            if folder_found:
+                if table_incomplete:
+                    return None, (
+                        "A matching item was found, but the folder could not be "
+                        "fully read, so its uniqueness could not be proven."
+                    )
+                return _single_match(folder_found, _PST_AMBIGUOUS)
 
     # 3. Fall back to scanning the whole store by Message-ID
-    candidates: list[Any] = []
+    candidates: list[str | None] = []
+    try:
+        target_entry = getattr(target_folder, "EntryID", None)
+    except Exception:
+        target_entry = None
+
+    def is_target(folder: Any) -> bool:
+        if target_folder is None:
+            return False
+        if folder is target_folder:
+            return True
+        try:
+            return target_entry is not None and folder.EntryID == target_entry
+        except Exception:
+            return False
 
     def scan_folder(folder: Any) -> None:
-        # The folder_path pass already read this folder's Items (and found no
+        # The folder_path pass already read this folder's table (and found no
         # match); re-reading would count its unreadable items twice.
-        if target_folder is None or not _same_folder(folder, target_folder):
-            candidates.extend(_matching_items(folder, message, tally))
+        if not is_target(folder):
+            candidates.extend(_matching_entries(folder, expected, tally, missing))
         try:
             child_folders = getattr(folder, "Folders", None)
         except Exception:
             child_folders = None
         if child_folders is None:
-            # Same as Items: a missing Folders collection means the subtree
+            # A missing Folders collection means the subtree
             # was not searched, so the scan is incomplete.
             tally.unreadable += 1
         else:
@@ -472,18 +642,20 @@ def _find_pst_item(
                 count = 0
             for i in range(1, count + 1):
                 try:
-                    scan_folder(child_folders.Item(i))
+                    child = child_folders.Item(i)
                 except Exception:
                     tally.unreadable += 1
                     continue
+                scan_folder(child)
 
-    try:
-        scan_folder(root_folder)
-    except Exception as exc:
-        return None, f"PST folder scan failed: {exc}"
+    scan_folder(root_folder)
 
-    if candidates:
-        return _single_match(candidates, _PST_AMBIGUOUS)
+    found = confirm(candidates)
+    if found is None:
+        return unconfirmed
+    found += hidden(missing, len(found))
+    if found:
+        return _single_match(found, _PST_AMBIGUOUS)
 
     return _nothing_found(tally.unreadable)
 

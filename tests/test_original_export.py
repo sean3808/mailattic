@@ -11,16 +11,19 @@ Retrieves one stored message's original from its source:
 from __future__ import annotations
 
 import imaplib
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from mailattic import original_export
 from mailattic.models import MaildirSource, PstSource, build_normalized_message
 from mailattic.original_export import (
     export_original_message,
 )
+from mailattic.outlook_pst import PR_INTERNET_MESSAGE_ID
 from mailattic.storage import (
     connect_database,
     initialize_database,
@@ -46,6 +49,10 @@ class FakeAccessor:
 
     def GetProperty(self, name: str) -> object:
         if name not in self._values:
+            if name == PR_INTERNET_MESSAGE_ID:
+                # Real Outlook returns "" for an item without a Message-ID
+                # rather than raising (measured on 3 PSTs, #71).
+                return ""
             raise KeyError(name)
         value = self._values[name]
         if isinstance(value, Exception):
@@ -73,7 +80,7 @@ class FakeOutlookItem:
         self.ReceivedTime = None
         props: dict[str, object] = {}
         if message_id:
-            props["http://schemas.microsoft.com/mapi/proptag/0x1035001E"] = message_id
+            props[PR_INTERNET_MESSAGE_ID] = message_id
         self.PropertyAccessor = FakeAccessor(props)
         self.saved_calls: list[tuple[str, int]] = []
 
@@ -86,8 +93,62 @@ class FakeOutlookFolder:
     def __init__(self, name: str, items: list[FakeOutlookItem] | None = None) -> None:
         self.Name = name
         self._items = items or []
-        self.Items = FakeCollection(*self._items)
+        self._items_missing = False
         self.Folders = FakeCollection()
+
+    @property
+    def Items(self):  # noqa: N802 - Outlook COM name
+        # Live view, so tests that add items later keep Items.Count in step.
+        return None if self._items_missing else FakeCollection(*self._items)
+
+    @Items.setter
+    def Items(self, value) -> None:  # noqa: N802
+        self._items_missing = value is None
+
+    def GetTable(self):
+        if self.Items is None:
+            raise RuntimeError("unreadable folder")
+        self.table = FakeTable(self._items, self.registry)
+        return self.table
+
+
+class FakeTable:
+    def __init__(self, items, registry):
+        self.items = items
+        self.registry = registry
+        self.Columns = self
+        self.EndOfTable = not items
+        self.columns = []
+        self.position = 0
+        self.calls = 0
+
+    def RemoveAll(self):
+        self.columns.clear()
+
+    def Add(self, name):
+        self.columns.append(name)
+
+    def GetArray(self, count):
+        self.calls += 1
+        rows = []
+        batch = self.items[self.position : self.position + count]
+        for item in batch:
+            self.registry[item.EntryID] = item
+            if getattr(item, "omit_from_table", False):
+                continue  # a row the table silently never returns
+            try:
+                value = item.PropertyAccessor.GetProperty(PR_INTERNET_MESSAGE_ID)
+            except Exception:
+                value = None
+            if value == "":
+                value = None  # real tables show a missing Message-ID as None
+            value = getattr(item, "table_message_id", value)
+            entry = getattr(item, "table_entry_id", item.EntryID)
+            values = {PR_INTERNET_MESSAGE_ID: value, "EntryID": entry}
+            rows.append(tuple(values[name] for name in self.columns))
+        self.position += len(batch)
+        self.EndOfTable = self.position >= len(self.items)
+        return rows
 
 
 class FakeOutlookStore:
@@ -108,12 +169,26 @@ class FakeOutlookNamespace:
     ) -> None:
         self.Stores = FakeCollection(*stores)
         self._items_by_id = items_by_id or {}
+        self._emitted = {}
+
+        def attach(folder):
+            folder.registry = self._emitted
+            if folder.Folders:
+                for child in folder.Folders:
+                    attach(child)
+
+        for store in stores:
+            with suppress(Exception):
+                attach(store.GetRootFolder())
 
     def GetItemFromID(
         self, entry_id: str, store_id: str | None = None
     ) -> FakeOutlookItem | None:
         if entry_id in self._items_by_id:
             return self._items_by_id[entry_id]
+
+        if entry_id in self._emitted:
+            return self._emitted[entry_id]
         raise RuntimeError(f"Item not found: {entry_id}")
 
 
@@ -1401,6 +1476,29 @@ def test_unreadable_store_with_no_match_fails_instead_of_not_found(
     assert "1 store" in (result.detail or "")
 
 
+class _UnreadableStores:
+    @property
+    def Count(self) -> int:  # noqa: N802
+        raise RuntimeError("stores offline")
+
+
+def test_unreadable_store_list_fails_instead_of_raising(tmp_path: Path) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(tmp_path, pst_path=pst_file)
+    namespace = FakeOutlookNamespace([])
+    namespace.Stores = _UnreadableStores()  # type: ignore[assignment]
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
 def test_unreadable_store_with_matching_other_store_still_exports(
     tmp_path: Path,
 ) -> None:
@@ -1900,3 +1998,552 @@ def test_folder_without_items_or_subfolders_is_unreadable_not_empty(
 
     assert result.status == "failed"
     assert "could not be read" in (result.detail or "")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected", "selected"),
+    [
+        ("root_prefix", "exported", "recorded"),
+        ("same_name_child", "exported", "recorded"),
+        ("moved", "exported", "other"),
+        ("ambiguous_store", "failed", None),
+        ("ambiguous_recorded", "failed", None),
+        ("unreadable", "failed", None),
+        ("verification", "failed", None),
+        ("normalized", "exported", "recorded"),
+    ],
+)
+def test_pst_bulk_lookup_cases(
+    tmp_path: Path, case: str, expected: str, selected: str | None
+) -> None:
+    pst = str(tmp_path / "archive.pst")
+    path = "Root/Inbox" if case in {"root_prefix", "same_name_child"} else "Inbox"
+    db, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst,
+        folder_path=path,
+        entry_id="stale",
+        message_id="<target@example.com>",
+    )
+    recorded_item = FakeOutlookItem("recorded", "Target", "<target@example.com>")
+    other_item = FakeOutlookItem("other", "Target", "<target@example.com>")
+    recorded = FakeOutlookFolder(
+        "Inbox",
+        [] if case in {"moved", "ambiguous_store", "unreadable"} else [recorded_item],
+    )
+    other = FakeOutlookFolder(
+        "Other",
+        [other_item]
+        if case in {"root_prefix", "same_name_child", "moved", "ambiguous_store"}
+        else [],
+    )
+    root = FakeOutlookFolder("Root")
+    if case == "same_name_child":
+        child = FakeOutlookFolder("Root")
+        child.Folders = FakeCollection(recorded)
+        root.Folders = FakeCollection(child, other)
+    else:
+        root.Folders = FakeCollection(recorded, other)
+    if case == "ambiguous_store":
+        third = FakeOutlookFolder(
+            "Third", [FakeOutlookItem("third", "Target", "<target@example.com>")]
+        )
+        root.Folders = FakeCollection(recorded, other, third)
+    if case == "ambiguous_recorded":
+        recorded._items.append(other_item)
+    if case == "unreadable":
+        other.GetTable = lambda: (_ for _ in ()).throw(RuntimeError("unreadable"))
+    if case == "normalized":
+        recorded_item.PropertyAccessor._values[PR_INTERNET_MESSAGE_ID] = (
+            "target@example.com"
+        )
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst, root)])
+    if case == "verification":
+        namespace._items_by_id["recorded"] = FakeOutlookItem(
+            "wrong", "Wrong", "<wrong@example.com>"
+        )
+    result = export_original_message(
+        db,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+    assert result.status == expected
+    if selected:
+        assert result.dest_path is not None
+        assert result.dest_path.read_bytes().endswith(selected.encode())
+    else:
+        assert result.dest_path is None
+        if case.startswith("ambiguous"):
+            assert "Ambiguous" in (result.detail or "")
+
+
+def _table_case(
+    tmp_path: Path,
+    items: list[FakeOutlookItem],
+    message_id: str = "<target@example.com>",
+):
+    pst = str(tmp_path / "archive.pst")
+    db, db_id = _seed_pst_message(
+        tmp_path, pst_path=pst, entry_id="stale", message_id=message_id
+    )
+    folder = FakeOutlookFolder("Inbox", items)
+    root = FakeOutlookFolder("Root")
+    root.Folders = FakeCollection(folder)
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst, root)])
+
+    def run():
+        return export_original_message(
+            db,
+            db_id,
+            destination_dir=tmp_path / "exports",
+            outlook_reader=FakeOutlookReader(namespace),
+        )
+
+    return folder, namespace, run
+
+
+def test_table_columns_and_multiple_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(original_export, "_TABLE_BATCH_ROWS", 1)
+    folder, _, run = _table_case(
+        tmp_path,
+        [
+            FakeOutlookItem("a", "Other", "<other@example.com>"),
+            FakeOutlookItem("b", "Target", "<target@example.com>"),
+        ],
+    )
+    result = run()
+    assert result.status == "exported"
+    assert folder.table.columns == [PR_INTERNET_MESSAGE_ID, "EntryID"]
+    assert folder.table.position == 2
+    assert folder.table.calls == 2
+
+
+@pytest.mark.parametrize("failure", ["empty", "partial"])
+def test_recorded_table_incomplete_fails(tmp_path: Path, failure: str) -> None:
+    folder, _, run = _table_case(
+        tmp_path,
+        [
+            FakeOutlookItem("a", "Target", "<target@example.com>"),
+            FakeOutlookItem("b", "Target", "<target@example.com>"),
+        ],
+    )
+    original = folder.GetTable
+
+    def get_table():
+        table = original()
+        get_array = table.GetArray
+        calls = 0
+
+        def get_batch(count):
+            nonlocal calls
+            calls += 1
+            if failure == "empty":
+                return []
+            if calls > 1:
+                raise RuntimeError("table failure")
+            return get_array(1)
+
+        table.GetArray = get_batch
+        return table
+
+    folder.GetTable = get_table
+    result = run()
+    assert result.status == "failed"
+    assert result.dest_path is None
+
+
+@pytest.mark.parametrize("case", ["hidden", "error", "missing"])
+def test_none_table_row_fallback(tmp_path: Path, case: str) -> None:
+    item = FakeOutlookItem(
+        "a", "Target", "<target@example.com>" if case == "hidden" else None
+    )
+    item.table_message_id = None
+    if case == "error":
+
+        def fail(name):
+            raise RuntimeError("unreadable property")
+
+        item.PropertyAccessor.GetProperty = fail
+    _, _, run = _table_case(tmp_path, [item])
+    result = run()
+    assert (
+        result.status
+        == {"hidden": "exported", "error": "failed", "missing": "not_found"}[case]
+    )
+
+
+@pytest.mark.parametrize("match", [True, False])
+def test_truncated_table_id_requires_full_verification(
+    tmp_path: Path, match: bool
+) -> None:
+    full = "<" + "a" * 260 + "@example.com>"
+    item = FakeOutlookItem("a", "Target", full if match else "<wrong@example.com>")
+    item.table_message_id = full[:255]
+    _, _, run = _table_case(tmp_path, [item], full)
+    result = run()
+    # A prefix-only row whose full Message-ID differs is not the message, and
+    # the rest of the store holds nothing else: not_found, as a full read says.
+    assert result.status == ("exported" if match else "not_found")
+    if not match:
+        assert result.dest_path is None
+
+
+def test_fake_namespace_only_opens_emitted_rows(tmp_path: Path) -> None:
+    item = FakeOutlookItem("a", "Target", "<target@example.com>")
+    folder, namespace, _ = _table_case(tmp_path, [item])
+    with pytest.raises(RuntimeError):
+        namespace.GetItemFromID("a")
+    table = folder.GetTable()
+    table.Columns.RemoveAll()
+    table.Columns.Add(PR_INTERNET_MESSAGE_ID)
+    table.Columns.Add("EntryID")
+    table.GetArray(1)
+    assert namespace.GetItemFromID("a") is item
+
+
+class _RaisingRow:
+    """A table row whose values cannot be read (iteration raises)."""
+
+    def __iter__(self):
+        raise RuntimeError("COM row read failed")
+
+
+@pytest.mark.parametrize(
+    "batch",
+    [
+        [("bad",)],
+        [("a", "b", "c")],
+        [None],
+        [42],
+        None,
+        42,
+        [_RaisingRow()],
+        [{"<other@example.com>": None, "a": None}],
+        [["<other@example.com>", "a"]],
+    ],
+    ids=[
+        "one_column",
+        "three_columns",
+        "none_row",
+        "int_row",
+        "none_batch",
+        "int_batch",
+        "row_read_raises",
+        "dict_row",
+        "list_row",
+    ],
+)
+def test_malformed_table_batch_is_unreadable_not_raised(
+    tmp_path: Path, batch: object
+) -> None:
+    # Like every other COM read problem: a reported failure with its reason
+    # (ruling 3), not an exception escaping the export.
+    folder, _, run = _table_case(
+        tmp_path, [FakeOutlookItem("a", "Target", "<target@example.com>")]
+    )
+    original = folder.GetTable
+
+    def get_table():
+        table = original()
+
+        def malformed(count):
+            table.EndOfTable = True
+            return batch
+
+        table.GetArray = malformed
+        return table
+
+    folder.GetTable = get_table
+    result = run()
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
+def _two_folder_case(
+    tmp_path: Path,
+    recorded_items: list[FakeOutlookItem],
+    other_items: list[FakeOutlookItem],
+    message_id: str = "<target@example.com>",
+):
+    pst = str(tmp_path / "archive.pst")
+    db, db_id = _seed_pst_message(
+        tmp_path,
+        pst_path=pst,
+        folder_path="Inbox",
+        entry_id="stale",
+        message_id=message_id,
+    )
+    root = FakeOutlookFolder("Root")
+    root.Folders = FakeCollection(
+        FakeOutlookFolder("Inbox", recorded_items),
+        FakeOutlookFolder("Other", other_items),
+    )
+    namespace = FakeOutlookNamespace([FakeOutlookStore(pst, root)])
+    return export_original_message(
+        db,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+
+def _hidden_copy(entry_id: str, message_id: str = "<target@example.com>"):
+    """A real copy whose Message-ID the table cannot give (shows as None)."""
+    item = FakeOutlookItem(entry_id, "Target", message_id)
+    item.table_message_id = None
+    return item
+
+
+@pytest.mark.parametrize("hidden_in", ["recorded", "other"])
+def test_copy_hidden_from_table_still_counts_toward_ambiguity(
+    tmp_path: Path, hidden_in: str
+) -> None:
+    visible = FakeOutlookItem("visible", "Target", "<target@example.com>")
+    copy = _hidden_copy("hidden")
+    if hidden_in == "recorded":
+        # Ruling 5: two matches inside the recorded folder are ambiguous.
+        result = _two_folder_case(tmp_path, [visible, copy], [])
+    else:
+        # Moved message: one table hit plus one hidden copy elsewhere.
+        result = _two_folder_case(tmp_path, [], [visible, copy])
+    assert result.status == "failed"
+    assert result.dest_path is None
+    assert "Ambiguous" in (result.detail or "")
+
+
+def test_hidden_copy_in_recorded_folder_wins_over_copy_elsewhere(
+    tmp_path: Path,
+) -> None:
+    # Ruling 5's exception: exactly one match in the recorded folder is
+    # exported even though another copy exists elsewhere in the PST.
+    result = _two_folder_case(
+        tmp_path,
+        [_hidden_copy("recorded")],
+        [FakeOutlookItem("other", "Target", "<target@example.com>")],
+    )
+    assert result.status == "exported"
+    assert result.dest_path is not None
+    assert result.dest_path.read_bytes().endswith(b"recorded")
+
+
+def test_truncated_rows_sharing_a_prefix_export_the_full_match(
+    tmp_path: Path,
+) -> None:
+    full = "<" + "a" * 260 + "@example.com>"
+    right = FakeOutlookItem("right", "Target", full)
+    wrong = FakeOutlookItem("wrong", "Target", full[:255] + "zz@example.com>")
+    right.table_message_id = wrong.table_message_id = full[:255]
+    result = _two_folder_case(tmp_path, [wrong, right], [], full)
+    assert result.status == "exported"
+    assert result.dest_path is not None
+    assert result.dest_path.read_bytes().endswith(b"right")
+
+
+def test_rejected_prefix_row_in_recorded_folder_falls_back_to_store(
+    tmp_path: Path,
+) -> None:
+    full = "<" + "a" * 260 + "@example.com>"
+    decoy = FakeOutlookItem("decoy", "Target", full[:255] + "zz@example.com>")
+    decoy.table_message_id = full[:255]
+    result = _two_folder_case(
+        tmp_path, [decoy], [FakeOutlookItem("other", "Target", full)], full
+    )
+    assert result.status == "exported"
+    assert result.dest_path is not None
+    assert result.dest_path.read_bytes().endswith(b"other")
+
+
+def test_none_row_that_outlook_returns_as_nothing_is_not_not_found(
+    tmp_path: Path,
+) -> None:
+    item = _hidden_copy("ghost")
+    _, namespace, run = _table_case(tmp_path, [item])
+    namespace._items_by_id["ghost"] = None  # GetItemFromID gives None, no raise
+    result = run()
+    assert result.status == "failed"
+    assert result.dest_path is None
+
+
+def test_table_hit_without_store_id_is_confirmed(tmp_path: Path) -> None:
+    _, namespace, run = _table_case(
+        tmp_path, [FakeOutlookItem("a", "Target", "<target@example.com>")]
+    )
+    del namespace.Stores.Item(1).StoreID
+    assert run().status == "exported"
+
+
+# --- #71 route after the review cap: "not the target" needs positive proof ----
+# A row is set aside unopened only when the table gives a plain, untruncated,
+# non-blank string that differs from the target. Every other shape -- the ones
+# listed here and any not yet seen -- must be opened or counted as unreadable,
+# so it can never turn into not_found (ruling 3) or hide a copy (ruling 5).
+
+_LONG_OTHER = "<" + "b" * 250 + "@example.com>"
+_UNTRUSTED_TABLE_VALUES = {
+    "none": None,
+    "empty": "",
+    "blank": "  \t",
+    "brackets_only": "<>",
+    "bytes": b"<target@example.com>",
+    "empty_bytes": b"",
+    "zero": 0,
+    "hresult": -2147221233,
+    "false": False,
+    "error_object": RuntimeError("table cell error"),
+    "tuple": ("<target@example.com>",),
+    "long_other": _LONG_OTHER,
+}
+
+
+@pytest.mark.parametrize("shape", list(_UNTRUSTED_TABLE_VALUES))
+def test_untrusted_table_value_is_opened_not_skipped(
+    tmp_path: Path, shape: str
+) -> None:
+    target = FakeOutlookItem("a", "Target", "<target@example.com>")
+    target.table_message_id = _UNTRUSTED_TABLE_VALUES[shape]
+    _, _, run = _table_case(tmp_path, [target])
+    result = run()
+    assert result.status == "exported"
+    assert result.dest_path is not None
+
+
+@pytest.mark.parametrize("shape", list(_UNTRUSTED_TABLE_VALUES))
+def test_untrusted_table_value_counts_toward_ambiguity(
+    tmp_path: Path, shape: str
+) -> None:
+    visible = FakeOutlookItem("visible", "Target", "<target@example.com>")
+    copy = FakeOutlookItem("copy", "Target", "<target@example.com>")
+    copy.table_message_id = _UNTRUSTED_TABLE_VALUES[shape]
+    result = _two_folder_case(tmp_path, [], [visible, copy])
+    assert result.status == "failed"
+    assert "Ambiguous" in (result.detail or "")
+
+
+@pytest.mark.parametrize("entry", [None, "", "   ", 0, b"a"])
+def test_untrusted_row_without_usable_entry_id_is_unreadable(
+    tmp_path: Path, entry: object
+) -> None:
+    item = FakeOutlookItem("a", "Target", "<target@example.com>")
+    item.table_message_id = ""
+    item.table_entry_id = entry
+    _, _, run = _table_case(tmp_path, [item])
+    result = run()
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
+@pytest.mark.parametrize("entry", [None, "", "   "])
+def test_exact_table_hit_that_cannot_be_opened_does_not_export_another_copy(
+    tmp_path: Path, entry: object
+) -> None:
+    # The recorded folder's table says the message is here, but the row has no
+    # usable EntryID: a copy elsewhere must not be exported in its place.
+    here = FakeOutlookItem("here", "Target", "<target@example.com>")
+    here.table_entry_id = entry
+    result = _two_folder_case(
+        tmp_path, [here], [FakeOutlookItem("other", "Target", "<target@example.com>")]
+    )
+    assert result.status == "failed"
+    assert result.dest_path is None
+
+
+class _NoIdAccessor:
+    """An opened item whose Message-ID cannot be read in the given way."""
+
+    def __init__(self, outcome: object) -> None:
+        self._outcome = outcome
+
+    def GetProperty(self, name: str) -> object:  # noqa: N802
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self._outcome
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["no_accessor", KeyError("x"), IndexError(0), None, 0, b"<x@example.com>"],
+    ids=["no_accessor", "key_error", "index_error", "none", "int", "bytes"],
+)
+def test_opened_item_with_unreadable_identity_is_not_not_found(
+    tmp_path: Path, outcome: object
+) -> None:
+    item = FakeOutlookItem("a", "Target", "<target@example.com>")
+    item.table_message_id = None
+    _, namespace, run = _table_case(tmp_path, [item])
+    opened = FakeOutlookItem("a", "Target")
+    if outcome == "no_accessor":
+        opened.PropertyAccessor = None  # type: ignore[assignment]
+    else:
+        opened.PropertyAccessor = _NoIdAccessor(outcome)  # type: ignore[assignment]
+    namespace._items_by_id["a"] = opened
+    result = run()
+    assert result.status == "failed"
+    assert result.dest_path is None
+
+
+def test_item_without_message_id_is_verified_different(tmp_path: Path) -> None:
+    # Real Outlook gives "" for an item that has no Message-ID: that item is
+    # really not the target, so a store holding only it is not_found.
+    _, _, run = _table_case(tmp_path, [FakeOutlookItem("sent", "Sent mail")])
+    assert run().status == "not_found"
+
+
+def test_duplicated_row_hiding_another_item_is_unreadable(tmp_path: Path) -> None:
+    # Row count matches Items.Count, but one row is listed twice and the
+    # target never appears: the listing does not show every item was seen.
+    other = FakeOutlookItem("other", "Other", "<other@example.com>")
+    target = FakeOutlookItem("target", "Target", "<target@example.com>")
+    folder, _, run = _table_case(tmp_path, [other, target])
+    original = folder.GetTable
+
+    def get_table():
+        table = original()
+
+        def duplicated(count):
+            table.EndOfTable = True
+            return (("<other@example.com>", "other"), ("<other@example.com>", "other"))
+
+        table.GetArray = duplicated
+        return table
+
+    folder.GetTable = get_table
+    result = run()
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
+def test_other_message_row_without_entry_id_is_unreadable(tmp_path: Path) -> None:
+    item = FakeOutlookItem("a", "Other", "<other@example.com>")
+    item.table_entry_id = ""
+    _, _, run = _table_case(tmp_path, [item])
+    result = run()
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
+@pytest.mark.parametrize("where", ["recorded", "other"])
+def test_table_missing_rows_against_item_count_is_unreadable(
+    tmp_path: Path, where: str
+) -> None:
+    hidden = FakeOutlookItem("ghost", "Target", "<target@example.com>")
+    hidden.omit_from_table = True
+    if where == "recorded":
+        result = _two_folder_case(tmp_path, [hidden], [])
+    else:
+        result = _two_folder_case(tmp_path, [], [hidden])
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
+def test_table_missing_rows_blocks_recorded_folder_export(tmp_path: Path) -> None:
+    visible = FakeOutlookItem("visible", "Target", "<target@example.com>")
+    hidden = FakeOutlookItem("ghost", "Target", "<target@example.com>")
+    hidden.omit_from_table = True
+    result = _two_folder_case(tmp_path, [visible, hidden], [])
+    assert result.status == "failed"
+    assert result.dest_path is None
+    assert "not found" not in (result.detail or "").lower()
+    assert "uniqueness" in (result.detail or "").lower()
