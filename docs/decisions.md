@@ -29,7 +29,7 @@
 | [D-20260813-1](decisions/D-20260813-1-design-doc-prs-get-no-follow-up-disposition.md) | 2026-08-13 | 設計文件型 PR 不給「先併、開 follow-up 票之後修」這個處置 | accepted |
 | [D-20260813-2](decisions/D-20260813-2-open-source-is-showcase-not-product.md) | 2026-08-13 | 開源的定位是展示成果，不是可用產品——它授權邊界工作，不授權跨平台支出 | accepted |
 | [D-20260820-1](decisions/D-20260820-1-review-trigger-is-change-size-not-pr.md) | 2026-08-20 | 語意 review 的觸發條件是變更 size，不是走不走 PR | accepted |
-| [D-20260820-2](decisions/D-20260820-2-excluded-ci-infrastructure-options.md) | 2026-08-20 | 三個 CI 基礎設施選項明文排除，「Free 方案」是所有 CI 決策的固定前提 | accepted |
+| [D-20260820-2](decisions/D-20260820-2-excluded-ci-infrastructure-options.md) | 2026-08-20 | 三個 CI 基礎設施選項明文排除，「Free 方案」是所有 CI 決策的固定前提 *(partially superseded by `D-20261113-1`: 公開 repo 改變費用與必要檢查的前提，理由 (1)(2) 被部分取代；理由 (3) 仍有效)* | accepted |
 | [D-20260820-3](decisions/D-20260820-3-migrate-to-contract-anchored-flowback.md) | 2026-08-20 | 退出 Spectra 鏈，遷移 Contract-Anchored Flow-Back | accepted |
 | [D-20260820-4](decisions/D-20260820-4-skill-ssot-deploy-trigger-main-commit.md) | 2026-08-20 | ~~skill→SSOT 自動部署的觸發改為「main commit + 內容不一致」~~ | ~~superseded~~ |
 | [D-20260821-1](decisions/D-20260821-1-retire-system-drive-hardware-guard.md) | 2026-08-21 | 退役 runtime-root 守門的系統碟（硬體動機）拒絕與其豁免機制 | accepted |
@@ -50,4 +50,5 @@
 | [D-20261105-1](decisions/D-20261105-1-table-fidelity-without-storing-html.md) | 2026-11-05 | 表格保真不靠存 HTML：轉換器轉對、轉不對就標提示、需要時匯出原信 | accepted |
 | [D-20261106-1](decisions/D-20261106-1-body-rederive-falls-back-to-message-id-match.md) | 2026-11-06 | 內文重做在原位置對不上時，改以 Message-ID 在所有 PST 找原信 | accepted |
 | [D-20261106-2](decisions/D-20261106-2-skill-ssot-deploy-only-on-release.md) | 2026-11-06 | skill→SSOT 部署只在發行時跑，拿掉 main commit 的 git hook | accepted |
+| [D-20261113-1](decisions/D-20261113-1-hosted-windows-full-is-merge-evidence.md) | 2026-11-13 | GitHub hosted Windows Full 作為合併證據 | accepted |
 <!-- END GENERATED ADR-INDEX -->

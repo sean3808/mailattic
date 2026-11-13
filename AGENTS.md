@@ -22,7 +22,7 @@ uv run bes <subcommand> [flags]            # CLI, runs the working tree
 
 # The launcher is the only pytest entry (a contract test patrols raw calls outside it)
 pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route Quick            # daily; not release evidence
-pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route Full             # closeout / merge / release evidence
+pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route Full             # development / fallback / release evidence; hosted-full on the PR is merge evidence
 pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route FullSequential   # when parallelism is suspect
 pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route Targeted tests\test_query.py::test_x
 
@@ -71,7 +71,7 @@ Two semantics fail silently when misused, returning a plausible-looking wrong an
 - **Every script is Python `.py`** (git hooks included): git hooks run as pre-commit framework local hooks (`entry: uv run python scripts/xxx.py`, `language: system`), and shell actions use stdlib (`subprocess` / `shutil` / `filecmp`).
 - **`PYTHONIOENCODING=utf-8`**: required when running Python directly or using the Python API; the `bes` CLI handles it internally.
 - **A WSL writer + a `/mnt/<drive>` destination → always robocopy or a tar bundle, whatever the file count**: on Windows, `robocopy "\\wsl$\Ubuntu-24.04\..." "C:\..." /E /Z /R:2 /W:2 /MT:8` (keep these conservative flags), or `tar -czf` on the WSL side first and then move it. `rsync` / `cp -a` / `tar -x` writing straight to `/mnt/c/...` once triggered a storage-controller reset and partial data corruption ([D-20260525-1](docs/decisions/D-20260525-1-no-wsl-write-to-mnt-drive.md)). Read [`docs/wsl-environment.md`](docs/wsl-environment.md) before any WSL operation (distro, mirror paths, uv location, docker mounts, the `run_sync.py` path trap).
-- **Work returned from a non-Windows environment (Linux cloud agent / WSL / container) is always a draft**: the canonical launcher and `pyright` commands run only on Windows; elsewhere only `ruff check` / `ruff format --check` / `deptry src` / `pip-audit` run. Open a **draft PR**; it becomes ready for review only after a local Windows `-Route Full` passes. A raw pytest pass outside the launcher is not evidence (host-difference bugs do not reproduce on Linux). Before dispatching, ask: does what this ticket must verify touch pwsh / the launcher / the registry / `.tools/`? If so, dispatch to a Windows environment (mechanism → quality-gates.md, `#61`).
+- **Work returned from a non-Windows environment (Linux cloud agent / WSL / container) is always a draft**: the canonical launcher and `pyright` commands run only on Windows; elsewhere only `ruff check` / `ruff format --check` / `deptry src` / `pip-audit` run. Open a **draft PR**; it becomes ready for review only after the hosted Windows Full passes (manually dispatch it for the draft's head). The `hosted-full` run on the PR is merge evidence; local Windows `-Route Full` remains a development check and fallback. A raw pytest pass outside the launcher is not evidence (host-difference bugs do not reproduce on Linux). Before dispatching, ask: does what this ticket must verify touch pwsh / the launcher / the registry / `.tools/`? If so, dispatch to a Windows environment (mechanism → quality-gates.md, `#61`).
 
 ### Tests and one-off artefacts
 
