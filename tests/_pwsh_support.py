@@ -118,10 +118,18 @@ def run_pwsh_command(
     env: dict[str, str] | None = None,
     timeout: float | None = None,
     check: bool = False,
+    bypass_execution_policy: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    """Run ``command`` via ``pwsh -Command``."""
+    """Run ``command`` via ``pwsh -Command``.
+
+    ``bypass_execution_policy=False`` drops ``-ExecutionPolicy Bypass``: the
+    local antivirus flags that flag combined with a dot-sourcing ``-Command``
+    as a suspicious PowerShell launch from python.exe, so callers whose scripts
+    are local and already allowed by the machine policy opt out.
+    """
+    policy_args = ["-ExecutionPolicy", "Bypass"] if bypass_execution_policy else []
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+        ["pwsh", "-NoProfile", *policy_args, "-Command", command],
         capture_output=True,
         text=True,
         encoding="utf-8",
