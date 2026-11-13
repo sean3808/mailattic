@@ -176,31 +176,43 @@ def _no_message_id_unresolved(
     )
 
 
+def _read_item_message_id(accessor: Any) -> str:
+    """The opened item's Message-ID, "" when it has none.
+
+    Raises when the value cannot be read: only a string (real Outlook returns
+    "" for an item without one, measured on 3 PSTs in #71) or MAPI_E_NOT_FOUND
+    proves what the item holds; anything else is "could not check", never
+    "verified as another message" (ruling 3).
+    """
+    if accessor is None:
+        raise LookupError("item has no PropertyAccessor")
+    try:
+        value = accessor.GetProperty(PR_INTERNET_MESSAGE_ID)
+    except Exception as exc:
+        hresult = getattr(exc, "hresult", None)
+        if hresult is None and len(getattr(exc, "args", ())) > 0:
+            hresult = exc.args[0]
+        if hresult == -2147221233:  # MAPI_E_NOT_FOUND (0x8004010F)
+            return ""
+        raise
+    if not isinstance(value, str):
+        raise TypeError(f"Message-ID read as {type(value).__name__}, not text")
+    return value
+
+
 def _verify_outlook_item(item: Any, message: Mapping[str, object]) -> bool:
-    """Check whether *item* matches *message*, strictly preventing wrong-mail export."""
+    """Check whether *item* matches *message*, strictly preventing wrong-mail export.
+
+    False means verified to be another message; a read that proves nothing raises.
+    """
     db_msg_id = message.get("message_id")
     accessor = getattr(item, "PropertyAccessor", None)
-    item_msg_id = None
-    if accessor:
-        try:
-            item_msg_id = accessor.GetProperty(PR_INTERNET_MESSAGE_ID)
-        except (KeyError, IndexError):
-            item_msg_id = None
-        except Exception as exc:
-            hresult = getattr(exc, "hresult", None)
-            if hresult is None and len(getattr(exc, "args", ())) > 0:
-                hresult = exc.args[0]
-            if hresult == -2147221233:  # MAPI_E_NOT_FOUND (0x8004010F)
-                item_msg_id = None
-            else:
-                raise
 
     if db_msg_id:
+        item_msg_id = _read_item_message_id(accessor)
         if not item_msg_id:
             return False
-        return normalize_message_id(str(item_msg_id)) == normalize_message_id(
-            str(db_msg_id)
-        )
+        return normalize_message_id(item_msg_id) == normalize_message_id(str(db_msg_id))
 
     # Without a Message-ID a subject alone cannot identify a message (a reused
     # EntryID or UID can point at another message with the same subject).
@@ -352,17 +364,32 @@ class _ScanTally:
 
 _TABLE_BATCH_ROWS = 512
 
+# Table string columns are cut at 255 characters (one real row measured, #71).
+# A value this long may be a cut-off copy of the target, so it proves nothing.
+_TABLE_TRUNCATION_RISK = 250
+
+
+def _usable_entry_id(entry_id: object) -> str | None:
+    if isinstance(entry_id, str) and entry_id.strip():
+        return entry_id
+    return None
+
 
 def _matching_entries(
     folder: Any, expected: str, tally: _ScanTally, missing: list[str]
-) -> list[tuple[str, bool]]:
-    """Find matching Message-IDs in batches without opening every item.
+) -> list[str | None]:
+    """Read *folder*'s Message-IDs in batches without opening every item.
 
-    Returns (EntryID, exact) pairs: exact is False for a 255-character
-    prefix match, which is only a candidate until its full Message-ID is read.
-    Rows whose Message-ID the table could not give are appended to *missing*.
+    Each row is decided once. It is set aside only on positive proof that it is
+    another message: a plain, non-blank string, too short to be truncated, that
+    normalises to something other than *expected*. A row that equals *expected*
+    is returned as a hit (None when it has no usable EntryID, so the caller
+    reports it as found but unconfirmed). Every other row -- None, blank,
+    non-text, possibly truncated, or any shape not foreseen -- goes to *missing*
+    to be opened, or is counted unreadable when it cannot be opened. A table
+    that yields fewer rows than the folder holds is counted unreadable.
     """
-    matches: list[tuple[str, bool]] = []
+    hits: list[str | None] = []
     try:
         table = folder.GetTable()
         table.Columns.RemoveAll()
@@ -370,10 +397,13 @@ def _matching_entries(
         table.Columns.Add("EntryID")
     except Exception:
         tally.unreadable += 1
-        return matches
+        return hits
+    seen = 0
+    complete = False
     while True:
         try:
             if table.EndOfTable:
+                complete = True
                 break
             rows = table.GetArray(_TABLE_BATCH_ROWS)
             ended = table.EndOfTable
@@ -384,23 +414,28 @@ def _matching_entries(
             tally.unreadable += 1
             break
         for msg_id, entry_id in rows:
-            if msg_id is None:
-                if entry_id:
-                    missing.append(str(entry_id))
-                else:
-                    tally.unreadable += 1
-            elif msg_id:
-                raw_id = str(msg_id)
-                normalized = normalize_message_id(raw_id)
-                # A table string column can be cut at 255 characters; a
-                # prefix match is only a candidate, confirmed later in full.
-                exact = normalized == expected
-                if exact or (len(raw_id) >= 255 and expected.startswith(normalized)):
-                    if not entry_id:
-                        tally.unreadable += 1
-                    else:
-                        matches.append((str(entry_id), exact))
-    return matches
+            seen += 1
+            entry = _usable_entry_id(entry_id)
+            if isinstance(msg_id, str) and len(msg_id) < _TABLE_TRUNCATION_RISK:
+                normalized = normalize_message_id(msg_id)
+                if normalized == expected:
+                    hits.append(entry)
+                    continue
+                if normalized:
+                    continue  # proven to be another message
+            if entry is None:
+                tally.unreadable += 1
+            else:
+                missing.append(entry)
+    if complete:
+        try:
+            item_count = int(folder.Items.Count)
+        except Exception:
+            tally.unreadable += 1
+        else:
+            if item_count != seen:
+                tally.unreadable += 1
+    return hits
 
 
 _PST_AMBIGUOUS = "Ambiguous: the message was found more than once in the PST"
@@ -477,23 +512,24 @@ def _find_pst_item(
 
     unconfirmed = (None, "A matching table row was found but could not be confirmed.")
 
-    def confirm(hits: list[tuple[str, bool]]) -> list[Any] | None:
-        """Open every table hit and keep those whose full identity verifies.
+    def confirm(hits: list[str | None]) -> list[Any] | None:
+        """Open every table hit; each must verify as the target.
 
-        A prefix-only hit whose full Message-ID differs is simply not a match.
-        An exact hit that cannot be opened, or opens as a different message,
-        contradicts the table: None (ruling 1, unsure means fail).
+        A hit without a usable EntryID, one that cannot be opened, or one that
+        opens as a different message contradicts the table: None (ruling 1,
+        unsure means fail), never a fall-back to a copy elsewhere (ruling 5).
         """
         found: list[Any] = []
-        for entry, exact in hits:
+        for entry in hits:
+            if entry is None:
+                return None
             try:
                 item = open_verified(entry)
             except Exception:
                 return None
-            if item is not None:
-                found.append(item)
-            elif exact:
+            if item is None:
                 return None
+            found.append(item)
         return found
 
     def hidden(entries: list[str], already: int) -> list[Any]:
@@ -543,7 +579,7 @@ def _find_pst_item(
                 return _single_match(folder_found, _PST_AMBIGUOUS)
 
     # 3. Fall back to scanning the whole store by Message-ID
-    candidates: list[tuple[str, bool]] = []
+    candidates: list[str | None] = []
     try:
         target_entry = getattr(target_folder, "EntryID", None)
     except Exception:

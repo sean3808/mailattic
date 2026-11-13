@@ -49,6 +49,10 @@ class FakeAccessor:
 
     def GetProperty(self, name: str) -> object:
         if name not in self._values:
+            if name == PR_INTERNET_MESSAGE_ID:
+                # Real Outlook returns "" for an item without a Message-ID
+                # rather than raising (measured on 3 PSTs, #71).
+                return ""
             raise KeyError(name)
         value = self._values[name]
         if isinstance(value, Exception):
@@ -89,8 +93,17 @@ class FakeOutlookFolder:
     def __init__(self, name: str, items: list[FakeOutlookItem] | None = None) -> None:
         self.Name = name
         self._items = items or []
-        self.Items = FakeCollection(*self._items)
+        self._items_missing = False
         self.Folders = FakeCollection()
+
+    @property
+    def Items(self):  # noqa: N802 - Outlook COM name
+        # Live view, so tests that add items later keep Items.Count in step.
+        return None if self._items_missing else FakeCollection(*self._items)
+
+    @Items.setter
+    def Items(self, value) -> None:  # noqa: N802
+        self._items_missing = value is None
 
     def GetTable(self):
         if self.Items is None:
@@ -118,16 +131,22 @@ class FakeTable:
     def GetArray(self, count):
         self.calls += 1
         rows = []
-        for item in self.items[self.position : self.position + count]:
+        batch = self.items[self.position : self.position + count]
+        for item in batch:
+            self.registry[item.EntryID] = item
+            if getattr(item, "omit_from_table", False):
+                continue  # a row the table silently never returns
             try:
                 value = item.PropertyAccessor.GetProperty(PR_INTERNET_MESSAGE_ID)
             except Exception:
                 value = None
+            if value == "":
+                value = None  # real tables show a missing Message-ID as None
             value = getattr(item, "table_message_id", value)
-            self.registry[item.EntryID] = item
-            values = {PR_INTERNET_MESSAGE_ID: value, "EntryID": item.EntryID}
+            entry = getattr(item, "table_entry_id", item.EntryID)
+            values = {PR_INTERNET_MESSAGE_ID: value, "EntryID": entry}
             rows.append(tuple(values[name] for name in self.columns))
-        self.position += len(rows)
+        self.position += len(batch)
         self.EndOfTable = self.position >= len(self.items)
         return rows
 
@@ -2294,3 +2313,142 @@ def test_table_hit_without_store_id_is_confirmed(tmp_path: Path) -> None:
     )
     del namespace.Stores.Item(1).StoreID
     assert run().status == "exported"
+
+
+# --- #71 route after the review cap: "not the target" needs positive proof ----
+# A row is set aside unopened only when the table gives a plain, untruncated,
+# non-blank string that differs from the target. Every other shape -- the ones
+# listed here and any not yet seen -- must be opened or counted as unreadable,
+# so it can never turn into not_found (ruling 3) or hide a copy (ruling 5).
+
+_LONG_OTHER = "<" + "b" * 250 + "@example.com>"
+_UNTRUSTED_TABLE_VALUES = {
+    "none": None,
+    "empty": "",
+    "blank": "  \t",
+    "brackets_only": "<>",
+    "bytes": b"<target@example.com>",
+    "empty_bytes": b"",
+    "zero": 0,
+    "hresult": -2147221233,
+    "false": False,
+    "error_object": RuntimeError("table cell error"),
+    "tuple": ("<target@example.com>",),
+    "long_other": _LONG_OTHER,
+}
+
+
+@pytest.mark.parametrize("shape", list(_UNTRUSTED_TABLE_VALUES))
+def test_untrusted_table_value_is_opened_not_skipped(
+    tmp_path: Path, shape: str
+) -> None:
+    target = FakeOutlookItem("a", "Target", "<target@example.com>")
+    target.table_message_id = _UNTRUSTED_TABLE_VALUES[shape]
+    _, _, run = _table_case(tmp_path, [target])
+    result = run()
+    assert result.status == "exported"
+    assert result.dest_path is not None
+
+
+@pytest.mark.parametrize("shape", list(_UNTRUSTED_TABLE_VALUES))
+def test_untrusted_table_value_counts_toward_ambiguity(
+    tmp_path: Path, shape: str
+) -> None:
+    visible = FakeOutlookItem("visible", "Target", "<target@example.com>")
+    copy = FakeOutlookItem("copy", "Target", "<target@example.com>")
+    copy.table_message_id = _UNTRUSTED_TABLE_VALUES[shape]
+    result = _two_folder_case(tmp_path, [], [visible, copy])
+    assert result.status == "failed"
+    assert "Ambiguous" in (result.detail or "")
+
+
+@pytest.mark.parametrize("entry", [None, "", "   ", 0, b"a"])
+def test_untrusted_row_without_usable_entry_id_is_unreadable(
+    tmp_path: Path, entry: object
+) -> None:
+    item = FakeOutlookItem("a", "Target", "<target@example.com>")
+    item.table_message_id = ""
+    item.table_entry_id = entry
+    _, _, run = _table_case(tmp_path, [item])
+    result = run()
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
+@pytest.mark.parametrize("entry", [None, "", "   "])
+def test_exact_table_hit_that_cannot_be_opened_does_not_export_another_copy(
+    tmp_path: Path, entry: object
+) -> None:
+    # The recorded folder's table says the message is here, but the row has no
+    # usable EntryID: a copy elsewhere must not be exported in its place.
+    here = FakeOutlookItem("here", "Target", "<target@example.com>")
+    here.table_entry_id = entry
+    result = _two_folder_case(
+        tmp_path, [here], [FakeOutlookItem("other", "Target", "<target@example.com>")]
+    )
+    assert result.status == "failed"
+    assert result.dest_path is None
+
+
+class _NoIdAccessor:
+    """An opened item whose Message-ID cannot be read in the given way."""
+
+    def __init__(self, outcome: object) -> None:
+        self._outcome = outcome
+
+    def GetProperty(self, name: str) -> object:  # noqa: N802
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self._outcome
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["no_accessor", KeyError("x"), IndexError(0), None, 0, b"<x@example.com>"],
+    ids=["no_accessor", "key_error", "index_error", "none", "int", "bytes"],
+)
+def test_opened_item_with_unreadable_identity_is_not_not_found(
+    tmp_path: Path, outcome: object
+) -> None:
+    item = FakeOutlookItem("a", "Target", "<target@example.com>")
+    item.table_message_id = None
+    _, namespace, run = _table_case(tmp_path, [item])
+    opened = FakeOutlookItem("a", "Target")
+    if outcome == "no_accessor":
+        opened.PropertyAccessor = None  # type: ignore[assignment]
+    else:
+        opened.PropertyAccessor = _NoIdAccessor(outcome)  # type: ignore[assignment]
+    namespace._items_by_id["a"] = opened
+    result = run()
+    assert result.status == "failed"
+    assert result.dest_path is None
+
+
+def test_item_without_message_id_is_verified_different(tmp_path: Path) -> None:
+    # Real Outlook gives "" for an item that has no Message-ID: that item is
+    # really not the target, so a store holding only it is not_found.
+    _, _, run = _table_case(tmp_path, [FakeOutlookItem("sent", "Sent mail")])
+    assert run().status == "not_found"
+
+
+@pytest.mark.parametrize("where", ["recorded", "other"])
+def test_table_missing_rows_against_item_count_is_unreadable(
+    tmp_path: Path, where: str
+) -> None:
+    hidden = FakeOutlookItem("ghost", "Target", "<target@example.com>")
+    hidden.omit_from_table = True
+    if where == "recorded":
+        result = _two_folder_case(tmp_path, [hidden], [])
+    else:
+        result = _two_folder_case(tmp_path, [], [hidden])
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
+def test_table_missing_rows_blocks_recorded_folder_export(tmp_path: Path) -> None:
+    visible = FakeOutlookItem("visible", "Target", "<target@example.com>")
+    hidden = FakeOutlookItem("ghost", "Target", "<target@example.com>")
+    hidden.omit_from_table = True
+    result = _two_folder_case(tmp_path, [visible, hidden], [])
+    assert result.status == "failed"
+    assert result.dest_path is None
