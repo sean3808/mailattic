@@ -6,11 +6,9 @@ name: CI
 # gitignored vendored files proves that this commit is complete and installable.
 # Neither of them runs pytest.
 #
-# `hosted-full` does run the canonical launcher's Full route, but only from the
-# weekly schedule or a manual dispatch (#62). It is a supplemental
-# environment-compatibility probe, not merge or release evidence -- those still
-# come from a local Full run. See docs/agents/quality-gates.md for what each
-# green signal does and does not mean.
+# `hosted-full` runs the canonical launcher's Full route and is merge evidence.
+# It also runs on the weekly schedule and manual dispatch. See
+# docs/agents/quality-gates.md for what each green signal does and does not mean.
 
 on:
   pull_request:
@@ -30,8 +28,8 @@ concurrency:
 
 jobs:
   static:
-    # Draft pull requests do not run: agents push often and Windows minutes bill
-    # at 2x. Marking a pull request ready for review triggers the run.
+    # Draft pull requests do not run: agents push often. Marking a pull request
+    # ready for review triggers the run.
     if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     # windows-latest only, and no matrix. Pyright is configured with
     # pythonPlatform = "Windows" and a .venv/Scripts/python.exe interpreter path,
@@ -117,7 +115,7 @@ jobs:
           bes-mcp --help
 
   hosted-full:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: windows-latest
     timeout-minutes: 20
     steps:

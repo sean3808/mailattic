@@ -573,28 +573,21 @@ The `package` job builds the wheel, installs *the built wheel* as a uv tool,
 and starts both console scripts. A `[tool.hatch]` packages list that omits a
 module fails here rather than during a release.
 
-The `hosted-full` job is a supplemental environment-compatibility probe. It
-runs only from the weekly schedule (`23 18 * * 0`, Monday 02:23 Asia/Taipei)
-or manual dispatch, and calls the same canonical launcher with `-Route Full`.
-A scheduled run executes only `hosted-full`; a manual dispatch intentionally
-runs all three jobs for the selected ref. Pull requests and pushes never make
-`hosted-full` eligible.
-
-This cadence bounds automatic usage at four or five automatic Full runs per
-month. Using issue #62's measured estimate of 12–16 Windows allowance minutes
-per Full run, that is approximately 48–80 allowance minutes per month before
-manual runs. Manual dispatch is reserved for changes whose risk specifically
-concerns Python, PowerShell, the launcher, runtime isolation, or hosted Windows
-behavior.
+The `hosted-full` job is merge evidence. It runs on every non-draft pull request
+and push to main, as well as the weekly schedule (`23 18 * * 0`, Monday 02:23
+Asia/Taipei) and manual dispatch, and calls the canonical launcher with
+`-Route Full`. A scheduled run executes only `hosted-full`; a manual dispatch
+runs all three jobs for the selected ref. To check a draft before marking it
+ready, manually dispatch its head ref. Local Full remains a development check
+and fallback; release evidence still uses local Full.
 
 The two green signals have different meanings:
 
 - Green `static` plus `package` means the recorded commit installs and starts
   on a clean Windows host.
 - Green `hosted-full` means the recorded commit completed the canonical Full
-  route on that GitHub-hosted Windows runner. It does not replace local Full
-  evidence for merge readiness or release, and says nothing about a later
-  commit.
+  route on that GitHub-hosted Windows runner. The PR run is merge evidence;
+  it says nothing about a later commit or release evidence.
 
 Both test failures and operational failures leave `hosted-full` non-successful,
 but they are not the same diagnosis. A launcher rejection, unavailable tool,
@@ -611,6 +604,4 @@ Neither green signal means anything more than stated above, and in particular:
   `scripts/release.ps1` stages 3-4; see
   [`docs/global-install-and-release.md`](../global-install-and-release.md).
 
-No status check is required for merge: this repository is a GitHub Free
-repository, where branch protection and rulesets are not available. CI is
-advisory signal that a human reads, not a gate that blocks.
+The `hosted-full` status check is required on main for merge (#70).

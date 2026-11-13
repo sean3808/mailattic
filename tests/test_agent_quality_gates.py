@@ -74,7 +74,7 @@ def _ci_workflow() -> dict[str, object]:
     )
 
 
-def test_hosted_windows_full_is_frequency_bounded_and_canonical() -> None:
+def test_hosted_windows_full_is_merge_evidence_and_canonical() -> None:
     config = _ci_workflow()
     events = config["on"]
     jobs = config["jobs"]
@@ -82,9 +82,18 @@ def test_hosted_windows_full_is_frequency_bounded_and_canonical() -> None:
 
     assert events["schedule"] == [{"cron": "23 18 * * 0"}]
     assert "workflow_dispatch" in events
+    # D-20261113-1: PRs and main pushes join schedule and manual dispatch.
     assert hosted_full["if"] == (
-        "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+        "github.event_name != 'pull_request' || "
+        "github.event.pull_request.draft == false"
     )
+    assert events["pull_request"]["types"] == [
+        "opened",
+        "synchronize",
+        "reopened",
+        "ready_for_review",
+    ]
+    assert events["push"]["branches"] == ["main"]
     assert hosted_full["runs-on"] == "windows-latest"
 
     run_steps = [step["run"] for step in hosted_full["steps"] if "run" in step]
@@ -108,7 +117,7 @@ def test_hosted_windows_full_is_frequency_bounded_and_canonical() -> None:
     )
 
 
-def test_ci_docs_distinguish_hosted_full_from_local_gate_evidence() -> None:
+def test_ci_docs_identify_hosted_full_as_merge_evidence() -> None:
     # The cron itself is pinned by the workflow-contract test above; this one
     # owns only the documentation half of the contract.
     docs = _normalize_whitespace(QUALITY_GATES.read_text(encoding="utf-8"))
@@ -116,9 +125,15 @@ def test_ci_docs_distinguish_hosted_full_from_local_gate_evidence() -> None:
     assert "`hosted-full`" in docs
     assert "weekly schedule" in docs
     assert "manual dispatch" in docs
-    assert "supplemental environment-compatibility probe" in docs
-    assert "four or five automatic Full runs per month" in docs
-    assert "does not replace local Full evidence for merge readiness or release" in docs
+    assert "`hosted-full` job is merge evidence" in docs
+    assert "every non-draft pull request and push to main" in docs
+    assert "release evidence still uses local Full" in docs
+    assert (
+        "does not replace local Full evidence for merge readiness or release"
+        not in docs
+    )
+    assert "supplemental environment-compatibility probe" not in docs
+    assert "No status check is required for merge" not in docs
     assert "operational failure" in docs
     assert "No test is executed." not in docs
 
