@@ -121,6 +121,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # scripts/record_ci_green_tree.py reads the tested tree from this notice.
+      - name: Record tested tree
+        shell: bash
+        run: echo "::notice title=tested-tree::$(git rev-parse 'HEAD^{tree}')"
+
       - uses: astral-sh/setup-uv@v9.0.0
 
       - name: Sync the locked environment

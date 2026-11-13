@@ -7,6 +7,10 @@ code plus output you have to read.
 This document is the canonical list. Run the command exactly as written — the
 flags are part of the gate, not decoration.
 
+## Reusing a hosted Full at closeout
+
+Before `/closeout`, run `uv run python scripts/record_ci_green_tree.py` to record a matching successful GitHub-hosted Full run. The script only reads existing CI results; it neither waits for nor triggers CI, so run it after the branch is pushed and its `hosted-full` job has finished. If no record matches, closeout runs local Full as usual. A reused green tree does not run the gitignored local-only tests `tests/test_recipient_rebuild_audit.py` and `tests/test_recipient_rebuild_apply.py`; run them with `-Route Targeted` when a change touches recipient rebuild.
+
 ## Commit-time preconditions
 
 Commit-time parity requires the tracked hooks to be installed with:
