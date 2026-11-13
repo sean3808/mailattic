@@ -48,7 +48,12 @@ def _run(
 
 def _run_release_function(command: str) -> subprocess.CompletedProcess[str]:
     script = f". {ps_quote(RELEASE_SCRIPT)}; {command}"
-    return run_pwsh_command(script, check=False, env=git_env_without_auto_maintenance())
+    return run_pwsh_command(
+        script,
+        check=False,
+        env=git_env_without_auto_maintenance(),
+        bypass_execution_policy=False,
+    )
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
