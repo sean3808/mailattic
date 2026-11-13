@@ -279,13 +279,17 @@ def _resolve_pst_store(
     sharing the recorded filename when the recorded path itself is gone."""
     expected_path = _normalized_windows_path(pst_source)
     expected_name = Path(pst_source).name.casefold()
-    stores = getattr(namespace, "Stores", None)
+    try:
+        stores = getattr(namespace, "Stores", None)
+        store_count = int(getattr(stores, "Count", 0)) if stores is not None else 0
+    except Exception as exc:
+        return None, f"Stores mounted in Outlook could not be read: {exc}"
     if stores is None:
         return None, None
 
     entries: list[tuple[Any, str, str]] = []  # (store, normalized path, name)
     unreadable = 0
-    for i in range(1, int(getattr(stores, "Count", 0)) + 1):
+    for i in range(1, store_count + 1):
         try:
             store = stores.Item(i)
             fp = getattr(store, "FilePath", None)
@@ -417,8 +421,8 @@ def _matching_entries(
             seen += 1
             try:
                 msg_id, entry_id = row
-            except (TypeError, ValueError):
-                tally.unreadable += 1  # a row of the wrong shape proves nothing
+            except Exception:
+                tally.unreadable += 1  # a row that cannot be read proves nothing
                 continue
             entry = _usable_entry_id(entry_id)
             if isinstance(msg_id, str) and len(msg_id) < _TABLE_TRUNCATION_RISK:

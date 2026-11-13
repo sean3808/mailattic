@@ -1476,6 +1476,29 @@ def test_unreadable_store_with_no_match_fails_instead_of_not_found(
     assert "1 store" in (result.detail or "")
 
 
+class _UnreadableStores:
+    @property
+    def Count(self) -> int:  # noqa: N802
+        raise RuntimeError("stores offline")
+
+
+def test_unreadable_store_list_fails_instead_of_raising(tmp_path: Path) -> None:
+    pst_file = str(tmp_path / "archive_2024.pst")
+    db_path, db_id = _seed_pst_message(tmp_path, pst_path=pst_file)
+    namespace = FakeOutlookNamespace([])
+    namespace.Stores = _UnreadableStores()  # type: ignore[assignment]
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        outlook_reader=FakeOutlookReader(namespace),
+    )
+
+    assert result.status == "failed"
+    assert "could not be read" in (result.detail or "")
+
+
 def test_unreadable_store_with_matching_other_store_still_exports(
     tmp_path: Path,
 ) -> None:
@@ -2181,9 +2204,16 @@ def test_fake_namespace_only_opens_emitted_rows(tmp_path: Path) -> None:
     assert namespace.GetItemFromID("a") is item
 
 
+class _RaisingRow:
+    """A table row whose values cannot be read (iteration raises)."""
+
+    def __iter__(self):
+        raise RuntimeError("COM row read failed")
+
+
 @pytest.mark.parametrize(
     "batch",
-    [[("bad",)], [("a", "b", "c")], [None], [42], None, 42],
+    [[("bad",)], [("a", "b", "c")], [None], [42], None, 42, [_RaisingRow()]],
     ids=[
         "one_column",
         "three_columns",
@@ -2191,6 +2221,7 @@ def test_fake_namespace_only_opens_emitted_rows(tmp_path: Path) -> None:
         "int_row",
         "none_batch",
         "int_batch",
+        "row_read_raises",
     ],
 )
 def test_malformed_table_batch_is_unreadable_not_raised(
