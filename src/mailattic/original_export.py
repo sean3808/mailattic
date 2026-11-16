@@ -894,6 +894,127 @@ def _verify_imap_rfc822(rfc822: bytes, message: Mapping[str, object]) -> bool:
     )
 
 
+_IMAP_CONNECTION_ERRORS = (
+    imaplib.IMAP4.abort,
+    OSError,
+    EOFError,
+    TimeoutError,
+)
+
+
+def _search_folder_by_message_id(
+    client: Any,
+    message: Mapping[str, object],
+    normalized_msg_id: str,
+) -> tuple[list[bytes], int, str | None, bool]:
+    """Search the currently selected IMAP folder by Message-ID and verify hits.
+
+    Returns ``(candidates, unreadable_count, error_message, is_connection_abort)``.
+    """
+    try:
+        raw_uids = client.search_uids_by_message_id(normalized_msg_id)
+    except _IMAP_CONNECTION_ERRORS as exc:
+        return [], 0, f"IMAP SEARCH protocol error: {exc}", True
+    except imaplib.IMAP4.error as exc:
+        return [], 0, f"IMAP SEARCH protocol error: {exc}", False
+    except Exception as exc:
+        return [], 0, f"IMAP SEARCH failed: {exc}", False
+
+    candidates: list[bytes] = []
+    unreadable_count = 0
+    for uid in raw_uids:
+        try:
+            candidate_bytes = client.fetch_rfc822(uid)
+            if candidate_bytes and _verify_imap_rfc822(candidate_bytes, message):
+                candidates.append(candidate_bytes)
+        except _IMAP_CONNECTION_ERRORS as exc:
+            return (
+                [],
+                unreadable_count,
+                f"IMAP abort or connection failure fetching UID {uid}: {exc}",
+                True,
+            )
+        except Exception:
+            unreadable_count += 1
+            continue
+    return candidates, unreadable_count, None, False
+
+
+def _search_other_imap_folders(
+    client: Any,
+    message: Mapping[str, object],
+    normalized_msg_id: str,
+    recorded_wire_name: str,
+    unreadable_count: int,
+) -> tuple[bytes | None, str | None]:
+    """Search all other IMAP folders by Message-ID when recorded folder missed."""
+    try:
+        folders = client.list_folders()
+    except Exception as exc:
+        return None, f"Failed to list IMAP folders: {exc}"
+
+    skipped = list(getattr(client, "skipped_listings", []) or [])
+    cross_matches: list[tuple[str, bytes]] = []
+    folder_errors: list[str] = []
+
+    for folder in folders:
+        folder_wire = getattr(folder, "wire_name", None)
+        if not folder_wire:
+            continue
+        if folder_wire == recorded_wire_name or (
+            recorded_wire_name.upper() == "INBOX" and folder_wire.upper() == "INBOX"
+        ):
+            continue
+        folder_display = getattr(folder, "display_name", None) or folder_wire
+        try:
+            client.select_folder(folder_wire)
+        except _IMAP_CONNECTION_ERRORS as exc:
+            return (
+                None,
+                "IMAP abort or connection failure selecting folder "
+                f"{folder_display!r}: {exc}",
+            )
+        except Exception as exc:
+            folder_errors.append(
+                f"Failed to SELECT folder {folder_display!r} on IMAP server: {exc}"
+            )
+            continue
+
+        candidates, folder_unreadable, search_err, is_abort = (
+            _search_folder_by_message_id(client, message, normalized_msg_id)
+        )
+        unreadable_count += folder_unreadable
+        if is_abort and search_err is not None:
+            return None, search_err
+        if search_err is not None:
+            folder_errors.append(f"Folder {folder_display!r}: {search_err}")
+            continue
+        for candidate_bytes in candidates:
+            cross_matches.append((folder_display, candidate_bytes))
+
+    if len(cross_matches) > 1:
+        matched_folders = ", ".join(
+            repr(name) for name in dict.fromkeys(name for name, _ in cross_matches)
+        )
+        return (
+            None,
+            "Ambiguous: the message was found more than once on the IMAP server "
+            f"across folders {matched_folders} ({len(cross_matches)} matches)",
+        )
+    if len(cross_matches) == 1:
+        return cross_matches[0][1], None
+    if skipped:
+        return (
+            None,
+            "Target message not found in accessible folders and "
+            f"{len(skipped)} IMAP folder listing(s) could not be decoded: "
+            + "; ".join(skipped),
+        )
+    if folder_errors:
+        return None, "; ".join(folder_errors)
+    return _nothing_found(unreadable_count)
+
+
 def _find_imap_rfc822(
     client: Any,
     message: Mapping[str, object],
@@ -907,16 +1028,16 @@ def _find_imap_rfc822(
         return None, f"Failed to SELECT folder {folder_path!r} on IMAP server: {exc}"
 
     unreadable_count = 0
+    db_msg_id = message.get("message_id")
 
     # 1. Try UID from logical_locator
     locator = str(message.get("logical_locator") or "")
     match = re.search(r"(?:^|[\W_])(?:uid-|U=)(\d+)", locator, re.IGNORECASE)
     if match:
         uid = int(match.group(1))
+        rfc822: bytes | None = None
         try:
             rfc822 = client.fetch_rfc822(uid)
-            if rfc822 and _verify_imap_rfc822(rfc822, message):
-                return rfc822, None
         except (
             imaplib.IMAP4.abort,
             imaplib.IMAP4.error,
@@ -926,49 +1047,30 @@ def _find_imap_rfc822(
         ) as exc:
             return None, f"IMAP error fetching UID {uid}: {exc}"
         except Exception:
-            unreadable_count += 1
+            # A stale UID (moved/deleted) is resolved by Message-ID search below;
+            # only count it unreadable when there is no Message-ID fallback.
+            if not db_msg_id:
+                unreadable_count += 1
+        if rfc822:
+            try:
+                if _verify_imap_rfc822(rfc822, message):
+                    return rfc822, None
+            except Exception:
+                unreadable_count += 1
 
-    # 2. Try Message-ID search
-    db_msg_id = message.get("message_id")
+    # 2. Try Message-ID search in the recorded folder
     if not db_msg_id:
         return _no_message_id_unresolved("server UID", unreadable_count)
 
     # HEADER search is a substring match, so the bare id also finds the
     # bracketed header value.
-    try:
-        raw_uids = client.search_uids_by_message_id(
-            normalize_message_id(str(db_msg_id))
-        )
-    except (
-        imaplib.IMAP4.abort,
-        imaplib.IMAP4.error,
-        OSError,
-        EOFError,
-        TimeoutError,
-    ) as exc:
-        return None, f"IMAP SEARCH protocol error: {exc}"
-    except Exception as exc:
-        return None, f"IMAP SEARCH failed: {exc}"
-
-    candidates: list[bytes] = []
-    for uid in raw_uids:
-        try:
-            candidate_bytes = client.fetch_rfc822(uid)
-            if candidate_bytes and _verify_imap_rfc822(candidate_bytes, message):
-                candidates.append(candidate_bytes)
-        except (
-            imaplib.IMAP4.abort,
-            OSError,
-            EOFError,
-            TimeoutError,
-        ) as exc:
-            return (
-                None,
-                f"IMAP abort or connection failure fetching UID {uid}: {exc}",
-            )
-        except Exception:
-            unreadable_count += 1
-            continue
+    normalized_msg_id = normalize_message_id(str(db_msg_id))
+    candidates, folder_unreadable, search_err, _ = _search_folder_by_message_id(
+        client, message, normalized_msg_id
+    )
+    if search_err is not None:
+        return None, search_err
+    unreadable_count += folder_unreadable
 
     if candidates:
         return _single_match(
@@ -976,7 +1078,10 @@ def _find_imap_rfc822(
             "Ambiguous: the message was found more than once on the IMAP server",
         )
 
-    return _nothing_found(unreadable_count)
+    # 3. Recorded folder had no match: search all other folders by Message-ID
+    return _search_other_imap_folders(
+        client, message, normalized_msg_id, wire_name, unreadable_count
+    )
 
 
 def _load_default_imap_client(env_file: Path | None = None) -> Any | None:

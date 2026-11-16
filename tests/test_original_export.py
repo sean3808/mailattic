@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from mailattic import original_export
+from mailattic.imap_native import ImapFolder
 from mailattic.models import MaildirSource, PstSource, build_normalized_message
 from mailattic.original_export import (
     export_original_message,
@@ -202,26 +203,45 @@ class FakeImapConnection:
         self,
         rfc822_by_uid: dict[int, bytes],
         uids_by_header: dict[str, list[int]] | None = None,
+        *,
+        folders: list[ImapFolder] | None = None,
+        folder_rfc822_by_uid: dict[str, dict[int, bytes]] | None = None,
+        folder_uids_by_header: dict[str, dict[str, list[int]]] | None = None,
+        select_errors: dict[str, Exception] | None = None,
+        skipped_listings: list[str] | None = None,
     ) -> None:
         self.rfc822_by_uid = rfc822_by_uid
         self.uids_by_header = uids_by_header or {}
+        self.folders = list(folders or [])
+        self.folder_rfc822_by_uid = folder_rfc822_by_uid or {}
+        self.folder_uids_by_header = folder_uids_by_header or {}
+        self.select_errors = select_errors or {}
+        self.skipped_listings = list(skipped_listings or [])
         self.selected_folder: str | None = None
 
     def select(self, folder: str, readonly: bool = True) -> tuple[str, list[object]]:
+        if folder in self.select_errors:
+            raise self.select_errors[folder]
         self.selected_folder = folder
         return "OK", [b"1"]
 
     def uid(self, command: str, *args: str) -> tuple[str, list[object]]:
+        rfc822_map = self.folder_rfc822_by_uid.get(
+            self.selected_folder or "", self.rfc822_by_uid
+        )
+        header_map = self.folder_uids_by_header.get(
+            self.selected_folder or "", self.uids_by_header
+        )
         if command.upper() == "FETCH":
             uid = int(args[0])
-            if uid in self.rfc822_by_uid:
-                body = self.rfc822_by_uid[uid]
+            if uid in rfc822_map:
+                body = rfc822_map[uid]
                 return "OK", [(b"1 (BODY[]", body)]
             return "NO", [b"UID not found"]
         if command.upper() == "SEARCH":
             # e.g. SEARCH HEADER Message-ID <foo@bar>
             search_str = " ".join(args)
-            for key, uids in self.uids_by_header.items():
+            for key, uids in header_map.items():
                 if key in search_str:
                     uid_str = " ".join(str(u) for u in uids).encode("ascii")
                     return "OK", [uid_str]
@@ -233,6 +253,7 @@ class FakeImapClient:
     def __init__(self, connection: FakeImapConnection) -> None:
         self._conn = connection
         self.close_calls = 0
+        self.skipped_listings: list[str] = list(connection.skipped_listings)
 
     def close(self) -> None:
         self.close_calls += 1
@@ -260,7 +281,7 @@ class FakeImapClient:
         raise RuntimeError(f"Could not extract RFC822 for UID {uid}")
 
     def list_folders(self) -> list[Any]:
-        return []
+        return list(self._conn.folders)
 
 
 def _seed_pst_message(
@@ -2547,3 +2568,231 @@ def test_table_missing_rows_blocks_recorded_folder_export(tmp_path: Path) -> Non
     assert result.dest_path is None
     assert "not found" not in (result.detail or "").lower()
     assert "uniqueness" in (result.detail or "").lower()
+
+
+def test_imap_message_moved_to_another_folder_exports(tmp_path: Path) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        folder_name="INBOX",
+        uid=42,
+        message_id="<moved42@mailattic.test>",
+        subject="Moved IMAP Message",
+    )
+    moved_eml = (
+        b"Message-ID: <moved42@mailattic.test>\r\n"
+        b"From: alice@example.com\r\n"
+        b"Subject: Moved IMAP Message\r\n"
+        b"\r\n"
+        b"Moved body content.\r\n"
+    )
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder("INBOX", "INBOX", "/"),
+            ImapFolder("Archive", "Archive", "/"),
+            ImapFolder("Sent", "Sent", "/"),
+        ],
+        folder_rfc822_by_uid={"Archive": {99: moved_eml}},
+        folder_uids_by_header={"Archive": {"moved42@mailattic.test": [99]}},
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        imap_client=imap_client,
+    )
+
+    assert result.status == "exported"
+    assert result.dest_path is not None
+    assert Path(result.dest_path).read_bytes() == moved_eml
+
+
+def test_imap_message_moved_to_trash_still_exports(tmp_path: Path) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        folder_name="INBOX",
+        uid=42,
+        message_id="<trashed42@mailattic.test>",
+        subject="Trashed IMAP Message",
+    )
+    trashed_eml = (
+        b"Message-ID: <trashed42@mailattic.test>\r\n"
+        b"From: alice@example.com\r\n"
+        b"Subject: Trashed IMAP Message\r\n"
+        b"\r\n"
+        b"Still on server in Trash.\r\n"
+    )
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder("INBOX", "INBOX", "/"),
+            ImapFolder("Trash", "Trash", "/"),
+        ],
+        folder_rfc822_by_uid={"Trash": {7: trashed_eml}},
+        folder_uids_by_header={"Trash": {"trashed42@mailattic.test": [7]}},
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        imap_client=imap_client,
+    )
+
+    assert result.status == "exported"
+    assert result.dest_path is not None
+    assert Path(result.dest_path).read_bytes() == trashed_eml
+
+
+def test_imap_message_in_multiple_other_folders_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        folder_name="INBOX",
+        uid=42,
+        message_id="<ambig42@mailattic.test>",
+        subject="Secret Subject",
+    )
+    copy_eml = (
+        b"Message-ID: <ambig42@mailattic.test>\r\n"
+        b"From: alice@example.com\r\n"
+        b"Subject: Secret Subject\r\n"
+        b"\r\n"
+        b"Secret Body Content\r\n"
+    )
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder("INBOX", "INBOX", "/"),
+            ImapFolder("Archive", "Archive", "/"),
+            ImapFolder("Sent", "Sent", "/"),
+        ],
+        folder_rfc822_by_uid={
+            "Archive": {11: copy_eml},
+            "Sent": {22: copy_eml},
+        },
+        folder_uids_by_header={
+            "Archive": {"ambig42@mailattic.test": [11]},
+            "Sent": {"ambig42@mailattic.test": [22]},
+        },
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        imap_client=imap_client,
+    )
+
+    assert result.status == "failed"
+    assert result.dest_path is None
+    detail = result.detail or ""
+    assert "Ambiguous" in detail
+    assert "Archive" in detail
+    assert "Sent" in detail
+    assert "Secret Subject" not in detail
+    assert "Secret Body Content" not in detail
+
+
+def test_imap_other_folder_select_failure_fails_not_found(
+    tmp_path: Path,
+) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        folder_name="INBOX",
+        uid=42,
+        message_id="<selfail42@mailattic.test>",
+        subject="Select Fail Other",
+    )
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder("INBOX", "INBOX", "/"),
+            ImapFolder("Archive", "Archive", "/"),
+            ImapFolder("Broken", "Broken", "/"),
+        ],
+        select_errors={
+            "Broken": imaplib.IMAP4.error("NO folder Broken unavailable"),
+        },
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        imap_client=imap_client,
+    )
+
+    assert result.status == "failed"
+    assert result.dest_path is None
+    assert "Broken" in (result.detail or "")
+
+
+def test_imap_skipped_listings_nonempty_with_zero_hits_fails(
+    tmp_path: Path,
+) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        folder_name="INBOX",
+        uid=42,
+        message_id="<skipped42@mailattic.test>",
+        subject="Skipped Listing",
+    )
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder("INBOX", "INBOX", "/"),
+            ImapFolder("Archive", "Archive", "/"),
+        ],
+        skipped_listings=["Undecodable folder name &bad-"],
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        imap_client=imap_client,
+    )
+
+    assert result.status == "failed"
+    assert result.dest_path is None
+    assert "could not be decoded" in (result.detail or "")
+
+
+def test_imap_all_folders_searched_zero_hits_returns_not_found(
+    tmp_path: Path,
+) -> None:
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        folder_name="INBOX",
+        uid=42,
+        message_id="<gone42@mailattic.test>",
+        subject="Really Gone",
+    )
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder("INBOX", "INBOX", "/"),
+            ImapFolder("Archive", "Archive", "/"),
+            ImapFolder("Drafts", "Drafts", "/"),
+            ImapFolder("Trash", "Trash", "/"),
+        ],
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        imap_client=imap_client,
+    )
+
+    assert result.status == "not_found"
+    assert result.dest_path is None
