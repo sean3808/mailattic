@@ -35,10 +35,11 @@ GitHub shares one number space across issues and PRs, so a bare `#42` may be eit
 
 Dependabot PRs are **not** exempted from `.github/workflows/pr-contract.yml` and auto-merge is **not** configured; merging to `main` always requires Sean's authorization.
 
-Because Dependabot's generated PR body has no `## Squash message` section, the `PR Contract` check starts red. Before asking Sean to authorize the merge:
+Because `scripts/check_pr_contract.py` unconditionally requires both `## Squash message` and a `Closes #<n>` line, Dependabot's generated PR body starts red on `PR Contract`. Before asking Sean to authorize the merge:
 
-1. Edit the PR body (`gh pr edit <number> --body ...`) to append `## Squash message` with the update rationale (and a `Closes #<n>` reference if closing a tracking issue, per `AGENTS.md > Pull request delivery contract`). Editing the PR body triggers the `edited` event and re-runs `PR Contract`.
-2. Wait for `PR Contract` and `hosted-full` to turn green, then present the PR and squash message to Sean to authorize the merge.
+1. Open a tracking issue for the dependency update (`gh issue create ...`) or find an existing tracking issue for it.
+2. Edit the PR body (`gh pr edit <number> --body ...`) to append `## Squash message` with the update rationale and `Closes #<that issue>` (per `AGENTS.md > Pull request delivery contract`). Editing the PR body triggers the `edited` event and re-runs `PR Contract`.
+3. Wait for `PR Contract` and `hosted-full` to turn green, then present the PR and squash message to Sean to authorize the merge.
 
 ## When a skill says "publish to the issue tracker"
 
