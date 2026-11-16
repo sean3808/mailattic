@@ -646,6 +646,26 @@ then runs `scripts/analyze_test_metrics.py` to produce the artifact
   `zero_src_coverage_test_files` (excluded from subset candidacy).
 - `summary.md`: human-readable Markdown summary of all three reports.
 
+`durations.json` also carries `coverage_nodeids_missing_from_junit`: coverage
+test contexts whose nodeid the analyzer could not find among the JUnit tests.
+More than 1% unjoined fails the job, because per-module durations would
+otherwise shrink silently.
+
+Limits to keep in mind when reading the reports:
+
+- **Wider-scope fixtures are attributed to one test.** A session- or
+  module-scoped fixture's `src/` lines run under the first test that triggers it
+  on that xdist worker, so later tests sharing it look independent of that code,
+  and the attribution can shift between runs.
+- **A subset candidate is not a deletion candidate.** Coverage compares executed
+  lines only, not inputs, assertions or the promise a test guards; tests with
+  identical coverage list each other. Each removal still needs its own ticket.
+- **Per-test contexts need the CTracer core.** With coverage 7.15 on Python
+  3.13 the default core is CTracer. On Python 3.14+ coverage defaults to the
+  `sysmon` core, which drops dynamic contexts (coverage warning
+  `no-sysmon-context`); pin `core = "ctrace"` before upgrading the Python
+  version this job runs on.
+
 Download the artifact from a completed run with:
 
 ```powershell

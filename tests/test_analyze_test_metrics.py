@@ -199,6 +199,10 @@ def test_analyze_produces_all_three_reports_and_summary(tmp_path: Path) -> None:
     assert "tests/test_alpha.py::test_fast" in single_supersets
     assert "tests/test_alpha.py::AlphaTests::test_slow" in single_supersets
 
+    # Every coverage context joined to a JUnit test (test_docs_only has JUnit
+    # only, which is fine: it touches no src/ line).
+    assert durations["coverage_nodeids_missing_from_junit"] == []
+
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "Top Slowest Tests" in summary
     assert "Source-to-Test Mapping" in summary
@@ -226,6 +230,34 @@ def test_analyze_fails_loudly_when_coverage_db_has_no_test_contexts(
     result = _run_analyzer(junit_xml, cov_db, out_dir, repo_root=repo)
     assert result.returncode != 0
     assert "context" in (result.stdout + result.stderr).lower()
+
+
+def test_analyze_fails_loudly_when_coverage_nodeids_do_not_join_junit(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src" / "mailattic").mkdir(parents=True)
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_alpha.py").write_text("", encoding="utf-8")
+    src_file = repo / "src" / "mailattic" / "alpha.py"
+    src_file.write_text("x = 1\n", encoding="utf-8")
+
+    junit_xml = tmp_path / "junit.xml"
+    _write_junit_xml(junit_xml, [("tests.test_alpha", "test_one", 0.1, "passed")])
+
+    cov_db = tmp_path / ".coverage"
+    _build_coverage_db(
+        cov_db,
+        lines_by_context={
+            # Same test, but the nodeid shape differs from what JUnit rebuilds.
+            "tests\\sub\\test_alpha.py::test_one[case-1]|run": {str(src_file): [1]},
+        },
+    )
+
+    out_dir = tmp_path / "reports"
+    result = _run_analyzer(junit_xml, cov_db, out_dir, repo_root=repo)
+    assert result.returncode != 0
+    assert "no matching junit test" in (result.stdout + result.stderr).lower()
 
 
 def test_analyze_fails_loudly_on_missing_or_empty_junit(tmp_path: Path) -> None:

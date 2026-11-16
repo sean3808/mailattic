@@ -283,6 +283,34 @@ def _find_subset_candidates(
     return candidates
 
 
+# Above this share of coverage-context nodeids missing from the JUnit XML, the
+# two sources are joined wrongly and per-module durations would silently shrink.
+MAX_UNJOINED_CONTEXT_RATIO = 0.01
+
+
+def check_nodeid_join(
+    cases: list[TestCaseTiming], cov_ctx: CoverageContextData
+) -> list[str]:
+    """Return coverage nodeids absent from JUnit; raise if too many to trust.
+
+    Checked coverage -> JUnit only: every coverage context is a real test that
+    must appear in JUnit, whereas a JUnit test that touches no src/ line has no
+    coverage context at all, so the reverse direction proves nothing.
+    """
+    junit_nodeids = {c.nodeid for c in cases}
+    unjoined = sorted(set(cov_ctx.nodeid_masks) - junit_nodeids)
+    if unjoined and len(unjoined) > MAX_UNJOINED_CONTEXT_RATIO * len(
+        cov_ctx.nodeid_masks
+    ):
+        sample = ", ".join(unjoined[:5])
+        raise ValueError(
+            f"{len(unjoined)} of {len(cov_ctx.nodeid_masks)} coverage test contexts "
+            f"have no matching JUnit test (e.g. {sample}); the JUnit classname to "
+            "nodeid reconstruction does not match pytest's nodeids."
+        )
+    return unjoined
+
+
 def build_reports(
     cases: list[TestCaseTiming],
     cov_ctx: CoverageContextData,
@@ -525,12 +553,14 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = args.repo_root.resolve()
     cases = parse_junit_xml(args.junit_xml, repo_root)
     cov_ctx = load_coverage_contexts(args.coverage_db, repo_root)
+    unjoined = check_nodeid_join(cases, cov_ctx)
 
     durations_report, mapping_report, audit_report, summary_md = build_reports(
         cases,
         cov_ctx,
         top_n=args.top_n,
     )
+    durations_report["coverage_nodeids_missing_from_junit"] = unjoined
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for name, payload in (
