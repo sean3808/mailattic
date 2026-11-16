@@ -9,6 +9,7 @@ is a visible decision rather than a quiet one.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import scripts.check_pr_contract as check_pr_contract
@@ -224,7 +225,9 @@ def test_workflow_rechecks_body_edits() -> None:
 def test_workflow_runs_parser_through_uv_on_python_313() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "astral-sh/setup-uv@v9.0.0" in workflow
+    # Pinned to an exact release, not a moving major tag; which release is
+    # Dependabot's to bump (#110), so the version itself is not asserted.
+    assert re.search(r"astral-sh/setup-uv@v\d+\.\d+\.\d+\s", workflow)
     assert (
         "uv run --python 3.13 --no-project python scripts/check_pr_contract.py"
         in workflow
