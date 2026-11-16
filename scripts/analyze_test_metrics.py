@@ -210,8 +210,11 @@ def load_coverage_contexts(coverage_db: Path, repo_root: Path) -> CoverageContex
             bit = 1 << line_bit_index
             line_bit_index += 1
             for ctx in non_empty:
-                nodeid = _strip_context_phase(ctx).replace("\\", "/")
-                test_file = nodeid.split("::", 1)[0]
+                # Only the file part is a path; parametrize ids after "::" may
+                # contain literal backslashes (e.g. "[\udce9]") and must stay.
+                path_part, sep, rest = _strip_context_phase(ctx).partition("::")
+                test_file = path_part.replace("\\", "/")
+                nodeid = test_file + sep + rest
                 src_to_test_files[norm_file].add(test_file)
                 nodeid_masks[nodeid] |= bit
                 test_file_masks[test_file] |= bit

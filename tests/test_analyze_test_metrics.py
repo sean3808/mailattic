@@ -261,6 +261,41 @@ def test_analyze_fails_loudly_when_coverage_nodeids_do_not_join_junit(
     assert "no matching junit test" in (result.stdout + result.stderr).lower()
 
 
+def test_parametrize_id_backslashes_survive_the_join(tmp_path: Path) -> None:
+    # Real CI run 43811470631: ids like "[\\udce9]" were rewritten to "[/udce9]",
+    # so 70 coverage contexts no longer matched their JUnit tests.
+    repo = tmp_path / "repo"
+    (repo / "src" / "mailattic").mkdir(parents=True)
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_alpha.py").write_text("", encoding="utf-8")
+    src_file = repo / "src" / "mailattic" / "alpha.py"
+    src_file.write_text("x = 1\n", encoding="utf-8")
+
+    param_name = "test_one[x\\ud800\\r\\n]"
+    junit_xml = tmp_path / "junit.xml"
+    _write_junit_xml(junit_xml, [("tests.test_alpha", param_name, 0.1, "passed")])
+    cov_db = tmp_path / ".coverage"
+    _build_coverage_db(
+        cov_db,
+        lines_by_context={
+            f"tests\\test_alpha.py::{param_name}|run": {str(src_file): [1]},
+        },
+    )
+
+    result = _run_analyzer(junit_xml, cov_db, tmp_path / "reports", repo_root=repo)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    durations = json.loads(
+        (tmp_path / "reports" / "durations.json").read_text(encoding="utf-8")
+    )
+    assert durations["coverage_nodeids_missing_from_junit"] == []
+    mapping = json.loads(
+        (tmp_path / "reports" / "source-to-tests.json").read_text(encoding="utf-8")
+    )
+    assert mapping["source_to_test_files"]["src/mailattic/alpha.py"] == [
+        "tests/test_alpha.py"
+    ]
+
+
 def _failure_ratio_fixture(
     tmp_path: Path, *, total: int, failed: int
 ) -> subprocess.CompletedProcess[str]:
