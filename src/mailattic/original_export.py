@@ -902,23 +902,30 @@ _IMAP_CONNECTION_ERRORS = (
 )
 
 
+@dataclass(frozen=True)
+class _FolderSearchResult:
+    candidates: list[bytes]
+    unreadable_count: int
+    error_message: str | None = None
+    is_connection_abort: bool = False
+
+
 def _search_folder_by_message_id(
     client: Any,
     message: Mapping[str, object],
     normalized_msg_id: str,
-) -> tuple[list[bytes], int, str | None, bool]:
-    """Search the currently selected IMAP folder by Message-ID and verify hits.
-
-    Returns ``(candidates, unreadable_count, error_message, is_connection_abort)``.
-    """
+) -> _FolderSearchResult:
+    """Search the currently selected IMAP folder by Message-ID and verify hits."""
     try:
         raw_uids = client.search_uids_by_message_id(normalized_msg_id)
     except _IMAP_CONNECTION_ERRORS as exc:
-        return [], 0, f"IMAP SEARCH protocol error: {exc}", True
+        return _FolderSearchResult(
+            [], 0, f"IMAP SEARCH protocol error: {exc}", is_connection_abort=True
+        )
     except imaplib.IMAP4.error as exc:
-        return [], 0, f"IMAP SEARCH protocol error: {exc}", False
+        return _FolderSearchResult([], 0, f"IMAP SEARCH protocol error: {exc}")
     except Exception as exc:
-        return [], 0, f"IMAP SEARCH failed: {exc}", False
+        return _FolderSearchResult([], 0, f"IMAP SEARCH failed: {exc}")
 
     candidates: list[bytes] = []
     unreadable_count = 0
@@ -928,16 +935,16 @@ def _search_folder_by_message_id(
             if candidate_bytes and _verify_imap_rfc822(candidate_bytes, message):
                 candidates.append(candidate_bytes)
         except _IMAP_CONNECTION_ERRORS as exc:
-            return (
+            return _FolderSearchResult(
                 [],
                 unreadable_count,
                 f"IMAP abort or connection failure fetching UID {uid}: {exc}",
-                True,
+                is_connection_abort=True,
             )
         except Exception:
             unreadable_count += 1
             continue
-    return candidates, unreadable_count, None, False
+    return _FolderSearchResult(candidates, unreadable_count)
 
 
 def _search_other_imap_folders(
@@ -980,16 +987,19 @@ def _search_other_imap_folders(
             )
             continue
 
-        candidates, folder_unreadable, search_err, is_abort = (
-            _search_folder_by_message_id(client, message, normalized_msg_id)
-        )
-        unreadable_count += folder_unreadable
-        if is_abort and search_err is not None:
-            return None, search_err
-        if search_err is not None:
-            folder_errors.append(f"Folder {folder_display!r}: {search_err}")
+        folder_result = _search_folder_by_message_id(client, message, normalized_msg_id)
+        unreadable_count += folder_result.unreadable_count
+        if (
+            folder_result.is_connection_abort
+            and folder_result.error_message is not None
+        ):
+            return None, folder_result.error_message
+        if folder_result.error_message is not None:
+            folder_errors.append(
+                f"Folder {folder_display!r}: {folder_result.error_message}"
+            )
             continue
-        for candidate_bytes in candidates:
+        for candidate_bytes in folder_result.candidates:
             cross_matches.append((folder_display, candidate_bytes))
 
     if len(cross_matches) > 1:
@@ -1038,13 +1048,7 @@ def _find_imap_rfc822(
         rfc822: bytes | None = None
         try:
             rfc822 = client.fetch_rfc822(uid)
-        except (
-            imaplib.IMAP4.abort,
-            imaplib.IMAP4.error,
-            OSError,
-            EOFError,
-            TimeoutError,
-        ) as exc:
+        except (*_IMAP_CONNECTION_ERRORS, imaplib.IMAP4.error) as exc:
             return None, f"IMAP error fetching UID {uid}: {exc}"
         except Exception:
             # A stale UID (moved/deleted) is resolved by Message-ID search below;
@@ -1057,6 +1061,8 @@ def _find_imap_rfc822(
                     return rfc822, None
             except Exception:
                 unreadable_count += 1
+        elif rfc822 == b"":
+            unreadable_count += 1
 
     # 2. Try Message-ID search in the recorded folder
     if not db_msg_id:
@@ -1065,16 +1071,14 @@ def _find_imap_rfc822(
     # HEADER search is a substring match, so the bare id also finds the
     # bracketed header value.
     normalized_msg_id = normalize_message_id(str(db_msg_id))
-    candidates, folder_unreadable, search_err, _ = _search_folder_by_message_id(
-        client, message, normalized_msg_id
-    )
-    if search_err is not None:
-        return None, search_err
-    unreadable_count += folder_unreadable
+    recorded_result = _search_folder_by_message_id(client, message, normalized_msg_id)
+    if recorded_result.error_message is not None:
+        return None, recorded_result.error_message
+    unreadable_count += recorded_result.unreadable_count
 
-    if candidates:
+    if recorded_result.candidates:
         return _single_match(
-            candidates,
+            recorded_result.candidates,
             "Ambiguous: the message was found more than once on the IMAP server",
         )
 
