@@ -677,13 +677,15 @@ def test_source_to_tests_union_tags_unmeasured_src_and_summary_stats(
     }
 
     # Counts per src file:
-    # dynamic-only: alpha=2, beta=1, gamma=0 -> avg 1.00, median 1.0
-    # import-only:  alpha=2, beta=0, gamma=1 -> avg 1.00, median 1.0
-    # union:        alpha=3, beta=1, gamma=1 -> avg 1.67, median 1.0
+    # coverage map (incl. both):      alpha=2, beta=1, gamma=0 -> avg 1.00, median 1.0
+    # static import map (incl. both): alpha=2, beta=0, gamma=1 -> avg 1.00, median 1.0
+    # union:                          alpha=3, beta=1, gamma=1 -> avg 1.67, median 1.0
     # share of all 3 test files: 1.67 / 3 = 55.6%
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
-    assert "Dynamic-only test files per source file: avg 1.00, median 1.0" in summary
-    assert "Import-only test files per source file: avg 1.00, median 1.0" in summary
+    assert "Coverage-map test files per source file: avg 1.00, median 1.0" in summary
+    assert (
+        "Static-import-map test files per source file: avg 1.00, median 1.0" in summary
+    )
     assert (
         "Union test files per source file: avg 1.67, median 1.0 (55.6% of 3 test files)"
         in summary

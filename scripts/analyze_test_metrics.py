@@ -575,9 +575,11 @@ def build_reports(
             f"{mapping_report['covered_source_file_count']}",
             "- Distinct test files referenced: "
             f"{mapping_report['mapped_test_file_count']}",
-            f"- Dynamic-only test files per source file: avg {dyn_avg:.2f}, "
+            # Each side counted on its own (pairs tagged "both" count on both
+            # sides), unlike the exclusive "dynamic"/"import" tags in the JSON.
+            f"- Coverage-map test files per source file: avg {dyn_avg:.2f}, "
             f"median {dyn_median:.1f}",
-            f"- Import-only test files per source file: avg {imp_avg:.2f}, "
+            f"- Static-import-map test files per source file: avg {imp_avg:.2f}, "
             f"median {imp_median:.1f}",
             f"- Union test files per source file: avg {union_avg:.2f}, "
             f"median {union_median:.1f} "
