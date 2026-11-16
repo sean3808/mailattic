@@ -9,6 +9,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from .export_files import (
+    format_sent_date_token,
+    land_exported_file,
+    sanitize_windows_filename,
+    truncate_export_filename,
+)
 from .storage import connect_database
 
 
@@ -72,19 +78,6 @@ class AttachmentExportResult:
     failed: int
     report_lines: list[str]
     items: list[AttachmentExportItem]
-
-
-_WINDOWS_ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_WINDOWS_RESERVED_NAMES = {
-    "CON",
-    "PRN",
-    "AUX",
-    "NUL",
-    *{f"COM{index}" for index in range(1, 10)},
-    *{f"LPT{index}" for index in range(1, 10)},
-}
-_MAX_EXPORT_PATH = 240
-_EXPORT_TMP_PREFIX = ".mailattic-export-"
 
 
 def write_attachment(
@@ -282,19 +275,19 @@ def build_attachment_export_filename(
     attachment_row: Mapping[str, object],
     destination_dir: Path,
 ) -> str:
-    sent_date = _format_sent_date_token(attachment_row.get("sent_at"))
+    sent_date = format_sent_date_token(attachment_row.get("sent_at"))
     attachment_id = int(attachment_row["attachment_id"])
     original_name = str(attachment_row.get("attachment_name") or "")
     if _has_usable_extension(original_name):
-        candidate_name = _sanitize_windows_filename(original_name)
+        candidate_name = sanitize_windows_filename(original_name)
     else:
         content_hash = str(attachment_row.get("content_hash") or "unknown-hash")
         inferred_ext = _infer_attachment_extension(
             mime_type=attachment_row.get("mime_type"),
         )
-        candidate_name = _sanitize_windows_filename(f"{content_hash}{inferred_ext}")
+        candidate_name = sanitize_windows_filename(f"{content_hash}{inferred_ext}")
     prefix = f"{sent_date}_att{attachment_id}_"
-    return _truncate_export_filename(prefix, candidate_name, destination_dir)
+    return truncate_export_filename(prefix, candidate_name, destination_dir)
 
 
 def export_attachments(
@@ -371,42 +364,14 @@ def export_attachments(
                 "content_hash"
             ):
                 raise ValueError("stored payload does not match its content_hash")
-            if overwrite:
-                destination_path.write_bytes(payload)
-            else:
-                # Write to a uniquely-named temp file first, then move it into
-                # place. This means every failure path only ever unlinks a
-                # file we created ourselves (never destination_path by
-                # pathname), so a foreign file that lands at destination_path
-                # during the write is never touched.
-                tmp_path = (
-                    destination_dir / f"{_EXPORT_TMP_PREFIX}{uuid.uuid4().hex}.tmp"
+            try:
+                land_exported_file(
+                    destination_path,
+                    overwrite=overwrite,
+                    payload=payload,
                 )
-                # Cleanup responsibility starts only once `open("xb")` itself
-                # has succeeded: if the open call raises (e.g. a foreign
-                # file already sits at this exact temp path), that path was
-                # never ours to unlink. Only a write failure on an already-
-                # opened handle -- which we did create -- triggers cleanup.
-                # Residual risk accepted (issue #28, 2026-09-24 decision):
-                # a same-user malicious local process racing the directory
-                # between handle close and rename/unlink is out of scope --
-                # it needs no new privilege to do that damage.
-                handle = tmp_path.open("xb")
-                try:
-                    with handle:
-                        handle.write(payload)
-                except BaseException:
-                    tmp_path.unlink(missing_ok=True)
-                    raise
-                try:
-                    # Windows os.rename (which Path.rename wraps) refuses to
-                    # replace an existing file, making it a no-overwrite move
-                    # primitive: if a file now sits at destination_path (a
-                    # race since the exists() check above), the move fails
-                    # and destination_path is left completely untouched.
-                    tmp_path.rename(destination_path)
-                except FileExistsError:
-                    tmp_path.unlink(missing_ok=True)
+            except FileExistsError:
+                if destination_path.exists():
                     skipped_existing += 1
                     items.append(
                         AttachmentExportItem(
@@ -414,9 +379,7 @@ def export_attachments(
                         )
                     )
                     continue
-                except BaseException:
-                    tmp_path.unlink(missing_ok=True)
-                    raise
+                raise
         except FileExistsError:
             failed += 1
             report_lines.append(
@@ -485,58 +448,3 @@ def _infer_attachment_extension(
     if guessed:
         return guessed.lower()
     return ".bin"
-
-
-def _sanitize_windows_filename(filename: str) -> str:
-    cleaned = _WINDOWS_ILLEGAL_CHARS.sub("_", filename).strip().rstrip(" .")
-    if not cleaned:
-        cleaned = "attachment"
-
-    suffixes = "".join(Path(cleaned).suffixes)
-    stem = cleaned[: -len(suffixes)] if suffixes else cleaned
-    stem = stem.rstrip(" .") or "attachment"
-    if stem.upper() in _WINDOWS_RESERVED_NAMES:
-        stem = f"{stem}_"
-    return f"{stem}{suffixes}"
-
-
-def _truncate_export_filename(
-    prefix: str,
-    candidate_name: str,
-    destination_dir: Path,
-    *,
-    max_path_length: int = _MAX_EXPORT_PATH,
-) -> str:
-    filename = f"{prefix}{candidate_name}"
-    if len(str(destination_dir / filename)) <= max_path_length:
-        return filename
-
-    suffixes = "".join(Path(candidate_name).suffixes)
-    stem = candidate_name[: -len(suffixes)] if suffixes else candidate_name
-    hash_suffix = "_" + hashlib.sha1(candidate_name.encode("utf-8")).hexdigest()[:8]
-    available = (
-        max_path_length
-        - len(str(destination_dir))
-        - 1
-        - len(prefix)
-        - len(suffixes)
-        - len(hash_suffix)
-    )
-    truncated_stem = stem[: max(1, available)].rstrip(" ._") or "file"
-    filename = f"{prefix}{truncated_stem}{hash_suffix}{suffixes}"
-    while (
-        len(str(destination_dir / filename)) > max_path_length
-        and len(truncated_stem) > 1
-    ):
-        truncated_stem = truncated_stem[:-1].rstrip(" ._") or truncated_stem[:-1] or "f"
-        filename = f"{prefix}{truncated_stem}{hash_suffix}{suffixes}"
-    return filename
-
-
-def _format_sent_date_token(sent_at: object) -> str:
-    if not sent_at:
-        return "unknown-date"
-    sent_at_text = str(sent_at)
-    if "T" in sent_at_text:
-        return sent_at_text.split("T", 1)[0]
-    return sent_at_text[:10] if len(sent_at_text) >= 10 else "unknown-date"
