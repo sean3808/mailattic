@@ -59,7 +59,7 @@ def test_plain_bounce_with_base64_delivery_status_excludes_base64(
     tmp_path: Path,
 ) -> None:
     raw = (_FIXTURES / "bounce-plain-dsn-base64.eml").read_bytes()
-    extracted = _extract_body_text(BytesParser(policy=policy.default).parsebytes(raw))
+    extracted = _extract_body_text(_parse_fixture("bounce-plain-dsn-base64.eml"))
     stored = _import_eml_bytes(tmp_path, raw)
 
     expected = "Your message could not be delivered to recipient@mailattic.test."
