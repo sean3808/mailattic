@@ -346,9 +346,10 @@ BIG5_PARAGRAPHS = [
 
 def test_big5_html_with_invalid_bytes_keeps_plain_paragraphs_and_warns() -> None:
     plain = "\n\n".join(BIG5_PARAGRAPHS)
-    # Markup-heavy, sparse-CJK HTML (like sender-client output): with one invalid
-    # byte pair, strict big5 fails and charset detection mis-decodes the whole
-    # part (probed against the current decoder: every CJK paragraph is lost).
+    # Markup-heavy, sparse-CJK HTML (like sender-client output): with invalid-byte
+    # density above the #54 replace threshold, strict big5 and #54 replace both
+    # decline, so charset detection mis-decodes the whole part and every CJK
+    # paragraph is lost.
     markup = (
         '<div style="font-family:Arial;font-size:12pt;color:#000">'
         '<span style="mso-line-height-rule:exactly">'
@@ -360,7 +361,7 @@ def test_big5_html_with_invalid_bytes_keeps_plain_paragraphs_and_warns() -> None
         + "".join(f"<p>{p}</p>" for p in BIG5_PARAGRAPHS)
     ).encode("big5")
     cut = len(markup) + 10
-    html_bytes = body[:cut] + b"\xff\xff" + body[cut:]  # invalid big5 byte pair
+    html_bytes = body[:cut] + b"\xff\xff" * 70 + body[cut:]  # above #54 threshold
     raw = (
         b"MIME-Version: 1.0\r\n"
         b'Content-Type: multipart/alternative; boundary="BND"\r\n\r\n'
@@ -379,6 +380,40 @@ def test_big5_html_with_invalid_bytes_keeps_plain_paragraphs_and_warns() -> None
     assert rest == plain
     for paragraph in BIG5_PARAGRAPHS:
         assert paragraph in rest
+
+
+def test_big5_html_with_few_invalid_bytes_keeps_html_and_paragraphs() -> None:
+    """Issue #54 win at body-selection level: one invalid pair uses big5 replace."""
+    plain = "\n\n".join(BIG5_PARAGRAPHS)
+    markup = (
+        '<div style="font-family:Arial;font-size:12pt;color:#000">'
+        '<span style="mso-line-height-rule:exactly">'
+    ) * 20
+    body = (
+        markup
+        + "<table><tr><td>Item</td><td>Qty</td></tr>"
+        + "<tr><td>PEN-100</td><td>5</td></tr></table>"
+        + "".join(f"<p>{p}</p>" for p in BIG5_PARAGRAPHS)
+    ).encode("big5")
+    cut = len(markup) + 10
+    html_bytes = body[:cut] + b"\xff\xff" + body[cut:]  # one invalid big5 byte pair
+    raw = (
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/alternative; boundary="BND"\r\n\r\n'
+        b"--BND\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"Content-Transfer-Encoding: 8bit\r\n\r\n"
+        + plain.encode("utf-8")
+        + b"\r\n--BND\r\n"
+        b"Content-Type: text/html; charset=big5\r\n"
+        b"Content-Transfer-Encoding: 8bit\r\n\r\n" + html_bytes + b"\r\n--BND--\r\n"
+    )
+    parsed = message_from_bytes(raw, policy=policy.default)
+    extracted = parser._extract_body_text(parsed)
+    assert extracted.startswith("Item | Qty")
+    assert parser.PLAIN_TABLE_FIDELITY_WARNING not in extracted
+    for paragraph in BIG5_PARAGRAPHS:
+        assert paragraph in extracted
 
 
 # --- pins unchanged behaviour: no data table / no plain ---------------------

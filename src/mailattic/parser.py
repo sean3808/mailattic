@@ -92,6 +92,14 @@ _DECLARED_CHARSET_DECODERS: dict[str, tuple[str, ...]] = {
     "iso8859-1": ("cp1252", "iso8859-1"),
 }
 
+# Declared Chinese CJK codecs whose strict-decode failure with only a few
+# invalid bytes should fall back to errors="replace" under the declared codec
+# family rather than charset detection (issue #54).
+_CJK_REPLACE_CODECS: frozenset[str] = frozenset(
+    codecs.lookup(n).name
+    for n in ("big5", "cp950", "big5hkscs", "gbk", "gb2312", "gb18030")
+)
+
 
 def _text_codec_name(label: str) -> str | None:
     """Normalise a charset label; ``None`` for unknown or non-text codecs.
@@ -119,6 +127,40 @@ def _decode_as_declared(raw: bytes, declared_norm: str) -> str | None:
             return raw.decode(codec, errors="strict")
         except UnicodeDecodeError:
             continue
+    return None
+
+
+def _decode_cjk_with_replace(raw: bytes, declared_norm: str) -> str | None:
+    """Decode *raw* with *declared_norm* (plus replace) if invalid bytes are few.
+
+    Guards against two failure modes before accepting replace-decoding:
+    - If *raw* is valid UTF-8 (while strict CJK decode already failed), it is
+      mislabeled UTF-8, so let charset detection recover it cleanly.
+    - If replacement count exceeds ``max(2, len(raw) // 20)`` or 25% of
+      ``len(raw)``, the declared charset is likely wrong; let detection run.
+    """
+    try:
+        raw.decode("utf-8", errors="strict")
+        return None
+    except UnicodeDecodeError:
+        pass
+
+    codecs_to_try = _DECLARED_CHARSET_DECODERS.get(declared_norm, (declared_norm,))
+    best_errors: int | None = None
+    best_text: str | None = None
+    for codec in codecs_to_try:
+        candidate = raw.decode(codec, errors="replace")
+        err_count = candidate.count("\ufffd")
+        if best_errors is None or err_count < best_errors:
+            best_errors = err_count
+            best_text = candidate
+
+    if (
+        best_errors is not None
+        and best_errors <= max(2, len(raw) // 20)
+        and best_errors * 4 <= len(raw)
+    ):
+        return best_text
     return None
 
 
@@ -185,6 +227,10 @@ def _detect_and_decode(raw: bytes | None, declared_charset: str | None) -> str:
         decoded = _decode_as_declared(raw, declared_norm)
         if decoded is not None:
             return decoded
+        if declared_norm in _CJK_REPLACE_CODECS:
+            replaced = _decode_cjk_with_replace(raw, declared_norm)
+            if replaced is not None:
+                return replaced
         # Strict failed → fall through to detection (step 5).
         # (LookupError already handled above; declared_norm is None in that case)
 
