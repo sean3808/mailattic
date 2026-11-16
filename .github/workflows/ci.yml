@@ -39,12 +39,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Pinned to the exact release measured in the #60 spike. setup-uv
       # publishes no `v9` moving major tag -- `@v9` fails to resolve, verified
       # on run 30686339783 -- so a major-tag pin is not available here.
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.3.3
 
       # No uv cache is restored on purpose: an empty environment is the point of
       # this job, and a restored cache would weaken the claim it makes. setup-uv
@@ -88,9 +88,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.3.3
 
       - name: Build the wheel
         run: uv build
@@ -119,14 +119,14 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # scripts/record_ci_green_tree.py reads the tested tree from this notice.
       - name: Record tested tree
         shell: bash
         run: echo "::notice title=tested-tree::$(git rev-parse 'HEAD^{tree}')"
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.3.3
 
       - name: Sync the locked environment
         run: uv sync --locked
@@ -141,9 +141,9 @@ jobs:
     env:
       COVERAGE_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.3.3
 
       - name: Sync the locked environment
         run: uv sync --locked
@@ -192,7 +192,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload test measurement reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-measurement-reports
           path: ${{ env.COVERAGE_STAGING_DIR }}/reports/
