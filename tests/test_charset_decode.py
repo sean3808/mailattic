@@ -406,3 +406,86 @@ def test_m_cp1252_undefined_byte_non_fatal():
     assert "Preis 100 " in result
     assert "EUR" in result
     # Ingest must not abort; result is a str (possibly with replacement chars)
+
+
+# ---------------------------------------------------------------------------
+# (n) Declared CJK (big5/gbk/gb2312) with a few invalid bytes
+#     → keep declared charset + errors="replace" instead of misdetecting
+# ---------------------------------------------------------------------------
+
+
+def test_n_declared_big5_short_sentence_with_invalid_byte_uses_replace():
+    """(n) Short Big5 sentence with an invalid byte → Big5 replace, not mojibake."""
+    prefix = "Order #123 "
+    cjk_part = "出貨通知，請查收。"
+    raw = (prefix + cjk_part).encode("big5") + b"\xff"
+
+    result = _detect_and_decode(raw, "big5")
+
+    assert result == raw.decode("big5", errors="replace")
+    assert cjk_part in result
+    assert U_FFFD in result
+
+
+def test_n_declared_big5_html_with_invalid_byte_uses_replace():
+    """(n) Tag-heavy Big5 HTML with invalid bytes → Big5 replace, CJK preserved."""
+    cjk_part = "請查收出貨通知。"
+    tags_open = '<div class="wrap"><span class="txt">' * 15
+    tags_close = "</span></div>" * 15
+    raw = (
+        f"<html><body>{tags_open}<p>Order #123 {cjk_part}</p>{tags_close}</body></html>"
+    ).encode("big5") + b"\xff\xfe"
+
+    result = _detect_and_decode(raw, "big5")
+
+    assert result == raw.decode("big5", errors="replace")
+    assert cjk_part in result
+    assert U_FFFD in result
+
+
+def test_n_declared_big5_cp950_char_plus_invalid_byte_uses_cp950_replace():
+    """(n) Declared big5 with cp950-only char + bad byte → cp950 replace wins."""
+    cjk_part = "Order #456 €100 報價單請查收。"
+    raw = cjk_part.encode("cp950") + b"\xff"
+
+    result = _detect_and_decode(raw, "big5")
+
+    assert result == raw.decode("cp950", errors="replace")
+    assert "€100" in result
+    assert "報價單請查收。" in result
+
+
+@pytest.mark.parametrize("declared", ["gbk", "gb2312"])
+def test_n_declared_gb_with_invalid_byte_uses_replace(declared):
+    """(n) Declared gbk/gb2312 with a bad byte → declared replace, CJK preserved."""
+    cjk_part = "Invoice #789 测试订单确认，请查收。"
+    raw = cjk_part.encode(declared) + b"\xff"
+
+    result = _detect_and_decode(raw, declared)
+
+    assert result == raw.decode(declared, errors="replace")
+    assert cjk_part in result
+    assert U_FFFD in result
+
+
+def test_n_declared_cjk_with_many_invalid_bytes_falls_through():
+    """(n) Declared big5 with many invalid bytes beyond threshold → falls through."""
+    # Mostly invalid bytes (>25% and >5%): must fall through to detection,
+    # not be accepted by replace-decoding.
+    raw = b"Hello " + b"\xff\xfe\x80\x81\x82\x83" * 5
+    result = _detect_and_decode(raw, "big5")
+    assert isinstance(result, str)
+    assert "Hello " in result
+    assert result != raw.decode("big5", errors="replace")
+    assert U_FFFD not in result
+
+
+def test_n_declared_cjk_actually_valid_utf8_still_recovers_utf8():
+    """(n) Mislabeled UTF-8 declaring gb2312 → detected as UTF-8, not mojibake."""
+    cjk_text = "這是一封正常的繁體中文郵件，請查收。"
+    raw = cjk_text.encode("utf-8")
+
+    result = _detect_and_decode(raw, "gb2312")
+
+    assert result == cjk_text
+    assert U_FFFD not in result

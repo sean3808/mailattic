@@ -92,6 +92,13 @@ _DECLARED_CHARSET_DECODERS: dict[str, tuple[str, ...]] = {
     "iso8859-1": ("cp1252", "iso8859-1"),
 }
 
+# Declared Chinese CJK codecs whose strict-decode failure with only a few
+# invalid bytes should fall back to errors="replace" under the declared codec
+# family rather than charset detection (issue #54).
+_CJK_REPLACE_CODECS: frozenset[str] = frozenset(
+    codecs.lookup(n).name for n in ("big5", "gbk", "gb2312")
+)
+
 
 def _text_codec_name(label: str) -> str | None:
     """Normalise a charset label; ``None`` for unknown or non-text codecs.
@@ -109,16 +116,47 @@ def _text_codec_name(label: str) -> str | None:
     return info.name
 
 
+def _decoders_for(declared_norm: str) -> tuple[str, ...]:
+    """The decoder chain a normalised declared label means in practice."""
+    return _DECLARED_CHARSET_DECODERS.get(declared_norm, (declared_norm,))
+
+
 def _decode_as_declared(raw: bytes, declared_norm: str) -> str | None:
     """Strictly decode *raw* as what *declared_norm* means in practice.
 
     Returns ``None`` when no decoder for the label accepts the bytes.
     """
-    for codec in _DECLARED_CHARSET_DECODERS.get(declared_norm, (declared_norm,)):
+    for codec in _decoders_for(declared_norm):
         try:
             return raw.decode(codec, errors="strict")
         except UnicodeDecodeError:
             continue
+    return None
+
+
+def _decode_cjk_with_replace(raw: bytes, declared_norm: str) -> str | None:
+    """Decode *raw* with *declared_norm* (plus replace) if invalid bytes are few.
+
+    Guards against two failure modes before accepting replace-decoding:
+    - If *raw* is valid UTF-8 (while strict CJK decode already failed), it is
+      mislabeled UTF-8, so let charset detection recover it cleanly.
+    - If replacement count exceeds ``max(2, len(raw) // 20)`` or 25% of
+      ``len(raw)``, the declared charset is likely wrong; let detection run.
+    """
+    try:
+        raw.decode("utf-8", errors="strict")
+        return None
+    except UnicodeDecodeError:
+        pass
+
+    # min() keeps the first of equal candidates, so ties follow the chain order.
+    best_text = min(
+        (raw.decode(codec, errors="replace") for codec in _decoders_for(declared_norm)),
+        key=lambda text: text.count("\ufffd"),
+    )
+    best_errors = best_text.count("\ufffd")
+    if best_errors <= max(2, len(raw) // 20) and best_errors * 4 <= len(raw):
+        return best_text
     return None
 
 
@@ -185,6 +223,10 @@ def _detect_and_decode(raw: bytes | None, declared_charset: str | None) -> str:
         decoded = _decode_as_declared(raw, declared_norm)
         if decoded is not None:
             return decoded
+        if declared_norm in _CJK_REPLACE_CODECS:
+            replaced = _decode_cjk_with_replace(raw, declared_norm)
+            if replaced is not None:
+                return replaced
         # Strict failed → fall through to detection (step 5).
         # (LookupError already handled above; declared_norm is None in that case)
 
@@ -263,7 +305,7 @@ def _decode_word_run(payload: bytes, charset: str) -> str:
     decoded = _decode_as_declared(payload, declared_norm)
     if decoded is None:
         # Truncated or corrupt: replace within the widest decoder for the label.
-        widest = _DECLARED_CHARSET_DECODERS.get(declared_norm, (declared_norm,))[-1]
+        widest = _decoders_for(declared_norm)[-1]
         decoded = payload.decode(widest, errors="replace")
     # A strict utf-7 decode can itself yield a lone surrogate (#288).
     return _without_lone_surrogates(decoded)
@@ -939,20 +981,31 @@ def _is_rfc822_attachment_part(part: Any, *, outer_message: Any) -> bool:
     return outer_message.get_content_type() != "multipart/report"
 
 
-def _walk_own_parts_with_context(message: Any) -> Iterator[tuple[Any, bool]]:
-    """walk() that does not descend into an attached message/rfc822 subtree,
-    yielding (part, in_alternative).
+def _walk_own_parts_with_context(
+    message: Any, *, exclude_delivery_status: bool = False
+) -> Iterator[tuple[Any, bool]]:
+    """walk() that does not descend into an attached message/rfc822 subtree
+    (and optionally message/delivery-status subtrees), yielding (part, in_alternative).
     """
     stack: list[tuple[Any, bool]] = [(message, False)]
     while stack:
         part, in_alt = stack.pop()
         yield part, in_alt
-        if part.is_multipart() and not _is_rfc822_attachment_part(
-            part, outer_message=message
+        # Python's email parser treats message/delivery-status as multipart and
+        # exposes its payload (including raw undecoded base64 when CTE=base64)
+        # as synthetic text/plain subparts; exclude it from body text (#92).
+        if (
+            not part.is_multipart()
+            or _is_rfc822_attachment_part(part, outer_message=message)
+            or (
+                exclude_delivery_status
+                and part.get_content_type() == "message/delivery-status"
+            )
         ):
-            is_alt = in_alt or (part.get_content_type() == "multipart/alternative")
-            for child in reversed(part.get_payload()):
-                stack.append((child, is_alt))
+            continue
+        is_alt = in_alt or (part.get_content_type() == "multipart/alternative")
+        for child in reversed(part.get_payload()):
+            stack.append((child, is_alt))
 
 
 # Pinned host-independent extensions for standard attachment MIME types.
@@ -1068,7 +1121,9 @@ def _extract_body_text(message: Any) -> str:
     html_attribute_values: list[str] = []
     has_data_table = False
 
-    for part, in_alt in _walk_own_parts_with_context(message):
+    for part, in_alt in _walk_own_parts_with_context(
+        message, exclude_delivery_status=True
+    ):
         if part.is_multipart():
             continue
         if _is_attachment_part(part, in_alternative=in_alt):

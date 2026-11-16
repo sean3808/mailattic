@@ -1,0 +1,35 @@
+From: mailer-daemon@mailattic.test
+To: sender@mailattic.test
+Subject: Delivery Status Notification (Failure)
+Date: Mon, 16 Nov 2026 10:05:00 +0800
+Message-ID: <bounce-html-1@mailattic.test>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUNDARY_HTML_92"
+
+--BOUNDARY_HTML_92
+Content-Type: text/html; charset="utf-8"
+
+<html><body><p>Mail delivery failed for recipient@mailattic.test.</p></body></html>
+
+--BOUNDARY_HTML_92
+Content-Type: message/rfc822
+
+From: sender@mailattic.test
+To: recipient@mailattic.test
+Subject: Placeholder HTML Bounce Target
+Date: Mon, 16 Nov 2026 10:04:00 +0800
+Message-ID: <orig-html-1@mailattic.test>
+Content-Type: text/plain; charset="us-ascii"
+
+Original HTML bounce target placeholder.
+
+--BOUNDARY_HTML_92
+Content-Type: message/delivery-status; name="delivery-status.txt"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="delivery-status.txt"
+
+UmVwb3J0aW5nLU1UQTogZG5zOyBteC5tYWlsYXR0aWMudGVzdA0KRmluYWwtUmVjaXBpZW50OiBy
+ZmM4MjI7IHJlY2lwaWVudEBtYWlsYXR0aWMudGVzdA0KQWN0aW9uOiBmYWlsZWQNClN0YXR1czog
+NS4xLjENCkRpYWdub3N0aWMtQ29kZTogc210cDsgNTUwIDUuMS4xIFVzZXIgdW5rbm93bg0K
+
+--BOUNDARY_HTML_92--

@@ -1,0 +1,37 @@
+From: mailer-daemon@mailattic.test
+To: sender@mailattic.test
+Subject: Undelivered Mail Returned to Sender
+Date: Mon, 16 Nov 2026 10:00:00 +0800
+Message-ID: <bounce-plain-1@mailattic.test>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUNDARY_PLAIN_92"
+
+--BOUNDARY_PLAIN_92
+Content-Type: text/plain; charset="us-ascii"
+
+This is the mail system at host mx.mailattic.test.
+
+Your message could not be delivered to recipient@mailattic.test.
+
+--BOUNDARY_PLAIN_92
+Content-Type: message/rfc822
+
+From: sender@mailattic.test
+To: recipient@mailattic.test
+Subject: Placeholder Subject
+Date: Mon, 16 Nov 2026 09:59:00 +0800
+Message-ID: <orig-plain-1@mailattic.test>
+Content-Type: text/plain; charset="us-ascii"
+
+Original message body placeholder.
+
+--BOUNDARY_PLAIN_92
+Content-Type: message/delivery-status; name="delivery-status.txt"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="delivery-status.txt"
+
+UmVwb3J0aW5nLU1UQTogZG5zOyBteC5tYWlsYXR0aWMudGVzdA0KRmluYWwtUmVjaXBpZW50OiBy
+ZmM4MjI7IHJlY2lwaWVudEBtYWlsYXR0aWMudGVzdA0KQWN0aW9uOiBmYWlsZWQNClN0YXR1czog
+NS4xLjENCkRpYWdub3N0aWMtQ29kZTogc210cDsgNTUwIDUuMS4xIFVzZXIgdW5rbm93bg0K
+
+--BOUNDARY_PLAIN_92--
