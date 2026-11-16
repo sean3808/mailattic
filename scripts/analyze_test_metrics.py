@@ -238,51 +238,57 @@ def load_coverage_contexts(coverage_db: Path, repo_root: Path) -> CoverageContex
     )
 
 
+MAX_SUPERSET_GROUPS = 10
+
+
 def _find_subset_candidates(
     masks: dict[str, int],
     *,
-    key_name: str,
     superset_list_name: str,
-    extra_fn=None,
+    max_supersets: int = MAX_SUPERSET_GROUPS,
 ) -> list[dict[str, object]]:
-    """Find entries whose non-empty bitmask is a subset of at least one other entry."""
-    items = [
-        (name, mask, mask.bit_count()) for name, mask in masks.items() if mask != 0
+    """Group identical non-empty bitmasks, then find subset/equal-group candidates."""
+    groups_by_mask: dict[int, list[str]] = defaultdict(list)
+    for name, mask in masks.items():
+        if mask != 0:
+            groups_by_mask[mask].append(name)
+
+    groups = [
+        (mask, mask.bit_count(), sorted(names))
+        for mask, names in groups_by_mask.items()
     ]
-    items.sort(key=lambda item: (item[2], item[0]))
+    groups.sort(key=lambda g: (g[1], g[2][0]))
 
     candidates: list[dict[str, object]] = []
-    for i, (name_a, mask_a, count_a) in enumerate(items):
+    for i, (mask_a, count_a, members_a) in enumerate(groups):
         supersets: list[dict[str, object]] = []
-        for j in range(len(items)):
-            if i == j:
-                continue
-            name_b, mask_b, count_b = items[j]
-            if count_b < count_a:
+        for j in range(i + 1, len(groups)):
+            mask_b, count_b, members_b = groups[j]
+            if count_b <= count_a:
                 continue
             if (mask_a & mask_b) == mask_a:
-                superset_entry: dict[str, object] = {
-                    key_name: name_b,
-                    "covered_line_count": count_b,
-                    "equal": count_a == count_b,
-                }
-                if extra_fn is not None:
-                    superset_entry.update(extra_fn(name_b))
-                supersets.append(superset_entry)
-        if supersets:
+                supersets.append(
+                    {
+                        "members": members_b,
+                        "member_count": len(members_b),
+                        "covered_line_count": count_b,
+                    }
+                )
+        if len(members_a) >= 2 or supersets:
             supersets.sort(
-                key=lambda s: (-int(s["covered_line_count"]), str(s[key_name]))
+                key=lambda s: (-int(s["covered_line_count"]), str(s["members"][0]))
             )
-            entry: dict[str, object] = {
-                key_name: name_a,
-                "covered_line_count": count_a,
-                superset_list_name: supersets,
-            }
-            if extra_fn is not None:
-                entry.update(extra_fn(name_a))
-            candidates.append(entry)
+            candidates.append(
+                {
+                    "covered_line_count": count_a,
+                    "member_count": len(members_a),
+                    "members": members_a,
+                    "superset_count": len(supersets),
+                    superset_list_name: supersets[:max_supersets],
+                }
+            )
 
-    candidates.sort(key=lambda c: (int(c["covered_line_count"]), str(c[key_name])))
+    candidates.sort(key=lambda c: (int(c["covered_line_count"]), str(c["members"][0])))
     return candidates
 
 
@@ -450,19 +456,25 @@ def build_reports(
     )
     test_file_candidates = _find_subset_candidates(
         cov_ctx.test_file_masks,
-        key_name="test_file",
         superset_list_name="superset_test_files",
     )
     single_test_candidates = _find_subset_candidates(
         cov_ctx.nodeid_masks,
-        key_name="nodeid",
         superset_list_name="superset_tests",
-        extra_fn=lambda nid: {"test_file": nid.split("::", 1)[0]},
+    )
+    test_file_candidate_count = sum(
+        int(c["member_count"]) for c in test_file_candidates
+    )
+    single_test_candidate_count = sum(
+        int(c["member_count"]) for c in single_test_candidates
     )
     audit_report = {
-        "schema_version": 1,
-        "test_file_candidate_count": len(test_file_candidates),
-        "single_test_candidate_count": len(single_test_candidates),
+        "schema_version": 2,
+        "max_superset_groups": MAX_SUPERSET_GROUPS,
+        "test_file_candidate_group_count": len(test_file_candidates),
+        "test_file_candidate_count": test_file_candidate_count,
+        "single_test_candidate_group_count": len(single_test_candidates),
+        "single_test_candidate_count": single_test_candidate_count,
         "zero_src_coverage_test_file_count": len(zero_src_test_files),
         "zero_src_coverage_test_files": zero_src_test_files,
         "test_file_candidates": test_file_candidates,
@@ -532,8 +544,10 @@ def build_reports(
             "",
             "## Audit Candidates (Subset Coverage)",
             "",
-            f"- Test-file subset candidates: {len(test_file_candidates)}",
-            f"- Single-test subset candidates: {len(single_test_candidates)}",
+            f"- Test-file subset candidates: {test_file_candidate_count} "
+            f"across {len(test_file_candidates)} groups",
+            f"- Single-test subset candidates: {single_test_candidate_count} "
+            f"across {len(single_test_candidates)} groups",
             "- Test files with zero `src/` coverage (excluded from subset check): "
             f"{len(zero_src_test_files)}",
         ]
@@ -542,17 +556,26 @@ def build_reports(
         md_lines.extend(
             [
                 "",
-                "| Candidate Test File | Lines | Superset Test Files (sample) |",
-                "|---|---:|---|",
+                "| Candidate Test File(s) | Members | Lines | "
+                "Superset Test File Groups (sample) |",
+                "|---|---:|---:|---|",
             ]
         )
         for cand in test_file_candidates[:top_n]:
+            members_sample = ", ".join(f"`{m}`" for m in cand["members"][:3])
+            if cand["member_count"] > 3:
+                members_sample += f" (+{cand['member_count'] - 3})"
             supers = ", ".join(
-                f"`{s['test_file']}` ({s['covered_line_count']})"
+                f"`{s['members'][0]}`"
+                + (f" (+{s['member_count'] - 1})" if s["member_count"] > 1 else "")
+                + f" ({s['covered_line_count']})"
                 for s in cand["superset_test_files"][:3]
             )
+            if not supers:
+                supers = "-"
             md_lines.append(
-                f"| `{cand['test_file']}` | {cand['covered_line_count']} | {supers} |"
+                f"| {members_sample} | {cand['member_count']} | "
+                f"{cand['covered_line_count']} | {supers} |"
             )
 
     return durations_report, mapping_report, audit_report, "\n".join(md_lines) + "\n"

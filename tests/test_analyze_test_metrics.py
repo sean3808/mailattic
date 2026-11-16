@@ -180,23 +180,35 @@ def test_analyze_produces_all_three_reports_and_summary(tmp_path: Path) -> None:
     ]
 
     audit = json.loads((out_dir / "audit-candidates.json").read_text(encoding="utf-8"))
-    file_candidates = {c["test_file"]: c for c in audit["test_file_candidates"]}
-    assert "tests/test_subset.py" in file_candidates
-    assert "tests/test_contract.py" not in file_candidates
+    assert audit["schema_version"] == 2
+    file_candidates_by_member = {
+        member: c for c in audit["test_file_candidates"] for member in c["members"]
+    }
+    assert "tests/test_subset.py" in file_candidates_by_member
+    assert "tests/test_contract.py" not in file_candidates_by_member
     assert "tests/test_contract.py" in audit["zero_src_coverage_test_files"]
     supersets = [
-        s["test_file"]
-        for s in file_candidates["tests/test_subset.py"]["superset_test_files"]
+        member
+        for s in file_candidates_by_member["tests/test_subset.py"][
+            "superset_test_files"
+        ]
+        for member in s["members"]
     ]
     assert "tests/test_alpha.py" in supersets
 
-    single_candidates = {c["nodeid"]: c for c in audit["single_test_candidates"]}
-    assert "tests/test_subset.py::test_small" in single_candidates
+    single_candidates_by_member = {
+        member: c for c in audit["single_test_candidates"] for member in c["members"]
+    }
+    assert "tests/test_subset.py::test_small" in single_candidates_by_member
+    small_group = single_candidates_by_member["tests/test_subset.py::test_small"]
+    assert small_group["member_count"] == 2
+    assert set(small_group["members"]) == {
+        "tests/test_alpha.py::test_fast",
+        "tests/test_subset.py::test_small",
+    }
     single_supersets = [
-        s["nodeid"]
-        for s in single_candidates["tests/test_subset.py::test_small"]["superset_tests"]
+        member for s in small_group["superset_tests"] for member in s["members"]
     ]
-    assert "tests/test_alpha.py::test_fast" in single_supersets
     assert "tests/test_alpha.py::AlphaTests::test_slow" in single_supersets
 
     # Every coverage context joined to a JUnit test (test_docs_only has JUnit
@@ -362,3 +374,174 @@ def test_analyze_fails_loudly_on_missing_or_empty_junit(tmp_path: Path) -> None:
     result = _run_analyzer(junit_xml, cov_db, out_dir, repo_root=repo)
     assert result.returncode != 0
     assert "testcase" in (result.stdout + result.stderr).lower()
+
+
+def test_grouped_candidates_match_brute_force_reference(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src" / "mailattic").mkdir(parents=True)
+    (repo / "tests").mkdir(parents=True)
+    alpha_src = repo / "src" / "mailattic" / "alpha.py"
+    beta_src = repo / "src" / "mailattic" / "beta.py"
+    alpha_src.write_text("x = 1\n", encoding="utf-8")
+    beta_src.write_text("y = 2\n", encoding="utf-8")
+
+    test_cases = [
+        # Identical single-test masks in the same file
+        ("tests.test_ident", "test_eq_a", {str(alpha_src): [1, 2]}),
+        ("tests.test_ident", "test_eq_b", {str(alpha_src): [1, 2]}),
+        # Strict subset vs superset
+        ("tests.test_sub", "test_sub", {str(alpha_src): [1]}),
+        ("tests.test_super", "test_super", {str(alpha_src): [1, 2, 3]}),
+        # Equal-but-distinct files: test_file_a has 1 test covering {10, 11};
+        # test_file_b has 2 tests covering {10} and {11} respectively.
+        (
+            "tests.test_file_a",
+            "test_a_all",
+            {str(beta_src): [10, 11]},
+        ),
+        ("tests.test_file_b", "test_b_part1", {str(beta_src): [10]}),
+        ("tests.test_file_b", "test_b_part2", {str(beta_src): [11]}),
+        # Disjoint mask (not a subset of anything, no equal peers)
+        ("tests.test_disjoint", "test_alone", {str(beta_src): [99]}),
+    ]
+
+    for mod, _, _ in test_cases:
+        tf = mod.replace(".", "/") + ".py"
+        (repo / tf).write_text("", encoding="utf-8")
+
+    junit_xml = tmp_path / "junit.xml"
+    _write_junit_xml(
+        junit_xml,
+        [(mod, name, 0.1, "passed") for mod, name, _ in test_cases],
+    )
+
+    lines_by_context = {
+        f"{mod.replace('.', '/')}.py::{name}|run": file_lines
+        for mod, name, file_lines in test_cases
+    }
+    cov_db = tmp_path / ".coverage"
+    _build_coverage_db(cov_db, lines_by_context=lines_by_context)
+
+    out_dir = tmp_path / "reports"
+    result = _run_analyzer(junit_xml, cov_db, out_dir, repo_root=repo)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    audit = json.loads((out_dir / "audit-candidates.json").read_text(encoding="utf-8"))
+    assert audit["schema_version"] == 2
+
+    # Independent brute-force reference derived directly from fixture line sets.
+    node_sets: dict[str, set[tuple[str, int]]] = {}
+    file_sets: dict[str, set[tuple[str, int]]] = {}
+    for mod, name, file_lines in test_cases:
+        tf = f"{mod.replace('.', '/')}.py"
+        nid = f"{tf}::{name}"
+        pts = {(path, line) for path, lines in file_lines.items() for line in lines}
+        node_sets[nid] = pts
+        file_sets.setdefault(tf, set()).update(pts)
+
+    expected_single = {
+        a
+        for a, sa in node_sets.items()
+        if sa and any(b != a and sa <= sb for b, sb in node_sets.items())
+    }
+    expected_files = {
+        a
+        for a, sa in file_sets.items()
+        if sa and any(b != a and sa <= sb for b, sb in file_sets.items())
+    }
+
+    actual_single = {
+        member
+        for group in audit["single_test_candidates"]
+        for member in group["members"]
+    }
+    actual_files = {
+        member for group in audit["test_file_candidates"] for member in group["members"]
+    }
+
+    assert actual_single == expected_single
+    assert actual_files == expected_files
+    assert audit["single_test_candidate_count"] == len(expected_single)
+    assert audit["test_file_candidate_count"] == len(expected_files)
+
+
+def _run_identical_tests_fixture(tmp_path: Path, k: int) -> dict[str, object]:
+    repo = tmp_path / f"repo_{k}"
+    (repo / "src" / "mailattic").mkdir(parents=True)
+    (repo / "tests").mkdir(parents=True)
+    alpha_src = repo / "src" / "mailattic" / "alpha.py"
+    alpha_src.write_text("x = 1\n", encoding="utf-8")
+    (repo / "tests" / "test_param.py").write_text("", encoding="utf-8")
+
+    junit_xml = tmp_path / f"junit_{k}.xml"
+    _write_junit_xml(
+        junit_xml,
+        [("tests.test_param", f"test_case[{i}]", 0.01, "passed") for i in range(k)],
+    )
+    cov_db = tmp_path / f".coverage_{k}"
+    _build_coverage_db(
+        cov_db,
+        lines_by_context={
+            f"tests/test_param.py::test_case[{i}]|run": {str(alpha_src): [1, 2, 3]}
+            for i in range(k)
+        },
+    )
+    out_dir = tmp_path / f"reports_{k}"
+    result = _run_analyzer(junit_xml, cov_db, out_dir, repo_root=repo)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    return json.loads((out_dir / "audit-candidates.json").read_text(encoding="utf-8"))
+
+
+def test_identical_tests_produce_linear_output_and_truncate_supersets(
+    tmp_path: Path,
+) -> None:
+    audit_10 = _run_identical_tests_fixture(tmp_path, 10)
+    audit_50 = _run_identical_tests_fixture(tmp_path, 50)
+
+    assert len(audit_50["single_test_candidates"]) == 1
+    group_50 = audit_50["single_test_candidates"][0]
+    assert group_50["member_count"] == 50
+    assert len(group_50["members"]) == 50
+    assert group_50["superset_count"] == 0
+    assert group_50["superset_tests"] == []
+
+    size_10 = len(json.dumps(audit_10["single_test_candidates"]))
+    size_50 = len(json.dumps(audit_50["single_test_candidates"]))
+    # O(k) grows ~5x from k=10 to k=50; O(k^2) would grow ~25x.
+    assert size_50 < 6 * size_10
+
+    # Verify superset truncation + total superset_count when > max_superset_groups.
+    repo = tmp_path / "repo_trunc"
+    (repo / "src" / "mailattic").mkdir(parents=True)
+    (repo / "tests").mkdir(parents=True)
+    alpha_src = repo / "src" / "mailattic" / "alpha.py"
+    alpha_src.write_text("x = 1\n", encoding="utf-8")
+    (repo / "tests" / "test_trunc.py").write_text("", encoding="utf-8")
+
+    superset_n = 15
+    junit_cases = [("tests.test_trunc", "test_base", 0.01, "passed")] + [
+        ("tests.test_trunc", f"test_sup_{i}", 0.01, "passed") for i in range(superset_n)
+    ]
+    junit_xml = tmp_path / "junit_trunc.xml"
+    _write_junit_xml(junit_xml, junit_cases)
+
+    lines_by_ctx = {
+        "tests/test_trunc.py::test_base|run": {str(alpha_src): [1]},
+    }
+    for i in range(superset_n):
+        lines_by_ctx[f"tests/test_trunc.py::test_sup_{i}|run"] = {
+            str(alpha_src): [1, 10 + i]
+        }
+    cov_db = tmp_path / ".coverage_trunc"
+    _build_coverage_db(cov_db, lines_by_context=lines_by_ctx)
+
+    out_dir = tmp_path / "reports_trunc"
+    result = _run_analyzer(junit_xml, cov_db, out_dir, repo_root=repo)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    audit_trunc = json.loads(
+        (out_dir / "audit-candidates.json").read_text(encoding="utf-8")
+    )
+    base_group = audit_trunc["single_test_candidates"][0]
+    assert base_group["members"] == ["tests/test_trunc.py::test_base"]
+    assert base_group["superset_count"] == superset_n
+    assert len(base_group["superset_tests"]) == audit_trunc["max_superset_groups"]
