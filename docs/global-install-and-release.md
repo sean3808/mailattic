@@ -21,7 +21,7 @@ bes search --keyword test --limit 1
 
 ## 路徑解析
 
-**DB 路徑 fallback 順序**：`--database <path>` flag > `MAILATTIC_DB` env var > absolute default 指向 repo root（`C:\IT_Projects\mailattic\mailattic.db`）。空字串或 whitespace-only env var 視為 unset，退回 absolute default。
+**DB 路徑 fallback 順序**：`--database <path>` flag > `MAILATTIC_DB` env var > absolute default（`storage.py` 的 `DEFAULT_DB_NAME`，指向本 repo 之外的舊 repo 目錄 `C:\IT_Projects\mailattic\mailattic.db`，不是本 repo 根目錄）。空字串或 whitespace-only env var 視為 unset，退回 absolute default。
 
 **`bes sync-imap` 各 default 寫死指向 repo root，呼叫端 cwd 不影響行為**：`env_file` / `maildir_root` / `log_dir` 三個 active sync default 都是 absolute path，從任意 cwd 呼叫（含跨專案 subagent 與 Windows Task Scheduler）行為一致。要切位置請走顯式 flag（`--env-file` / `--maildir-root` / `--log-dir` / `--database`）或 env var。此設計是有意為之，避免 default 路徑被 `.resolve()` 接到呼叫端 cwd 而失敗或產出 stray 目錄。
 
