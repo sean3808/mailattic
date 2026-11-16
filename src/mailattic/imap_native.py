@@ -375,6 +375,8 @@ class NativeImapClient:
         result: list[ImapFolder] = []
         previous_was_literal = False
         for raw in data or []:
+            # Update before any `continue`, so a literal that is skipped
+            # (#308) still marks the next element as its trailer.
             after_literal = previous_was_literal
             previous_was_literal = isinstance(raw, tuple)
             if raw is None:

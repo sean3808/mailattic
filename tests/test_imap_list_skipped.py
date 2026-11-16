@@ -57,6 +57,15 @@ def test_missing_name_is_recorded() -> None:
     assert len(skipped) == 1
 
 
+def test_trailer_after_undecodable_literal_is_ignored() -> None:
+    # The undecodable literal is reported once (#308); its trailer is not a
+    # second, unparseable listing.
+    names, skipped = _list(b'* LIST () "/" {3}\r\n\xff\xfe\xfd\r\n' + _lit("Archive"))
+    assert names == ["Archive"]
+    assert len(skipped) == 1
+    assert "could not be parsed" not in skipped[0]
+
+
 def test_lone_close_paren_not_after_literal_is_recorded() -> None:
     names, skipped = _list(b"* LIST )\r\n" + b'* LIST () "/" INBOX\r\n')
     assert names == ["INBOX"]
