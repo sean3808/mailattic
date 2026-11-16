@@ -794,11 +794,11 @@ def _write_original_file(
             payload=payload,
             save_to_tmp=save_to_tmp,
         )
-    except FileExistsError as exc:
-        if destination_path.exists():
-            return exists_result
-        return replace(base, detail=f"Writing original file failed: {exc}")
     except Exception as exc:
+        # A rename race leaves the destination in place; any other failure,
+        # including a temp-file collision, is a write failure.
+        if isinstance(exc, FileExistsError) and destination_path.exists():
+            return exists_result
         return replace(base, detail=f"Writing original file failed: {exc}")
 
     return replace(base, status="exported", dest_path=destination_path)
@@ -947,6 +947,11 @@ def _search_folder_by_message_id(
     return _FolderSearchResult(candidates, unreadable_count)
 
 
+def _same_imap_folder(a: str, b: str) -> bool:
+    """Compare IMAP folder names exactly; INBOX alone is case-insensitive."""
+    return a == b or (a.upper() == "INBOX" and b.upper() == "INBOX")
+
+
 def _search_other_imap_folders(
     client: Any,
     message: Mapping[str, object],
@@ -968,9 +973,7 @@ def _search_other_imap_folders(
         folder_wire = getattr(folder, "wire_name", None)
         if not folder_wire:
             continue
-        if folder_wire == recorded_wire_name or (
-            recorded_wire_name.upper() == "INBOX" and folder_wire.upper() == "INBOX"
-        ):
+        if _same_imap_folder(folder_wire, recorded_wire_name):
             continue
         folder_display = getattr(folder, "display_name", None) or folder_wire
         try:
