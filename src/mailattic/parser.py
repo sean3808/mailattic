@@ -116,12 +116,17 @@ def _text_codec_name(label: str) -> str | None:
     return info.name
 
 
+def _decoders_for(declared_norm: str) -> tuple[str, ...]:
+    """The decoder chain a normalised declared label means in practice."""
+    return _DECLARED_CHARSET_DECODERS.get(declared_norm, (declared_norm,))
+
+
 def _decode_as_declared(raw: bytes, declared_norm: str) -> str | None:
     """Strictly decode *raw* as what *declared_norm* means in practice.
 
     Returns ``None`` when no decoder for the label accepts the bytes.
     """
-    for codec in _DECLARED_CHARSET_DECODERS.get(declared_norm, (declared_norm,)):
+    for codec in _decoders_for(declared_norm):
         try:
             return raw.decode(codec, errors="strict")
         except UnicodeDecodeError:
@@ -144,21 +149,13 @@ def _decode_cjk_with_replace(raw: bytes, declared_norm: str) -> str | None:
     except UnicodeDecodeError:
         pass
 
-    codecs_to_try = _DECLARED_CHARSET_DECODERS.get(declared_norm, (declared_norm,))
-    best_errors: int | None = None
-    best_text: str | None = None
-    for codec in codecs_to_try:
-        candidate = raw.decode(codec, errors="replace")
-        err_count = candidate.count("\ufffd")
-        if best_errors is None or err_count < best_errors:
-            best_errors = err_count
-            best_text = candidate
-
-    if (
-        best_errors is not None
-        and best_errors <= max(2, len(raw) // 20)
-        and best_errors * 4 <= len(raw)
-    ):
+    # min() keeps the first of equal candidates, so ties follow the chain order.
+    best_text = min(
+        (raw.decode(codec, errors="replace") for codec in _decoders_for(declared_norm)),
+        key=lambda text: text.count("\ufffd"),
+    )
+    best_errors = best_text.count("\ufffd")
+    if best_errors <= max(2, len(raw) // 20) and best_errors * 4 <= len(raw):
         return best_text
     return None
 
@@ -308,7 +305,7 @@ def _decode_word_run(payload: bytes, charset: str) -> str:
     decoded = _decode_as_declared(payload, declared_norm)
     if decoded is None:
         # Truncated or corrupt: replace within the widest decoder for the label.
-        widest = _DECLARED_CHARSET_DECODERS.get(declared_norm, (declared_norm,))[-1]
+        widest = _decoders_for(declared_norm)[-1]
         decoded = payload.decode(widest, errors="replace")
     # A strict utf-7 decode can itself yield a lone surrogate (#288).
     return _without_lone_surrogates(decoded)
@@ -994,16 +991,16 @@ def _walk_own_parts_with_context(
     while stack:
         part, in_alt = stack.pop()
         yield part, in_alt
-        if not part.is_multipart():
-            continue
-        if _is_rfc822_attachment_part(part, outer_message=message):
-            continue
         # Python's email parser treats message/delivery-status as multipart and
         # exposes its payload (including raw undecoded base64 when CTE=base64)
         # as synthetic text/plain subparts; exclude it from body text (#92).
         if (
-            exclude_delivery_status
-            and part.get_content_type() == "message/delivery-status"
+            not part.is_multipart()
+            or _is_rfc822_attachment_part(part, outer_message=message)
+            or (
+                exclude_delivery_status
+                and part.get_content_type() == "message/delivery-status"
+            )
         ):
             continue
         is_alt = in_alt or (part.get_content_type() == "multipart/alternative")
