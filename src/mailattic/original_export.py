@@ -932,7 +932,11 @@ def _search_folder_by_message_id(
     for uid in raw_uids:
         try:
             candidate_bytes = client.fetch_rfc822(uid)
-            if candidate_bytes and _verify_imap_rfc822(candidate_bytes, message):
+            if not candidate_bytes:
+                # A hit whose body could not be read leaves the scope unread.
+                unreadable_count += 1
+                continue
+            if _verify_imap_rfc822(candidate_bytes, message):
                 candidates.append(candidate_bytes)
         except _IMAP_CONNECTION_ERRORS as exc:
             return _FolderSearchResult(

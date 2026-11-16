@@ -2609,6 +2609,38 @@ def test_imap_message_moved_to_another_folder_exports(tmp_path: Path) -> None:
     assert Path(result.dest_path).read_bytes() == moved_eml
 
 
+def test_imap_other_folder_empty_fetch_fails_not_found(tmp_path: Path) -> None:
+    # A SEARCH hit whose FETCH returns no bytes was not read, so the result
+    # cannot be not_found (#53 ruling 3).
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        folder_name="INBOX",
+        uid=42,
+        message_id="<empty42@mailattic.test>",
+        subject="Empty Fetch",
+    )
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder("INBOX", "INBOX", "/"),
+            ImapFolder("Archive", "Archive", "/"),
+        ],
+        folder_rfc822_by_uid={"Archive": {99: b""}},
+        folder_uids_by_header={"Archive": {"empty42@mailattic.test": [99]}},
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        imap_client=imap_client,
+    )
+
+    assert result.status == "failed"
+    assert result.dest_path is None
+
+
 def test_imap_message_moved_to_trash_still_exports(tmp_path: Path) -> None:
     db_path, db_id = _seed_imap_message(
         tmp_path,
