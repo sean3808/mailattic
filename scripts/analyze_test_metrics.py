@@ -24,7 +24,7 @@ import argparse
 import json
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import coverage
@@ -36,6 +36,31 @@ class TestCaseTiming:
     test_file: str
     duration_seconds: float
     outcome: str
+
+
+@dataclass(frozen=True)
+class CoverageContextData:
+    src_to_test_files: dict[str, set[str]]
+    test_file_masks: dict[str, int]
+    nodeid_masks: dict[str, int]
+    nodeid_to_src_files: dict[str, set[str]]
+    all_src_files: list[str]
+
+
+@dataclass
+class _TestFileStats:
+    test_file: str
+    duration_seconds: float = 0.0
+    test_count: int = 0
+
+
+@dataclass
+class _SourceModuleStats:
+    source_file: str
+    total_touching_duration_seconds: float = 0.0
+    proportional_duration_seconds: float = 0.0
+    touching_test_count: int = 0
+    touching_test_files: set[str] = field(default_factory=set)
 
 
 def _normalize_repo_path(raw_path: str, repo_root: Path) -> str:
@@ -132,24 +157,8 @@ def _strip_context_phase(context: str) -> str:
     return context
 
 
-def load_coverage_contexts(
-    coverage_db: Path, repo_root: Path
-) -> tuple[
-    dict[str, set[str]],
-    dict[str, int],
-    dict[str, int],
-    dict[str, set[str]],
-    list[str],
-]:
-    """Read coverage.py DB and extract per-test and per-file src/ coverage bitmasks.
-
-    Returns:
-      - src_to_test_files: {src_file: set of test_files}
-      - test_file_masks: {test_file: int bitmask of covered (src_file, lineno)}
-      - nodeid_masks: {nodeid: int bitmask of covered (src_file, lineno)}
-      - nodeid_to_src_files: {nodeid: set of src_files}
-      - all_src_files: sorted list of measured src/ files
-    """
+def load_coverage_contexts(coverage_db: Path, repo_root: Path) -> CoverageContextData:
+    """Read coverage.py DB and extract per-test and per-file src/ coverage bitmasks."""
     if not coverage_db.is_file():
         raise FileNotFoundError(f"Coverage DB not found: {coverage_db}")
 
@@ -208,12 +217,12 @@ def load_coverage_contexts(
             f"test context: {coverage_db}"
         )
 
-    return (
-        dict(src_to_test_files),
-        dict(test_file_masks),
-        dict(nodeid_masks),
-        dict(nodeid_to_src_files),
-        sorted(all_src_files),
+    return CoverageContextData(
+        src_to_test_files=dict(src_to_test_files),
+        test_file_masks=dict(test_file_masks),
+        nodeid_masks=dict(nodeid_masks),
+        nodeid_to_src_files=dict(nodeid_to_src_files),
+        all_src_files=sorted(all_src_files),
     )
 
 
@@ -267,75 +276,65 @@ def _find_subset_candidates(
 
 def build_reports(
     cases: list[TestCaseTiming],
-    src_to_test_files: dict[str, set[str]],
-    test_file_masks: dict[str, int],
-    nodeid_masks: dict[str, int],
-    nodeid_to_src_files: dict[str, set[str]],
-    all_src_files: list[str],
+    cov_ctx: CoverageContextData,
     *,
     top_n: int,
 ) -> tuple[dict[str, object], dict[str, object], dict[str, object], str]:
     """Assemble the three JSON reports and Markdown summary."""
     # 1. Durations
     sorted_tests = sorted(cases, key=lambda c: (-c.duration_seconds, c.nodeid))
-    by_test_file: dict[str, dict[str, object]] = {}
+    by_test_file: dict[str, _TestFileStats] = {}
     for c in cases:
         entry = by_test_file.setdefault(
-            c.test_file,
-            {"test_file": c.test_file, "duration_seconds": 0.0, "test_count": 0},
+            c.test_file, _TestFileStats(test_file=c.test_file)
         )
-        entry["duration_seconds"] = round(
-            float(entry["duration_seconds"]) + c.duration_seconds, 6
-        )
-        entry["test_count"] = int(entry["test_count"]) + 1
+        entry.duration_seconds = round(entry.duration_seconds + c.duration_seconds, 6)
+        entry.test_count += 1
 
-    sorted_test_files = sorted(
-        by_test_file.values(),
-        key=lambda item: (-float(item["duration_seconds"]), str(item["test_file"])),
-    )
-
-    by_source_module: dict[str, dict[str, object]] = {
-        src: {
-            "source_file": src,
-            "total_touching_duration_seconds": 0.0,
-            "proportional_duration_seconds": 0.0,
-            "touching_test_count": 0,
-            "touching_test_files": set(),
+    sorted_test_files = [
+        {
+            "test_file": item.test_file,
+            "duration_seconds": item.duration_seconds,
+            "test_count": item.test_count,
         }
-        for src in all_src_files
+        for item in sorted(
+            by_test_file.values(),
+            key=lambda item: (-item.duration_seconds, item.test_file),
+        )
+    ]
+
+    by_source_module: dict[str, _SourceModuleStats] = {
+        src: _SourceModuleStats(source_file=src) for src in cov_ctx.all_src_files
     }
     for c in cases:
-        touched = nodeid_to_src_files.get(c.nodeid, set())
+        touched = cov_ctx.nodeid_to_src_files.get(c.nodeid, set())
         if not touched:
             continue
         share = c.duration_seconds / len(touched)
         for src in touched:
             mod = by_source_module[src]
-            mod["total_touching_duration_seconds"] = round(
-                float(mod["total_touching_duration_seconds"]) + c.duration_seconds, 6
+            mod.total_touching_duration_seconds = round(
+                mod.total_touching_duration_seconds + c.duration_seconds, 6
             )
-            mod["proportional_duration_seconds"] = round(
-                float(mod["proportional_duration_seconds"]) + share, 6
+            mod.proportional_duration_seconds = round(
+                mod.proportional_duration_seconds + share, 6
             )
-            mod["touching_test_count"] = int(mod["touching_test_count"]) + 1
-            mod["touching_test_files"].add(c.test_file)
+            mod.touching_test_count += 1
+            mod.touching_test_files.add(c.test_file)
 
-    sorted_source_modules = sorted(
-        [
-            {
-                "source_file": m["source_file"],
-                "total_touching_duration_seconds": m["total_touching_duration_seconds"],
-                "proportional_duration_seconds": m["proportional_duration_seconds"],
-                "touching_test_count": m["touching_test_count"],
-                "touching_test_file_count": len(m["touching_test_files"]),
-            }
-            for m in by_source_module.values()
-        ],
-        key=lambda item: (
-            -float(item["total_touching_duration_seconds"]),
-            str(item["source_file"]),
-        ),
-    )
+    sorted_source_modules = [
+        {
+            "source_file": m.source_file,
+            "total_touching_duration_seconds": m.total_touching_duration_seconds,
+            "proportional_duration_seconds": m.proportional_duration_seconds,
+            "touching_test_count": m.touching_test_count,
+            "touching_test_file_count": len(m.touching_test_files),
+        }
+        for m in sorted(
+            by_source_module.values(),
+            key=lambda item: (-item.total_touching_duration_seconds, item.source_file),
+        )
+    ]
 
     total_duration = round(sum(c.duration_seconds for c in cases), 6)
     durations_report = {
@@ -343,7 +342,7 @@ def build_reports(
         "top_n": top_n,
         "total_tests": len(cases),
         "total_test_files": len(by_test_file),
-        "total_source_modules": len(all_src_files),
+        "total_source_modules": len(cov_ctx.all_src_files),
         "total_duration_seconds": total_duration,
         "top_tests": [
             {
@@ -362,7 +361,8 @@ def build_reports(
 
     # 2. Source-to-tests mapping
     mapping_dict = {
-        src: sorted(src_to_test_files.get(src, set())) for src in all_src_files
+        src: sorted(cov_ctx.src_to_test_files.get(src, set()))
+        for src in cov_ctx.all_src_files
     }
     unreferenced_sources = [src for src, tests in mapping_dict.items() if not tests]
     all_mapped_test_files = sorted(
@@ -370,8 +370,9 @@ def build_reports(
     )
     mapping_report = {
         "schema_version": 1,
-        "source_file_count": len(all_src_files),
-        "covered_source_file_count": len(all_src_files) - len(unreferenced_sources),
+        "source_file_count": len(cov_ctx.all_src_files),
+        "covered_source_file_count": len(cov_ctx.all_src_files)
+        - len(unreferenced_sources),
         "mapped_test_file_count": len(all_mapped_test_files),
         "unreferenced_source_files": unreferenced_sources,
         "source_to_test_files": mapping_dict,
@@ -380,15 +381,15 @@ def build_reports(
     # 3. Audit candidates
     all_junit_test_files = sorted({c.test_file for c in cases})
     zero_src_test_files = sorted(
-        tf for tf in all_junit_test_files if test_file_masks.get(tf, 0) == 0
+        tf for tf in all_junit_test_files if cov_ctx.test_file_masks.get(tf, 0) == 0
     )
     test_file_candidates = _find_subset_candidates(
-        test_file_masks,
+        cov_ctx.test_file_masks,
         key_name="test_file",
         superset_list_name="superset_test_files",
     )
     single_test_candidates = _find_subset_candidates(
-        nodeid_masks,
+        cov_ctx.nodeid_masks,
         key_name="nodeid",
         superset_list_name="superset_tests",
         extra_fn=lambda nid: {"test_file": nid.split("::", 1)[0]},
@@ -409,7 +410,7 @@ def build_reports(
         "",
         f"- Total tests: {len(cases)} across {len(by_test_file)} test files",
         f"- Total cumulative test duration: {total_duration:.2f}s",
-        f"- Measured `src/` files: {len(all_src_files)}",
+        f"- Measured `src/` files: {len(cov_ctx.all_src_files)}",
         "",
         f"## Top Slowest Tests (Top {min(top_n, len(sorted_tests))})",
         "",
@@ -453,13 +454,13 @@ def build_reports(
             f"{mod['touching_test_count']} | `{mod['source_file']}` |"
         )
 
-    covered_src_count = len(all_src_files) - len(unreferenced_sources)
+    covered_src_count = len(cov_ctx.all_src_files) - len(unreferenced_sources)
     md_lines.extend(
         [
             "",
             "## Source-to-Test Mapping",
             "",
-            f"- Source files measured: {len(all_src_files)}",
+            f"- Source files measured: {len(cov_ctx.all_src_files)}",
             f"- Source files covered by >= 1 test: {covered_src_count}",
             f"- Distinct test files referenced: {len(all_mapped_test_files)}",
             "",
@@ -506,21 +507,11 @@ def main(argv: list[str] | None = None) -> int:
 
     repo_root = args.repo_root.resolve()
     cases = parse_junit_xml(args.junit_xml, repo_root)
-    (
-        src_to_test_files,
-        test_file_masks,
-        nodeid_masks,
-        nodeid_to_src_files,
-        all_src_files,
-    ) = load_coverage_contexts(args.coverage_db, repo_root)
+    cov_ctx = load_coverage_contexts(args.coverage_db, repo_root)
 
     durations_report, mapping_report, audit_report, summary_md = build_reports(
         cases,
-        src_to_test_files,
-        test_file_masks,
-        nodeid_masks,
-        nodeid_to_src_files,
-        all_src_files,
+        cov_ctx,
         top_n=args.top_n,
     )
 

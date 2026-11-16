@@ -114,8 +114,10 @@ pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route FullSequential
 
 Emits the `full` vector byte-for-byte and appends only coverage
 instrumentation and reporting. Do not invoke it by hand: it requires a staging
-directory and run descriptor that `scripts\report-diff-coverage.ps1` creates.
-Use that script instead — see [Diff coverage evidence](#diff-coverage-evidence).
+directory and run descriptor that `scripts\report-diff-coverage.ps1` (for
+diff coverage) or the `measure-test-metrics` job in `.github/workflows/ci.yml`
+(for scheduled/manual CI measurement) creates. Use `scripts\report-diff-coverage.ps1`
+locally — see [Diff coverage evidence](#diff-coverage-evidence).
 
 It takes a run **ID**, never a path. The launcher resolves the coverage
 artifact root itself and derives `<runtime root>/coverage/<run id>` beneath it.
@@ -157,7 +159,7 @@ contract — it would invalidate the numbers.
 An agent uses targeted for current-task regression, quick for ordinary
 implementation feedback, full for medium/high closeout, full-sequential
 for fallback and equivalence proof, and full-coverage only through
-`scripts\report-diff-coverage.ps1`. `quick` is not release evidence, and no
+`scripts\report-diff-coverage.ps1` (or the `measure-test-metrics` CI job). `quick` is not release evidence, and no
 route reproduces a raw canonical pytest command by hand outside the
 launcher. Release invokes the same launcher with `-Route Full`; there is no
 hidden sixth pytest variant. A new worker count requires a new immutable

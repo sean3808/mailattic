@@ -1445,12 +1445,12 @@ def test_full_coverage_run_id_resolving_into_another_runs_directory_is_refused(
     assert "escapes the artifact root" in result.stderr
 
 
-def test_full_coverage_pytest_vector_equals_full_plus_exactly_five_coverage_options(
+def test_full_coverage_pytest_vector_equals_full_plus_exactly_six_coverage_options(
     tmp_path: Path, stub_uv_dir: Path
 ):
     """Argument-assembly only -- this does not exercise a full pytest run.
 
-    The first three elements of the coverage tail are literal and independent
+    The first four elements of the coverage tail are literal and independent
     of path resolution, so they are compared by exact string equality, same
     as every other route-vector test in this file. The XML/junit report
     paths are built from the launcher's own Win32-resolved real path (which

@@ -138,6 +138,8 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      COVERAGE_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v5
 
@@ -150,28 +152,28 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $runId = "ci-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
-          $staging = Join-Path (Join-Path '.project-runtime' 'coverage') $runId
+          . (Join-Path 'scripts' 'project-tool-environment.ps1')
+          $runtimeRoot = Get-ProjectRuntimeRoot -RepositoryRoot (Get-Location).Path
+          $staging = Join-Path (Join-Path $runtimeRoot 'coverage') $env:COVERAGE_RUN_ID
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
-          $descriptor = @{
-              runId = $runId
-              leaseNamespace = $runId
+          $descriptor = [ordered]@{
+              runId          = $env:COVERAGE_RUN_ID
               ownerProcessId = $PID
+              leaseNamespace = $env:COVERAGE_RUN_ID
           } | ConvertTo-Json -Compress
           Set-Content -LiteralPath (Join-Path $staging 'run-descriptor.json') -Value $descriptor -Encoding utf8NoBOM
-          & pwsh -NoProfile -File scripts/invoke-pytest.ps1 -Route FullCoverage -CoverageRunId $runId
+          "COVERAGE_STAGING_DIR=$staging" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & pwsh -NoProfile -File scripts/invoke-pytest.ps1 -Route FullCoverage -CoverageRunId $env:COVERAGE_RUN_ID
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Analyze test durations and coverage contexts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $runId = "ci-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
-          $staging = Join-Path (Join-Path '.project-runtime' 'coverage') $runId
           uv run --locked --exact python scripts/analyze_test_metrics.py `
-              --junit-xml (Join-Path $staging 'junit.xml') `
-              --coverage-db (Join-Path $staging '.coverage') `
-              --output-dir (Join-Path $staging 'reports') `
+              --junit-xml (Join-Path $env:COVERAGE_STAGING_DIR 'junit.xml') `
+              --coverage-db (Join-Path $env:COVERAGE_STAGING_DIR '.coverage') `
+              --output-dir (Join-Path $env:COVERAGE_STAGING_DIR 'reports') `
               --repo-root .
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -179,5 +181,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-measurement-reports
-          path: .project-runtime/coverage/ci-${{ github.run_id }}-${{ github.run_attempt }}/reports/
+          path: ${{ env.COVERAGE_STAGING_DIR }}/reports/
           if-no-files-found: error

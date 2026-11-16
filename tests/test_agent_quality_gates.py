@@ -434,3 +434,38 @@ def test_no_active_raw_pytest_command_outside_launcher_or_tests() -> None:
         "raw pytest invocation (command or coverage flag) found outside the "
         f"launcher/tests: {violations}"
     )
+
+
+def test_measure_test_metrics_ci_job_pins_run_descriptor_to_launcher_contract() -> None:
+    config = _ci_workflow()
+    job = config["jobs"]["measure-test-metrics"]
+
+    assert job["if"] == (
+        "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+    )
+    assert job["runs-on"] == "windows-latest"
+
+    run_steps = "\n".join(step["run"] for step in job["steps"] if "run" in step)
+    assert "scripts/invoke-pytest.ps1 -Route FullCoverage -CoverageRunId" in run_steps
+    assert "Get-ProjectRuntimeRoot" in run_steps
+    assert RAW_PYTEST_COMMAND not in run_steps
+
+    launcher_text = LAUNCHER_SCRIPT.read_text(encoding="utf-8")
+    assert_block = launcher_text.split("function Assert-CoverageStagingDirectory", 1)[
+        1
+    ].split("function Get-ProjectPathOccupancy", 1)[0]
+    validated_fields = set(re.findall(r"\$descriptor\.([A-Za-z0-9_]+)", assert_block))
+    assert validated_fields == {"runId", "leaseNamespace", "ownerProcessId"}
+
+    for field in validated_fields:
+        assert re.search(rf"\b{re.escape(field)}\s*=", run_steps), (
+            f"measure-test-metrics inline run-descriptor.json is missing field {field}"
+        )
+
+    upload_steps = [
+        step
+        for step in job["steps"]
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(upload_steps) == 1
+    assert upload_steps[0]["with"]["name"] == "test-measurement-reports"
