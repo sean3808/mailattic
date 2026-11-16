@@ -430,10 +430,10 @@ def test_n_declared_big5_short_sentence_with_invalid_byte_uses_replace():
 def test_n_declared_big5_html_with_invalid_byte_uses_replace():
     """(n) Tag-heavy Big5 HTML with invalid bytes → Big5 replace, CJK preserved."""
     cjk_part = "請查收出貨通知。"
+    tags_open = '<div class="wrap"><span class="txt">' * 15
+    tags_close = "</span></div>" * 15
     raw = (
-        "<html><body><div class='notice'><p>Order #123 "
-        + cjk_part
-        + "</p></div></body></html>"
+        f"<html><body>{tags_open}<p>Order #123 {cjk_part}</p>{tags_close}</body></html>"
     ).encode("big5") + b"\xff\xfe"
 
     result = _detect_and_decode(raw, "big5")
@@ -470,11 +470,14 @@ def test_n_declared_gb_with_invalid_byte_uses_replace(declared):
 
 def test_n_declared_cjk_with_many_invalid_bytes_falls_through():
     """(n) Declared big5 with many invalid bytes beyond threshold → falls through."""
-    # Mostly invalid bytes (>25% and >5%): should not be treated as "a few bad bytes".
+    # Mostly invalid bytes (>25% and >5%): must fall through to detection,
+    # not be accepted by replace-decoding.
     raw = b"Hello " + b"\xff\xfe\x80\x81\x82\x83" * 5
     result = _detect_and_decode(raw, "big5")
     assert isinstance(result, str)
     assert "Hello " in result
+    assert result != raw.decode("big5", errors="replace")
+    assert U_FFFD not in result
 
 
 def test_n_declared_cjk_actually_valid_utf8_still_recovers_utf8():

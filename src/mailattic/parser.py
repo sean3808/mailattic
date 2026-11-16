@@ -96,8 +96,7 @@ _DECLARED_CHARSET_DECODERS: dict[str, tuple[str, ...]] = {
 # invalid bytes should fall back to errors="replace" under the declared codec
 # family rather than charset detection (issue #54).
 _CJK_REPLACE_CODECS: frozenset[str] = frozenset(
-    codecs.lookup(n).name
-    for n in ("big5", "cp950", "big5hkscs", "gbk", "gb2312", "gb18030")
+    codecs.lookup(n).name for n in ("big5", "gbk", "gb2312")
 )
 
 
