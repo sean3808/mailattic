@@ -6,7 +6,7 @@ import tempfile
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.errors import HeaderParseError
 from email.headerregistry import Address
 from pathlib import Path
@@ -250,6 +250,12 @@ class OutlookComReader:
         return matches[0]
 
     def iter_messages(
+        self, source: PstSource
+    ) -> Iterable[RawOutlookMessage | RawOutlookFailure]:
+        require_taipei_machine_timezone()
+        return self._iter_messages(source)
+
+    def _iter_messages(
         self, source: PstSource
     ) -> Iterable[RawOutlookMessage | RawOutlookFailure]:
         root_folder = self.resolve_store(source).GetRootFolder()
@@ -629,6 +635,46 @@ def _normalized_windows_path(value: str | Path) -> str:
     return str(Path(value).expanduser().resolve()).casefold()
 
 
+_EXPECTED_PST_UTC_OFFSET = timedelta(hours=8)
+
+
+def get_machine_utc_offset() -> timedelta | None:
+    """Return the reading machine's current local UTC offset.
+
+    Kept as a module-level seam so tests (and UTC CI hosts) can override
+    the detected offset without mutating the Windows system time zone.
+    """
+    return datetime.now().astimezone().utcoffset()
+
+
+def _format_utc_offset(offset: timedelta | None) -> str:
+    if offset is None:
+        return "unknown (None)"
+    total_seconds = int(offset.total_seconds())
+    sign = "+" if total_seconds >= 0 else "-"
+    abs_seconds = abs(total_seconds)
+    hours, remainder = divmod(abs_seconds, 3600)
+    minutes = remainder // 60
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def require_taipei_machine_timezone() -> None:
+    """Fail loudly unless the reading machine's UTC offset is +08:00.
+
+    Outlook COM returns timestamps in the reading machine's local wall clock
+    while ``pywintypes`` tags them as UTC. Relabelling them as ``+08:00`` is
+    only valid when the reading machine itself is at UTC+08:00.
+    """
+    offset = get_machine_utc_offset()
+    if offset != _EXPECTED_PST_UTC_OFFSET:
+        detected = _format_utc_offset(offset)
+        raise RuntimeError(
+            "PST import requires machine UTC offset +08:00 (Asia/Taipei), "
+            f"but detected {detected}. "
+            "Refusing to import before writing any records."
+        )
+
+
 def _com_wall_clock_to_aware(value: Any) -> datetime | None:
     """Relabel a COM timestamp with the timezone its numbers are really in.
 
@@ -650,6 +696,7 @@ def _com_wall_clock_to_aware(value: Any) -> datetime | None:
     """
     if value is None:
         return None
+    require_taipei_machine_timezone()
     return datetime(
         value.year,
         value.month,
@@ -810,13 +857,15 @@ class OutlookPstParser:
         self.summary: PstExtractionAccount | None = None
 
     def iter_extraction_results(self, source: PstSource) -> Iterable[ExtractionResult]:
+        require_taipei_machine_timezone()
         account = PstExtractionAccount(source_path=source.source_path)
         self.summary = account
-        yield from self._generate(source, account)
+        return self._generate(source, account)
 
     def extract(
         self, source: PstSource
     ) -> tuple[PstExtractionAccount, Iterable[ExtractionResult]]:
+        require_taipei_machine_timezone()
         account = PstExtractionAccount(source_path=source.source_path)
         return account, self._generate(source, account)
 
