@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import imaplib
 import re
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -21,11 +20,11 @@ from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .attachment_store import (
-    _EXPORT_TMP_PREFIX,
-    _format_sent_date_token,
-    _sanitize_windows_filename,
-    _truncate_export_filename,
+from .export_files import (
+    format_sent_date_token,
+    land_exported_file,
+    sanitize_windows_filename,
+    truncate_export_filename,
 )
 from .mutf7 import encode_mutf7
 from .outlook_pst import (
@@ -99,17 +98,17 @@ def build_original_export_filename(
     fmt: Literal["msg", "eml"],
 ) -> str:
     """Build a sanitized export filename: {date}_msg{id}_{subject}.{ext}."""
-    sent_date = _format_sent_date_token(message.get("sent_at"))
+    sent_date = format_sent_date_token(message.get("sent_at"))
     message_id = int(message.get("id") or 0)
     raw_subject = str(message.get("subject") or "").strip()
     if raw_subject:
-        cleaned_subject = _sanitize_windows_filename(raw_subject)
+        cleaned_subject = sanitize_windows_filename(raw_subject)
     else:
         cleaned_subject = "message"
 
     candidate_name = f"{cleaned_subject}.{fmt}"
     prefix = f"{sent_date}_msg{message_id}_"
-    return _truncate_export_filename(prefix, candidate_name, destination_dir)
+    return truncate_export_filename(prefix, candidate_name, destination_dir)
 
 
 def _format_sender_string(message: Mapping[str, object]) -> str:
@@ -276,7 +275,18 @@ def _resolve_pst_store(
 ) -> tuple[Any | None, str | None]:
     """The mounted store for *pst_source*, or (None, why it is a failure rather
     than "not mounted"): stores that could not be read, or several mounted PSTs
-    sharing the recorded filename when the recorded path itself is gone."""
+    sharing the recorded filename when the recorded path itself is gone.
+
+    Kept separate from ``outlook_pst.OutlookComReader.resolve_store`` and
+    ``_optional_property`` (issue #64):
+    (a) Ingest's ``resolve_store`` matches only exact full paths and raises on
+        missing/ambiguous stores, whereas export must fall back to filename
+        matching for relocated PSTs and count unreadable stores.
+    (b) Ingest's ``_optional_property`` swallows all exceptions, whereas export
+        must treat a Message-ID read failure as "cannot confirm" (#53 ruling 3)
+        rather than "not found".
+    Merging them would also touch the upstream of rebuild (behaviour contract #6).
+    """
     expected_path = _normalized_windows_path(pst_source)
     expected_name = Path(pst_source).name.casefold()
     try:
@@ -671,11 +681,12 @@ def _load_default_outlook_reader() -> Any | None:
 
 def _write_original_file(
     destination_path: Path,
-    write_fn: Callable[[Path], None],
     base: OriginalExportResult,
     *,
     overwrite: bool,
     skip_existing: bool,
+    payload: bytes | None = None,
+    save_to_tmp: Callable[[Path], None] | None = None,
 ) -> OriginalExportResult:
     """Atomic write via sibling temp file, handling overwrite and skip-existing.
 
@@ -690,18 +701,16 @@ def _write_original_file(
     if destination_path.exists() and (skip_existing or not overwrite):
         return exists_result
 
-    tmp_path = destination_path.parent / f"{_EXPORT_TMP_PREFIX}{uuid.uuid4().hex}.tmp"
     try:
-        write_fn(tmp_path)
-        if overwrite:
-            tmp_path.replace(destination_path)
-        else:
-            tmp_path.rename(destination_path)
+        land_exported_file(
+            destination_path,
+            overwrite=overwrite,
+            payload=payload,
+            save_to_tmp=save_to_tmp,
+        )
     except FileExistsError:
-        tmp_path.unlink(missing_ok=True)
         return exists_result
     except Exception as exc:
-        tmp_path.unlink(missing_ok=True)
         return replace(base, detail=f"Writing original file failed: {exc}")
 
     return replace(base, status="exported", dest_path=destination_path)
@@ -760,10 +769,10 @@ def export_from_pst(
 
     return _write_original_file(
         destination_path,
-        write_item,
         base,
         overwrite=overwrite,
         skip_existing=skip_existing,
+        save_to_tmp=write_item,
     )
 
 
@@ -927,15 +936,12 @@ def export_from_imap(
             detail="Original message not found on IMAP server.",
         )
 
-    def write_rfc822(tmp_path: Path) -> None:
-        tmp_path.write_bytes(rfc822)
-
     return _write_original_file(
         destination_path,
-        write_rfc822,
         base,
         overwrite=overwrite,
         skip_existing=skip_existing,
+        payload=rfc822,
     )
 
 
