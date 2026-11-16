@@ -18,7 +18,11 @@ dependencies = [
     "urllib3>=2.0,<3",
     "beautifulsoup4>=4.12",
     "toons>=0.7.0",
-    "charset-normalizer>=3.4.7",
+    # Ceiling (#113): from 3.5.0 detection scores short Big5 text as shift_jis_2004
+    # with zero chaos, so a Big5 body mislabelled utf-8 comes back as half-width
+    # katakana instead of Chinese (tests/test_charset_decode.py::test_h_*). 3.4.x
+    # detects it as big5. Lift only after that test passes on the newer release.
+    "charset-normalizer>=3.4.7,<3.5",
     # Generation constraint, not a version pin: keeps resolution inside the 2.x generation
     # whose result-conversion shape and validation-error format this repo has measured.
     # Excludes 1.x (different lowlevel handler-registration surface and a different
