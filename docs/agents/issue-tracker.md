@@ -31,6 +31,15 @@ When set to `yes`, PRs run through the same labels and states as issues, using t
 
 GitHub shares one number space across issues and PRs, so a bare `#42` may be either — resolve with `gh pr view 42` and fall back to `gh issue view 42`.
 
+## Merging Dependabot PRs
+
+Dependabot PRs are **not** exempted from `.github/workflows/pr-contract.yml` and auto-merge is **not** configured; merging to `main` always requires Sean's authorization.
+
+Because Dependabot's generated PR body has no `## Squash message` section, the `PR Contract` check starts red. Before asking Sean to authorize the merge:
+
+1. Edit the PR body (`gh pr edit <number> --body ...`) to append `## Squash message` with the update rationale (and a `Closes #<n>` reference if closing a tracking issue, per `AGENTS.md > Pull request delivery contract`). Editing the PR body triggers the `edited` event and re-runs `PR Contract`.
+2. Wait for `PR Contract` and `hosted-full` to turn green, then present the PR and squash message to Sean to authorize the merge.
+
 ## When a skill says "publish to the issue tracker"
 
 Create a GitHub issue.
