@@ -982,24 +982,28 @@ def _is_rfc822_attachment_part(part: Any, *, outer_message: Any) -> bool:
 
 
 def _walk_own_parts_with_context(
-    message: Any, *, exclude_delivery_status: bool = False
+    message: Any, *, exclude_non_rfc822_message_containers: bool = False
 ) -> Iterator[tuple[Any, bool]]:
     """walk() that does not descend into an attached message/rfc822 subtree
-    (and optionally message/delivery-status subtrees), yielding (part, in_alternative).
+    (and optionally non-rfc822 message/* container subtrees), yielding
+    (part, in_alternative).
     """
     stack: list[tuple[Any, bool]] = [(message, False)]
     while stack:
         part, in_alt = stack.pop()
         yield part, in_alt
-        # Python's email parser treats message/delivery-status as multipart and
-        # exposes its payload (including raw undecoded base64 when CTE=base64)
-        # as synthetic text/plain subparts; exclude it from body text (#92).
+        # Python's email parser treats non-rfc822 message/* parts (e.g.
+        # message/delivery-status, message/disposition-notification,
+        # message/feedback-report) as multipart and exposes their payload
+        # (including raw undecoded base64 when CTE=base64) as synthetic
+        # text/plain subparts; exclude them from body text (#92, #96).
         if (
             not part.is_multipart()
             or _is_rfc822_attachment_part(part, outer_message=message)
             or (
-                exclude_delivery_status
-                and part.get_content_type() == "message/delivery-status"
+                exclude_non_rfc822_message_containers
+                and part.get_content_maintype() == "message"
+                and part.get_content_type() != "message/rfc822"
             )
         ):
             continue
@@ -1122,7 +1126,7 @@ def _extract_body_text(message: Any) -> str:
     has_data_table = False
 
     for part, in_alt in _walk_own_parts_with_context(
-        message, exclude_delivery_status=True
+        message, exclude_non_rfc822_message_containers=True
     ):
         if part.is_multipart():
             continue
