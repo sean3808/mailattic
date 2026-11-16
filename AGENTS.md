@@ -33,7 +33,7 @@ uv run --locked --exact pyright            # scans only mcp_server.py / mcp_deli
 
 Choosing a route, and the canonical deptry / pip-audit commands with their exit-code meanings → [`docs/agents/quality-gates.md`](docs/agents/quality-gates.md). **A non-zero gate is not a found defect by itself**: the gate may have failed to run. Read the output.
 
-The production DB `mailattic.db` (repo root, several GB) is the **default target** of every entry point. Prototypes, experiments, and one-off scripts always pass an explicit `--database` pointing at a scratch path. Backup snapshots live in `backups/`.
+The production DB `mailattic.db` (several GB) is the **default target** of every entry point. It is **not** in this repo's root: every entry point resolves it as `--database` > `MAILATTIC_DB` > the hard-coded absolute default (`DEFAULT_DB_NAME` in `storage.py`, `DEFAULT_DATABASE_PATH` in `imap_sync.py`), which points outside this repo. To find it, read `MAILATTIC_DB` and those two constants; never assume a path. Prototypes, experiments, and one-off scripts always pass an explicit `--database` pointing at a scratch path. Backup snapshots live in a `backups/` directory next to the DB file.
 
 ## Architecture map (`src/mailattic/`)
 
@@ -163,7 +163,7 @@ Global install, DB path resolution, the daily schedule, the scratch maildir, the
 
 - **Tagging never rebuilds**: `release.ps1` builds first, and only then does the guard let the tag through.
 - **The global `bes` is a build snapshot**: `uv run bes` in the repo runs the working tree, while other projects' subagents run the last released wheel; a cross-project change takes effect only after a release. The MCP server uses `uv run --project` and follows the working tree; restarting Claude Desktop picks it up.
-- **When query results look wrong, first confirm which DB was hit**: `--database` flag > `MAILATTIC_DB` > the hard-coded absolute default pointing at the repo root.
+- **When query results look wrong, first confirm which DB was hit**: `--database` flag > `MAILATTIC_DB` > the hard-coded absolute default in `storage.py` / `imap_sync.py` (outside this repo, not its root).
 
 ## Where to look first
 
