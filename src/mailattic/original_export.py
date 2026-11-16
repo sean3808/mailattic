@@ -34,6 +34,7 @@ from .outlook_pst import (
     _com_wall_clock_to_aware,
     _normalized_windows_path,
     _optional_property,
+    require_taipei_machine_timezone,
 )
 from .parser import _MAIL_POLICY
 from .query import (
@@ -235,6 +236,7 @@ def _verify_outlook_item(item: Any, message: Mapping[str, object]) -> bool:
             if accessor
             else None
         )
+    require_taipei_machine_timezone()
     return _matches_without_message_id(
         message,
         subject=getattr(item, "Subject", None),
