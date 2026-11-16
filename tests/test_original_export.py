@@ -2135,24 +2135,19 @@ def _assert_exported_item(result, selected: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("recorded_path", "same_name_parent", "selected"),
-    [
-        ("Root/Inbox", False, "recorded"),
-        ("Root/Inbox", True, "recorded"),
-    ],
-    ids=["root_prefix", "same_name_child"],
+    "same_name_parent", [False, True], ids=["root_prefix", "same_name_child"]
 )
 def test_pst_bulk_lookup_root_prefixed_folder_path_exports_recorded_copy(
-    tmp_path: Path, recorded_path: str, same_name_parent: bool, selected: str
+    tmp_path: Path, same_name_parent: bool
 ) -> None:
     result = _pst_bulk_lookup(
         tmp_path,
-        recorded_path=recorded_path,
+        recorded_path="Root/Inbox",
         same_name_parent=same_name_parent,
         recorded_items=[FakeOutlookItem("recorded", "Target", "<target@example.com>")],
         other_items=[FakeOutlookItem("other", "Target", "<target@example.com>")],
     )
-    _assert_exported_item(result, selected)
+    _assert_exported_item(result, "recorded")
 
 
 def test_pst_bulk_lookup_moved_message_exports_the_other_folder_copy(
