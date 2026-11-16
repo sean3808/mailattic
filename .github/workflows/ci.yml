@@ -133,3 +133,67 @@ jobs:
 
       - name: Run the canonical full test gate
         run: pwsh -NoProfile -File scripts/invoke-pytest.ps1 -Route Full
+
+  measure-test-metrics:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      COVERAGE_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      - name: Sync the locked environment
+        run: uv sync --locked
+
+      - name: Run full test suite with per-test coverage contexts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . (Join-Path 'scripts' 'project-tool-environment.ps1')
+          $runtimeRoot = Get-ProjectRuntimeRoot -RepositoryRoot (Get-Location).Path
+          $staging = Join-Path (Join-Path $runtimeRoot 'coverage') $env:COVERAGE_RUN_ID
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          $descriptor = [ordered]@{
+              runId          = $env:COVERAGE_RUN_ID
+              ownerProcessId = $PID
+              leaseNamespace = $env:COVERAGE_RUN_ID
+          } | ConvertTo-Json -Compress
+          Set-Content -LiteralPath (Join-Path $staging 'run-descriptor.json') -Value $descriptor -Encoding utf8NoBOM
+          "COVERAGE_STAGING_DIR=$staging" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & pwsh -NoProfile -File scripts/invoke-pytest.ps1 -Route FullCoverage -CoverageRunId $env:COVERAGE_RUN_ID
+          $testExit = $LASTEXITCODE
+          # This job measures; hosted-full is the gate. Exit 1 means the suite
+          # ran and some tests failed (wall-clock tests can exceed their budget
+          # under per-test coverage tracing), so the reports are still produced
+          # and the failure is surfaced as a warning; the analysis step fails
+          # the job if more than 1% of tests failed. Any other non-zero exit
+          # means the suite did not run as measured, and the job fails.
+          if ($testExit -eq 1) {
+              Write-Host "::warning title=tests failed under measurement::invoke-pytest -Route FullCoverage exited 1; failed tests are listed with outcome 'failure' in durations.json all_tests."
+          } elseif ($testExit -ne 0) {
+              exit $testExit
+          }
+          # GitHub's pwsh wrapper exits with the last native $LASTEXITCODE, so
+          # the tolerated exit 1 must be cleared explicitly.
+          exit 0
+
+      - name: Analyze test durations and coverage contexts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          uv run --locked --exact python scripts/analyze_test_metrics.py `
+              --junit-xml (Join-Path $env:COVERAGE_STAGING_DIR 'junit.xml') `
+              --coverage-db (Join-Path $env:COVERAGE_STAGING_DIR '.coverage') `
+              --output-dir (Join-Path $env:COVERAGE_STAGING_DIR 'reports') `
+              --repo-root .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload test measurement reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-measurement-reports
+          path: ${{ env.COVERAGE_STAGING_DIR }}/reports/
+          if-no-files-found: error

@@ -375,7 +375,7 @@ function Write-ReleaseStage {
         [string]$Message
     )
 
-    Write-Host ("[release] {0}/8 {1}" -f $Number, $Message)
+    Write-Host ("[release] {0}/9 {1}" -f $Number, $Message)
 }
 
 function Invoke-ReleaseTests {
@@ -484,6 +484,29 @@ function Invoke-AtomicReleasePush {
     ) | Out-Null
 }
 
+function New-GitHubRelease {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepoRoot,
+        [Parameter(Mandatory)]
+        [string]$Tag
+    )
+
+    Push-Location -LiteralPath $RepoRoot
+    try {
+        $global:LASTEXITCODE = 0
+        $output = @(& gh release create $Tag --verify-tag --generate-notes 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+
+    if ($exitCode -ne 0) {
+        $detail = ($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+        throw "gh release create $Tag --verify-tag --generate-notes failed with exit code $exitCode. $detail"
+    }
+}
+
 function Invoke-BesRelease {
     param(
         [Parameter(Mandatory)]
@@ -576,6 +599,17 @@ function Invoke-BesRelease {
         throw (
             "Local deployment, evidence, and tag succeeded, but the remote release did not complete. " +
             "Retry with: $retry. Cause: $($_.Exception.Message)"
+        )
+    }
+
+    Write-ReleaseStage -Number 9 -Message 'Create GitHub Release'
+    try {
+        New-GitHubRelease -RepoRoot $resolvedRoot -Tag $Tag
+    } catch {
+        $retry = "gh release create $Tag --verify-tag --generate-notes"
+        throw (
+            "Local deployment, evidence, tag, and remote push succeeded, but GitHub Release creation failed. " +
+            "The tag was NOT rolled back. Retry with: $retry. Cause: $($_.Exception.Message)"
         )
     }
 

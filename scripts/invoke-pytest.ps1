@@ -705,6 +705,7 @@ if ($Route -eq 'FullCoverage') {
     $pytestArguments += @(
         '--cov=src'
         '--cov-branch'
+        '--cov-context=test'
         '--cov-report=term-missing'
         "--cov-report=xml:$(Join-Path $coverageStagingDirectory 'coverage.xml')"
         "--junitxml=$(Join-Path $coverageStagingDirectory 'junit.xml')"

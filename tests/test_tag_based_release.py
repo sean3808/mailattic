@@ -401,7 +401,10 @@ def _make_release_repo(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _release_test_overrides(
-    installed_path: Path, *, override_tests: bool = True
+    installed_path: Path,
+    *,
+    override_tests: bool = True,
+    override_github_release: bool = True,
 ) -> str:
     tests_override = (
         """
@@ -413,8 +416,19 @@ function Invoke-ReleaseTests {
         if override_tests
         else ""
     )
+    github_release_override = (
+        """
+function New-GitHubRelease {
+    param([string]$RepoRoot, [string]$Tag)
+    Write-Host 'OVERRIDE_GITHUB_RELEASE'
+}
+"""
+        if override_github_release
+        else ""
+    )
     return f"""
 {tests_override}
+{github_release_override}
 function Invoke-GlobalReinstall {{
     param([string]$RepoRoot)
     Write-Host 'OVERRIDE_REINSTALL'
@@ -441,15 +455,21 @@ def _run_release_driver(
     tag: str = "bes-v2026.07.18.1",
     extra_script: str = "",
     override_tests: bool = True,
+    override_github_release: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     driver = tmp_path / "release-driver.ps1"
     installed = repo / "src" / "mailattic"
+    overrides = _release_test_overrides(
+        installed,
+        override_tests=override_tests,
+        override_github_release=override_github_release,
+    )
     driver.write_text(
         f"""
 $ErrorActionPreference = 'Stop'
 $env:MAILATTIC_SKILL_SSOT = {ps_quote(tmp_path / "ssot")}
 . {ps_quote(repo / "scripts" / "release.ps1")}
-{_release_test_overrides(installed, override_tests=override_tests)}
+{overrides}
 {extra_script}
 try {{
     Invoke-BesRelease -RepoRoot {ps_quote(repo)} -Tag {ps_quote(tag)} -Remote 'origin'
@@ -461,6 +481,17 @@ try {{
         encoding="utf-8",
     )
     return run_pwsh_file(driver, check=False, env=git_env_without_auto_maintenance())
+
+
+def _assert_tag_pushed(repo: Path, remote: Path, tag: str) -> str:
+    """Assert annotated tag exists locally and points to the same commit on remote."""
+    assert _git(repo, "cat-file", "-t", f"refs/tags/{tag}").stdout.strip() == "tag"
+    local_commit = _git(repo, "rev-parse", f"{tag}^{{commit}}").stdout.strip()
+    remote_commit = _git(
+        repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}^{{}}"
+    ).stdout.split()[0]
+    assert remote_commit == local_commit
+    return local_commit
 
 
 @pytest.mark.release
@@ -482,18 +513,14 @@ def test_release_orchestration_orders_stages_and_pushes_annotated_tag(
         "Write local release evidence",
         "Create annotated release tag",
         "Atomically push main and release tag",
+        "Create GitHub Release",
     ]
     positions = [result.stdout.index(marker) for marker in stage_markers]
     assert positions == sorted(positions)
     assert (tmp_path / "ssot/SKILL.md").read_text(
         encoding="utf-8"
     ) == "released skill\n"
-    assert _git(repo, "cat-file", "-t", f"refs/tags/{tag}").stdout.strip() == "tag"
-    local_commit = _git(repo, "rev-parse", f"{tag}^{{commit}}").stdout.strip()
-    remote_commit = _git(
-        repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}^{{}}"
-    ).stdout.split()[0]
-    assert remote_commit == local_commit
+    local_commit = _assert_tag_pushed(repo, remote, tag)
     assert (
         json.loads(
             (repo / ".git" / "bes-release-state.json").read_text(encoding="utf-8")
@@ -660,6 +687,97 @@ function Invoke-AtomicReleasePush {
         _git(repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}").stdout.strip()
         == ""
     )
+
+
+def test_release_creates_github_release_after_atomic_push(tmp_path: Path):
+    repo, remote = _make_release_repo(tmp_path)
+    tag = "bes-v2026.07.18.1"
+    gh_log = tmp_path / "gh-args.txt"
+    remote_tag_seen = tmp_path / "remote-tag-seen.txt"
+    gh_stub = f"""
+function gh {{
+    $remoteTag = (
+        & git ls-remote {ps_quote(remote.as_posix())} "refs/tags/{tag}"
+    ).Trim()
+    [IO.File]::WriteAllText({ps_quote(remote_tag_seen)}, $remoteTag)
+    [IO.File]::WriteAllText({ps_quote(gh_log)}, ($args -join ' '))
+    $global:LASTEXITCODE = 0
+}}
+"""
+
+    result = _run_release_driver(
+        tmp_path,
+        repo,
+        tag=tag,
+        extra_script=gh_stub,
+        override_github_release=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        gh_log.read_text(encoding="utf-8").strip()
+        == f"release create {tag} --verify-tag --generate-notes"
+    )
+    assert remote_tag_seen.read_text(encoding="utf-8").strip() != ""
+    push_idx = result.stdout.index("Atomically push main and release tag")
+    release_idx = result.stdout.index("Create GitHub Release")
+    assert push_idx < release_idx
+
+
+def test_github_release_failure_retains_local_and_remote_tag_with_retry(
+    tmp_path: Path,
+):
+    repo, remote = _make_release_repo(tmp_path)
+    tag = "bes-v2026.07.18.1"
+    gh_failure = """
+function gh {
+    Write-Output 'simulated gh release failure'
+    $global:LASTEXITCODE = 1
+}
+"""
+
+    result = _run_release_driver(
+        tmp_path,
+        repo,
+        tag=tag,
+        extra_script=gh_failure,
+        override_github_release=False,
+    )
+
+    assert result.returncode != 0
+    normalized_stderr = " ".join(result.stderr.split())
+    assert "github release creation failed" in normalized_stderr.lower()
+    assert f"gh release create {tag} --verify-tag --generate-notes" in normalized_stderr
+    _assert_tag_pushed(repo, remote, tag)
+    assert (repo / ".git" / "bes-release-state.json").is_file()
+
+
+def test_push_failure_skips_github_release_creation(tmp_path: Path):
+    repo, _ = _make_release_repo(tmp_path)
+    tag = "bes-v2026.07.18.1"
+    gh_log = tmp_path / "gh-args.txt"
+    push_failure_with_gh_spy = f"""
+function Invoke-AtomicReleasePush {{
+    param([string]$RepoRoot, [string]$Tag, [string]$Remote)
+    throw 'simulated atomic push failure'
+}}
+function gh {{
+    [IO.File]::WriteAllText({ps_quote(gh_log)}, ($args -join ' '))
+    $global:LASTEXITCODE = 0
+}}
+"""
+
+    result = _run_release_driver(
+        tmp_path,
+        repo,
+        tag=tag,
+        extra_script=push_failure_with_gh_spy,
+        override_github_release=False,
+    )
+
+    assert result.returncode != 0
+    assert not gh_log.exists()
+    assert "Create GitHub Release" not in result.stdout
 
 
 @pytest.mark.release

@@ -1445,12 +1445,12 @@ def test_full_coverage_run_id_resolving_into_another_runs_directory_is_refused(
     assert "escapes the artifact root" in result.stderr
 
 
-def test_full_coverage_pytest_vector_equals_full_plus_exactly_five_coverage_options(
+def test_full_coverage_pytest_vector_equals_full_plus_exactly_six_coverage_options(
     tmp_path: Path, stub_uv_dir: Path
 ):
     """Argument-assembly only -- this does not exercise a full pytest run.
 
-    The first three elements of the coverage tail are literal and independent
+    The first four elements of the coverage tail are literal and independent
     of path resolution, so they are compared by exact string equality, same
     as every other route-vector test in this file. The XML/junit report
     paths are built from the launcher's own Win32-resolved real path (which
@@ -1485,10 +1485,11 @@ def test_full_coverage_pytest_vector_equals_full_plus_exactly_five_coverage_opti
     assert args[: len(expected_prefix)] == expected_prefix, args
 
     tail = args[len(expected_prefix) :]
-    assert len(tail) == 6, tail
+    assert len(tail) == 7, tail
     assert tail[0] == "--cov=src"
     assert tail[1] == "--cov-branch"
-    assert tail[2] == "--cov-report=term-missing"
+    assert tail[2] == "--cov-context=test"
+    assert tail[3] == "--cov-report=term-missing"
 
     def _resolved_path_from_flag(flag_value: str, flag_prefix: str) -> Path:
         # The launcher builds these paths from its own Win32-resolved real
@@ -1501,20 +1502,20 @@ def test_full_coverage_pytest_vector_equals_full_plus_exactly_five_coverage_opti
         return Path(path_text).resolve()
 
     xml_flag_prefix = "--cov-report=xml:"
-    assert tail[3].startswith(xml_flag_prefix), tail[3]
+    assert tail[4].startswith(xml_flag_prefix), tail[4]
     assert (
-        _resolved_path_from_flag(tail[3], xml_flag_prefix)
+        _resolved_path_from_flag(tail[4], xml_flag_prefix)
         == (staging / "coverage.xml").resolve()
     )
 
     junit_flag_prefix = "--junitxml="
-    assert tail[4].startswith(junit_flag_prefix), tail[4]
+    assert tail[5].startswith(junit_flag_prefix), tail[5]
     assert (
-        _resolved_path_from_flag(tail[4], junit_flag_prefix)
+        _resolved_path_from_flag(tail[5], junit_flag_prefix)
         == (staging / "junit.xml").resolve()
     )
 
-    assert tail[5] == f"--basetemp={runtime_root / 'pytest'}"
+    assert tail[6] == f"--basetemp={runtime_root / 'pytest'}"
 
 
 # ---------------------------------------------------------------------------

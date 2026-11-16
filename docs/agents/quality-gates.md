@@ -114,8 +114,10 @@ pwsh -NoProfile -File scripts\invoke-pytest.ps1 -Route FullSequential
 
 Emits the `full` vector byte-for-byte and appends only coverage
 instrumentation and reporting. Do not invoke it by hand: it requires a staging
-directory and run descriptor that `scripts\report-diff-coverage.ps1` creates.
-Use that script instead — see [Diff coverage evidence](#diff-coverage-evidence).
+directory and run descriptor that `scripts\report-diff-coverage.ps1` (for
+diff coverage) or the `measure-test-metrics` job in `.github/workflows/ci.yml`
+(for scheduled/manual CI measurement) creates. Use `scripts\report-diff-coverage.ps1`
+locally — see [Diff coverage evidence](#diff-coverage-evidence).
 
 It takes a run **ID**, never a path. The launcher resolves the coverage
 artifact root itself and derives `<runtime root>/coverage/<run id>` beneath it.
@@ -157,7 +159,7 @@ contract — it would invalidate the numbers.
 An agent uses targeted for current-task regression, quick for ordinary
 implementation feedback, full for medium/high closeout, full-sequential
 for fallback and equivalence proof, and full-coverage only through
-`scripts\report-diff-coverage.ps1`. `quick` is not release evidence, and no
+`scripts\report-diff-coverage.ps1` (or the `measure-test-metrics` CI job). `quick` is not release evidence, and no
 route reproduces a raw canonical pytest command by hand outside the
 launcher. Release invokes the same launcher with `-Route Full`; there is no
 hidden sixth pytest variant. A new worker count requires a new immutable
@@ -580,8 +582,9 @@ module fails here rather than during a release.
 The `hosted-full` job is merge evidence. It runs on every non-draft pull request
 and push to main, as well as the weekly schedule (`23 18 * * 0`, Monday 02:23
 Asia/Taipei) and manual dispatch, and calls the canonical launcher with
-`-Route Full`. A scheduled run executes only `hosted-full`; a manual dispatch
-runs all three jobs for the selected ref. To check a draft before marking it
+`-Route Full`. A scheduled run executes `hosted-full` and the measurement job
+`measure-test-metrics` (see "Test duration and coverage measurement" below); a
+manual dispatch runs all four jobs for the selected ref. To check a draft before marking it
 ready, manually dispatch its head ref. Local Full remains a development check
 and fallback; release evidence still uses local Full.
 
@@ -609,3 +612,72 @@ Neither green signal means anything more than stated above, and in particular:
   [`docs/global-install-and-release.md`](../global-install-and-release.md).
 
 The `hosted-full` status check is required on main for merge (#70).
+
+## Test duration and coverage measurement
+
+The `measure-test-metrics` job in `.github/workflows/ci.yml` runs only on the
+weekly schedule (`schedule`) and manual dispatch (`workflow_dispatch`). It is
+measurement-only and never acts as a PR merge gate. Per-test coverage tracing
+slows the suite, so wall-clock tests (for example the conversion-speed checks in
+`tests/test_html_table_cells.py`) can fail here while passing in `hosted-full`.
+A launcher exit of 1 (tests ran, some failed) therefore becomes a run warning
+and the reports are still produced; the failed tests are listed in
+`durations.json` `failed_tests`. More than 1% failed or errored tests fails the
+analysis step, because the coverage map would be too incomplete to guide test
+selection. Any other non-zero launcher exit fails the job.
+
+It invokes `scripts\invoke-pytest.ps1 -Route FullCoverage -CoverageRunId <id>`
+(which records `--cov-context=test` in `.coverage` alongside `junit.xml`) and
+then runs `scripts/analyze_test_metrics.py` to produce the artifact
+`test-measurement-reports`:
+
+- `durations.json`: `top_tests` (`nodeid`, `test_file`, `duration_seconds`,
+  `outcome`), `top_test_files` (`test_file`, `duration_seconds`, `test_count`),
+  `top_source_modules` (`source_file`, `total_touching_duration_seconds`,
+  `proportional_duration_seconds`, `touching_test_count`,
+  `touching_test_file_count`), plus the full lists `all_tests` (every test,
+  same fields as `top_tests`), `all_test_files` and `all_source_modules`.
+- `source-to-tests.json`: `source_to_test_files` mapping each `src/` file to
+  the sorted list of covering test files, plus `source_file_count`,
+  `covered_source_file_count`, `mapped_test_file_count`,
+  `unreferenced_source_files`, and `source_files_with_uncontexted_lines`.
+  **Known gap**: lines that run at import or collection time carry no test
+  context, so a test that depends on a module only by importing it is missing
+  from that module's list. When selecting affected tests from this map, treat a
+  change to a file listed in `source_files_with_uncontexted_lines` that touches
+  module-level code (imports, constants, decorators, class bodies) as affecting
+  every test, not only the mapped ones.
+- `audit-candidates.json`: `test_file_candidates` (test files whose covered
+  `src/` line set is a non-empty subset of another test file's),
+  `single_test_candidates` (single-test subset precision), and
+  `zero_src_coverage_test_files` (excluded from subset candidacy).
+- `summary.md`: human-readable Markdown summary of all three reports.
+
+`durations.json` also carries `coverage_nodeids_missing_from_junit`: coverage
+test contexts whose nodeid the analyzer could not find among the JUnit tests.
+More than 1% unjoined fails the job, because per-module durations would
+otherwise shrink silently.
+
+Limits to keep in mind when reading the reports:
+
+- **Wider-scope fixtures are attributed to one test.** A session- or
+  module-scoped fixture's `src/` lines run under the first test that triggers it
+  on that xdist worker, so later tests sharing it look independent of that code,
+  and the attribution can shift between runs.
+- **A subset candidate is not a deletion candidate.** Coverage compares executed
+  lines only, not inputs, assertions or the promise a test guards; tests with
+  identical coverage list each other. Each removal still needs its own ticket.
+- **Per-test contexts need the CTracer core.** With coverage 7.15 on Python
+  3.13 the default core is CTracer. On Python 3.14+ coverage defaults to the
+  `sysmon` core, which drops dynamic contexts (coverage warning
+  `no-sysmon-context`); pin `core = "ctrace"` before upgrading the Python
+  version this job runs on.
+
+Download the artifact from a completed run with:
+
+```powershell
+gh run download <run-id> -n test-measurement-reports -D .project-runtime/ci-metrics
+```
+
+Run this measurement locally only when CI is unavailable, to avoid loading the
+development workstation with a full instrumented suite run.
