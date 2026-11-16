@@ -708,8 +708,10 @@ def _write_original_file(
             payload=payload,
             save_to_tmp=save_to_tmp,
         )
-    except FileExistsError:
-        return exists_result
+    except FileExistsError as exc:
+        if destination_path.exists():
+            return exists_result
+        return replace(base, detail=f"Writing original file failed: {exc}")
     except Exception as exc:
         return replace(base, detail=f"Writing original file failed: {exc}")
 
