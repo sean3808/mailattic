@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import sqlite3
+from contextlib import closing
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -68,7 +69,7 @@ def _import_eml_bytes(tmp_path: Path, raw: bytes) -> str:
         attachment_root=tmp_path / "attachments",
     )
     assert summary.imported_messages == 1
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn:
         return conn.execute("SELECT body_text FROM messages").fetchone()[0]
 
 
