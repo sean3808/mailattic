@@ -587,6 +587,16 @@ class _PstItemSearch:
                 found.append(item)
         return found
 
+    def _resolve_candidates(
+        self, hits: list[str | None], unlisted: list[str]
+    ) -> list[Any] | None:
+        """Confirm table hits, then inspect unlisted-ID rows for extra copies."""
+        found = self.confirm_table_hits(hits)
+        if found is None:
+            return None
+        found += self.open_entries_without_table_id(unlisted, len(found))
+        return found
+
     def search_recorded_folder(
         self, root_folder: Any, folder_path: str, expected: str
     ) -> tuple[Any | None, tuple[Any | None, str | None] | None]:
@@ -617,12 +627,9 @@ class _PstItemSearch:
         # whole-store pass below does not open them a second time.
         folder_unlisted = self._tally.take_unlisted_id_entries()
 
-        folder_found = self.confirm_table_hits(folder_hits)
+        folder_found = self._resolve_candidates(folder_hits, folder_unlisted)
         if folder_found is None:
             return target_folder, _PST_UNCONFIRMED
-        folder_found += self.open_entries_without_table_id(
-            folder_unlisted, len(folder_found)
-        )
         if folder_found:
             if table_incomplete:
                 return target_folder, (
@@ -687,12 +694,11 @@ class _PstItemSearch:
             root_folder, expected, candidates, skip_folder, skip_entry_id
         )
 
-        found = self.confirm_table_hits(candidates)
+        found = self._resolve_candidates(
+            candidates, self._tally.take_unlisted_id_entries()
+        )
         if found is None:
             return _PST_UNCONFIRMED
-        found += self.open_entries_without_table_id(
-            self._tally.take_unlisted_id_entries(), len(found)
-        )
         if found:
             return _single_match(found, _PST_AMBIGUOUS)
         return _nothing_found(self._tally.unreadable)
