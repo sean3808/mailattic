@@ -1568,7 +1568,6 @@ def search_attachments(
         "    m.message_id AS rfc_message_id,",
         "    m.dedup_key,",
         "    m.sent_at,",
-        "    COALESCE(unixepoch(m.sent_at), -62135596800) AS sent_at_epoch,",
         "    m.sender_email,",
         "    m.subject,",
         "    ma.attachment_name,",
@@ -1636,15 +1635,15 @@ def search_attachments(
 
     results = []
     for row in rows:
-        sent_at, sent_at_epoch = format_sent_at_and_epoch(row["sent_at"])
+        summary = _message_summary_from_attachment_row(row)
         results.append(
             {
                 "attachment_id": row["attachment_id"],
                 "message_db_id": row["message_db_id"],
                 "rfc_message_id": row["rfc_message_id"],
                 "dedup_key": row["dedup_key"],
-                "sent_at": sent_at,
-                "sent_at_epoch": sent_at_epoch,
+                "sent_at": summary["sent_at"],
+                "sent_at_epoch": summary["sent_at_epoch"],
                 "sender_email": row["sender_email"],
                 "subject": row["subject"],
                 "attachment_name": row["attachment_name"],
@@ -1654,7 +1653,7 @@ def search_attachments(
                 "storage_path": row["storage_path"],
                 "folder_path": row["folder_path"],
                 "exportable": row["storage_path"] is not None,
-                "carrying_messages": [_message_summary_from_attachment_row(row)],
+                "carrying_messages": [summary],
             }
         )
 
