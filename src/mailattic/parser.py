@@ -363,6 +363,16 @@ class ParserUnavailableError(RuntimeError):
 
 
 class ReadpstParser:
+    """Extract a PST with `readpst` and parse the resulting `.eml`/mbox files.
+
+    Exit status 0 from `readpst` does not mean the extraction is complete: a
+    run can drop whole folders and still exit 0 (#56), and this class trusts
+    the exit status only. A caller that needs completeness has to check it
+    itself against an independent count -- `scripts/body_rederive_stage.py`
+    does this with its `lspst` ledger. Not an import path: production import
+    goes through Outlook (see `ingest._import_pst_sources_with_readpst`).
+    """
+
     def __init__(
         self,
         *,

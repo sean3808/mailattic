@@ -462,6 +462,13 @@ def scan_pst_coverage_until(
     pst_paths: Sequence[str | Path],
     readpst_path: str | Path | None = None,
 ) -> date | None:
+    """Return the latest sent/received date found in *pst_paths*.
+
+    Uses `readpst`, whose exit status 0 does not guarantee every folder was
+    extracted (#56). A dropped folder can only make the returned date earlier
+    than the truth; this function writes nothing, so the result is a hint, not
+    a coverage guarantee.
+    """
     sources = resolve_ingestion_sources(file_inputs=pst_paths)
     coverage_scan_root = Path(work_dir).expanduser().resolve() / ".coverage-scan"
     coverage_scan_root.mkdir(parents=True, exist_ok=True)

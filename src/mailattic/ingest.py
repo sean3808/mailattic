@@ -134,6 +134,10 @@ def _import_pst_sources_with_readpst(
     3. It exists for one situation only: a PST in hand and Outlook
        unavailable. Treat its output as a stopgap and re-run the Outlook
        extraction once Outlook is usable again.
+    4. **A clean exit is not a complete extraction.** `readpst` can drop whole
+       folders and still exit 0 (#56), and nothing on this path checks the
+       result against an independent count, so missing mail here is silent.
+       Compare against `lspst` yourself before trusting the import.
 
     For a mail source that is not a PST, `import_maildir_sources` needs
     neither Outlook nor readpst and does not carry this defect.
