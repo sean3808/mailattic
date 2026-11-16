@@ -483,6 +483,17 @@ try {{
     return run_pwsh_file(driver, check=False, env=git_env_without_auto_maintenance())
 
 
+def _assert_tag_pushed(repo: Path, remote: Path, tag: str) -> str:
+    """Assert annotated tag exists locally and points to the same commit on remote."""
+    assert _git(repo, "cat-file", "-t", f"refs/tags/{tag}").stdout.strip() == "tag"
+    local_commit = _git(repo, "rev-parse", f"{tag}^{{commit}}").stdout.strip()
+    remote_commit = _git(
+        repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}^{{}}"
+    ).stdout.split()[0]
+    assert remote_commit == local_commit
+    return local_commit
+
+
 @pytest.mark.release
 def test_release_orchestration_orders_stages_and_pushes_annotated_tag(
     tmp_path: Path,
@@ -509,12 +520,7 @@ def test_release_orchestration_orders_stages_and_pushes_annotated_tag(
     assert (tmp_path / "ssot/SKILL.md").read_text(
         encoding="utf-8"
     ) == "released skill\n"
-    assert _git(repo, "cat-file", "-t", f"refs/tags/{tag}").stdout.strip() == "tag"
-    local_commit = _git(repo, "rev-parse", f"{tag}^{{commit}}").stdout.strip()
-    remote_commit = _git(
-        repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}^{{}}"
-    ).stdout.split()[0]
-    assert remote_commit == local_commit
+    local_commit = _assert_tag_pushed(repo, remote, tag)
     assert (
         json.loads(
             (repo / ".git" / "bes-release-state.json").read_text(encoding="utf-8")
@@ -742,12 +748,7 @@ function gh {
     normalized_stderr = " ".join(result.stderr.split())
     assert "github release creation failed" in normalized_stderr.lower()
     assert f"gh release create {tag} --verify-tag --generate-notes" in normalized_stderr
-    assert _git(repo, "cat-file", "-t", f"refs/tags/{tag}").stdout.strip() == "tag"
-    local_commit = _git(repo, "rev-parse", f"{tag}^{{commit}}").stdout.strip()
-    remote_commit = _git(
-        repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}^{{}}"
-    ).stdout.split()[0]
-    assert remote_commit == local_commit
+    _assert_tag_pushed(repo, remote, tag)
     assert (repo / ".git" / "bes-release-state.json").is_file()
 
 
