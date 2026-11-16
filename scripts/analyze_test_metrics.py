@@ -80,8 +80,6 @@ def _normalize_repo_path(raw_path: str, repo_root: Path) -> str:
         return posix[len(root_posix) + 1 :]
     if "/src/" in posix:
         return "src/" + posix.split("/src/", 1)[1]
-    if posix.startswith("src/"):
-        return posix
     return posix
 
 
@@ -114,6 +112,8 @@ def parse_junit_xml(junit_path: Path, repo_root: Path) -> list[TestCaseTiming]:
     tree = ET.parse(junit_path)
     root = tree.getroot()
     cases: list[TestCaseTiming] = []
+    # Classnames repeat across every test in a class; each lookup stats files.
+    resolved_classnames: dict[str, tuple[str, list[str]]] = {}
 
     for elem in root.iter("testcase"):
         classname = elem.attrib.get("classname", "")
@@ -129,7 +129,11 @@ def parse_junit_xml(junit_path: Path, repo_root: Path) -> list[TestCaseTiming]:
         else:
             outcome = "passed"
 
-        test_file, class_parts = _classname_to_file_and_class(classname, repo_root)
+        if classname not in resolved_classnames:
+            resolved_classnames[classname] = _classname_to_file_and_class(
+                classname, repo_root
+            )
+        test_file, class_parts = resolved_classnames[classname]
         nodeid_parts = (
             [test_file, *class_parts, name] if name else [test_file, *class_parts]
         )
@@ -190,9 +194,6 @@ def load_coverage_contexts(coverage_db: Path, repo_root: Path) -> CoverageContex
         if not norm_file.startswith("src/"):
             continue
         all_src_files.add(norm_file)
-        _ = src_to_test_files[
-            norm_file
-        ]  # Ensure key exists even if only import-time touched.
 
         contexts_by_line = cov_data.contexts_by_lineno(raw_file)
         for _lineno, contexts in sorted(contexts_by_line.items()):
@@ -454,15 +455,16 @@ def build_reports(
             f"{mod['touching_test_count']} | `{mod['source_file']}` |"
         )
 
-    covered_src_count = len(cov_ctx.all_src_files) - len(unreferenced_sources)
     md_lines.extend(
         [
             "",
             "## Source-to-Test Mapping",
             "",
-            f"- Source files measured: {len(cov_ctx.all_src_files)}",
-            f"- Source files covered by >= 1 test: {covered_src_count}",
-            f"- Distinct test files referenced: {len(all_mapped_test_files)}",
+            f"- Source files measured: {mapping_report['source_file_count']}",
+            "- Source files covered by >= 1 test: "
+            f"{mapping_report['covered_source_file_count']}",
+            "- Distinct test files referenced: "
+            f"{mapping_report['mapped_test_file_count']}",
             "",
             "## Audit Candidates (Subset Coverage)",
             "",
@@ -516,15 +518,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "durations.json").write_text(
-        json.dumps(durations_report, indent=2) + "\n", encoding="utf-8"
-    )
-    (args.output_dir / "source-to-tests.json").write_text(
-        json.dumps(mapping_report, indent=2) + "\n", encoding="utf-8"
-    )
-    (args.output_dir / "audit-candidates.json").write_text(
-        json.dumps(audit_report, indent=2) + "\n", encoding="utf-8"
-    )
+    for name, payload in (
+        ("durations.json", durations_report),
+        ("source-to-tests.json", mapping_report),
+        ("audit-candidates.json", audit_report),
+    ):
+        (args.output_dir / name).write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
     (args.output_dir / "summary.md").write_text(summary_md, encoding="utf-8")
     return 0
 
