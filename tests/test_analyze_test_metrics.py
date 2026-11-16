@@ -164,6 +164,12 @@ def test_analyze_produces_all_three_reports_and_summary(tmp_path: Path) -> None:
     ] == pytest.approx(3.5)
 
     mapping = json.loads((out_dir / "source-to-tests.json").read_text(encoding="utf-8"))
+    # Both files ran lines under the empty (import-time) context above; the map
+    # cannot attribute those to a test, so the report names them.
+    assert mapping["source_files_with_uncontexted_lines"] == [
+        "src/mailattic/alpha.py",
+        "src/mailattic/beta.py",
+    ]
     assert mapping["source_to_test_files"]["src/mailattic/alpha.py"] == [
         "tests/test_alpha.py",
         "tests/test_subset.py",

@@ -582,8 +582,9 @@ module fails here rather than during a release.
 The `hosted-full` job is merge evidence. It runs on every non-draft pull request
 and push to main, as well as the weekly schedule (`23 18 * * 0`, Monday 02:23
 Asia/Taipei) and manual dispatch, and calls the canonical launcher with
-`-Route Full`. A scheduled run executes only `hosted-full`; a manual dispatch
-runs all three jobs for the selected ref. To check a draft before marking it
+`-Route Full`. A scheduled run executes `hosted-full` and the measurement job
+`measure-test-metrics` (see "Test duration and coverage measurement" below); a
+manual dispatch runs all four jobs for the selected ref. To check a draft before marking it
 ready, manually dispatch its head ref. Local Full remains a development check
 and fallback; release evidence still uses local Full.
 
@@ -631,8 +632,14 @@ then runs `scripts/analyze_test_metrics.py` to produce the artifact
   same fields as `top_tests`), `all_test_files` and `all_source_modules`.
 - `source-to-tests.json`: `source_to_test_files` mapping each `src/` file to
   the sorted list of covering test files, plus `source_file_count`,
-  `covered_source_file_count`, `mapped_test_file_count`, and
-  `unreferenced_source_files`.
+  `covered_source_file_count`, `mapped_test_file_count`,
+  `unreferenced_source_files`, and `source_files_with_uncontexted_lines`.
+  **Known gap**: lines that run at import or collection time carry no test
+  context, so a test that depends on a module only by importing it is missing
+  from that module's list. When selecting affected tests from this map, treat a
+  change to a file listed in `source_files_with_uncontexted_lines` that touches
+  module-level code (imports, constants, decorators, class bodies) as affecting
+  every test, not only the mapped ones.
 - `audit-candidates.json`: `test_file_candidates` (test files whose covered
   `src/` line set is a non-empty subset of another test file's),
   `single_test_candidates` (single-test subset precision), and

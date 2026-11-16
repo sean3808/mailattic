@@ -45,6 +45,10 @@ class CoverageContextData:
     nodeid_masks: dict[str, int]
     nodeid_to_src_files: dict[str, set[str]]
     all_src_files: list[str]
+    # src/ files with lines that ran outside any test context (import time,
+    # collection). A test that depends on them only through import is NOT in
+    # src_to_test_files, so the map under-selects for changes to these files.
+    src_files_with_uncontexted_lines: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -186,6 +190,7 @@ def load_coverage_contexts(coverage_db: Path, repo_root: Path) -> CoverageContex
     nodeid_masks: dict[str, int] = defaultdict(int)
     nodeid_to_src_files: dict[str, set[str]] = defaultdict(set)
     all_src_files: set[str] = set()
+    uncontexted_src_files: set[str] = set()
 
     line_bit_index = 0
 
@@ -198,6 +203,8 @@ def load_coverage_contexts(coverage_db: Path, repo_root: Path) -> CoverageContex
         contexts_by_line = cov_data.contexts_by_lineno(raw_file)
         for _lineno, contexts in sorted(contexts_by_line.items()):
             non_empty = [c for c in contexts if c]
+            if len(non_empty) < len(contexts):
+                uncontexted_src_files.add(norm_file)
             if not non_empty:
                 continue
             bit = 1 << line_bit_index
@@ -224,6 +231,7 @@ def load_coverage_contexts(coverage_db: Path, repo_root: Path) -> CoverageContex
         nodeid_masks=dict(nodeid_masks),
         nodeid_to_src_files=dict(nodeid_to_src_files),
         all_src_files=sorted(all_src_files),
+        src_files_with_uncontexted_lines=sorted(uncontexted_src_files),
     )
 
 
@@ -378,6 +386,11 @@ def build_reports(
         - len(unreferenced_sources),
         "mapped_test_file_count": len(all_mapped_test_files),
         "unreferenced_source_files": unreferenced_sources,
+        # Import-time lines carry no test context: tests depending on these
+        # files only through import are missing from source_to_test_files.
+        "source_files_with_uncontexted_lines": (
+            cov_ctx.src_files_with_uncontexted_lines
+        ),
         "source_to_test_files": mapping_dict,
     }
 
