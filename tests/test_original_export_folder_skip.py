@@ -154,27 +154,36 @@ def _seed_db(tmp_path: Path, pst_path: str, folder_path: str) -> tuple[Path, int
     return db_path, db_id
 
 
-def test_root_name_skipped_when_no_same_name_child_and_no_read_error(
+def _run_export(
     tmp_path: Path,
-) -> None:
+    root: _FakeFolder,
+    items_by_id: dict[str, _FakeItem],
+):
     pst_path = str(tmp_path / "archive.pst")
     db_path, db_id = _seed_db(tmp_path, pst_path, folder_path="Personal Folders/Inbox")
-    inbox = _FakeFolder("Inbox", rows=[("<target@example.com>", "entry-inbox")])
-    other = _FakeFolder("Other", rows=[("<target@example.com>", "entry-other")])
-    root = _FakeFolder("Personal Folders", children=[inbox, other])
-    namespace = _FakeNamespace(
-        _FakeStore(pst_path, root),
-        {
-            "entry-inbox": _FakeItem("entry-inbox", "<target@example.com>"),
-            "entry-other": _FakeItem("entry-other", "<target@example.com>"),
-        },
-    )
-
-    result = export_original_message(
+    namespace = _FakeNamespace(_FakeStore(pst_path, root), items_by_id)
+    return export_original_message(
         db_path,
         db_id,
         destination_dir=tmp_path / "exports",
         outlook_reader=_FakeOutlookReader(namespace),
+    )
+
+
+def test_root_name_skipped_when_no_same_name_child_and_no_read_error(
+    tmp_path: Path,
+) -> None:
+    inbox = _FakeFolder("Inbox", rows=[("<target@example.com>", "entry-inbox")])
+    other = _FakeFolder("Other", rows=[("<target@example.com>", "entry-other")])
+    root = _FakeFolder("Personal Folders", children=[inbox, other])
+
+    result = _run_export(
+        tmp_path,
+        root,
+        {
+            "entry-inbox": _FakeItem("entry-inbox", "<target@example.com>"),
+            "entry-other": _FakeItem("entry-other", "<target@example.com>"),
+        },
     )
 
     assert result.status == "exported"
@@ -183,25 +192,18 @@ def test_root_name_skipped_when_no_same_name_child_and_no_read_error(
 
 
 def test_root_name_not_skipped_when_same_name_child_exists(tmp_path: Path) -> None:
-    pst_path = str(tmp_path / "archive.pst")
-    db_path, db_id = _seed_db(tmp_path, pst_path, folder_path="Personal Folders/Inbox")
     nested_inbox = _FakeFolder("Inbox", rows=[("<target@example.com>", "entry-nested")])
     same_name_child = _FakeFolder("Personal Folders", children=[nested_inbox])
     root_inbox = _FakeFolder("Inbox", rows=[("<target@example.com>", "entry-root")])
     root = _FakeFolder("Personal Folders", children=[same_name_child, root_inbox])
-    namespace = _FakeNamespace(
-        _FakeStore(pst_path, root),
+
+    result = _run_export(
+        tmp_path,
+        root,
         {
             "entry-nested": _FakeItem("entry-nested", "<target@example.com>"),
             "entry-root": _FakeItem("entry-root", "<target@example.com>"),
         },
-    )
-
-    result = export_original_message(
-        db_path,
-        db_id,
-        destination_dir=tmp_path / "exports",
-        outlook_reader=_FakeOutlookReader(namespace),
     )
 
     assert result.status == "exported"
@@ -212,27 +214,20 @@ def test_root_name_not_skipped_when_same_name_child_exists(tmp_path: Path) -> No
 def test_root_name_not_skipped_when_read_failure_occurs_at_root_level(
     tmp_path: Path,
 ) -> None:
-    pst_path = str(tmp_path / "archive.pst")
-    db_path, db_id = _seed_db(tmp_path, pst_path, folder_path="Personal Folders/Inbox")
     inbox = _FakeFolder("Inbox", rows=[("<target@example.com>", "entry-inbox")])
     other = _FakeFolder("Other", rows=[("<target@example.com>", "entry-other")])
     root = _FakeFolder(
         "Personal Folders",
         children=[RuntimeError("MAPI_E_FAIL"), inbox, other],
     )
-    namespace = _FakeNamespace(
-        _FakeStore(pst_path, root),
+
+    result = _run_export(
+        tmp_path,
+        root,
         {
             "entry-inbox": _FakeItem("entry-inbox", "<target@example.com>"),
             "entry-other": _FakeItem("entry-other", "<target@example.com>"),
         },
-    )
-
-    result = export_original_message(
-        db_path,
-        db_id,
-        destination_dir=tmp_path / "exports",
-        outlook_reader=_FakeOutlookReader(namespace),
     )
 
     assert result.status == "failed"
