@@ -627,7 +627,8 @@ then runs `scripts/analyze_test_metrics.py` to produce the artifact
   `outcome`), `top_test_files` (`test_file`, `duration_seconds`, `test_count`),
   `top_source_modules` (`source_file`, `total_touching_duration_seconds`,
   `proportional_duration_seconds`, `touching_test_count`,
-  `touching_test_file_count`), plus `all_test_files` and `all_source_modules`.
+  `touching_test_file_count`), plus the full lists `all_tests` (every test,
+  same fields as `top_tests`), `all_test_files` and `all_source_modules`.
 - `source-to-tests.json`: `source_to_test_files` mapping each `src/` file to
   the sorted list of covering test files, plus `source_file_count`,
   `covered_source_file_count`, `mapped_test_file_count`, and

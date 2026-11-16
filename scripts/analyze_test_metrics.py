@@ -338,6 +338,15 @@ def build_reports(
     ]
 
     total_duration = round(sum(c.duration_seconds for c in cases), 6)
+    all_tests = [
+        {
+            "nodeid": c.nodeid,
+            "test_file": c.test_file,
+            "duration_seconds": round(c.duration_seconds, 6),
+            "outcome": c.outcome,
+        }
+        for c in sorted_tests
+    ]
     durations_report = {
         "schema_version": 1,
         "top_n": top_n,
@@ -345,17 +354,10 @@ def build_reports(
         "total_test_files": len(by_test_file),
         "total_source_modules": len(cov_ctx.all_src_files),
         "total_duration_seconds": total_duration,
-        "top_tests": [
-            {
-                "nodeid": c.nodeid,
-                "test_file": c.test_file,
-                "duration_seconds": round(c.duration_seconds, 6),
-                "outcome": c.outcome,
-            }
-            for c in sorted_tests[:top_n]
-        ],
+        "top_tests": all_tests[:top_n],
         "top_test_files": sorted_test_files[:top_n],
         "top_source_modules": sorted_source_modules[:top_n],
+        "all_tests": all_tests,
         "all_test_files": sorted_test_files,
         "all_source_modules": sorted_source_modules,
     }

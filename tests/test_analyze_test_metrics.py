@@ -145,6 +145,9 @@ def test_analyze_produces_all_three_reports_and_summary(tmp_path: Path) -> None:
         == "tests/test_alpha.py::AlphaTests::test_slow"
     )
     assert durations["top_tests"][0]["duration_seconds"] == pytest.approx(4.0)
+    # Every test's duration is in the artifact, not only the top-N (#79).
+    assert len(durations["all_tests"]) == 5
+    assert durations["all_tests"][:3] == durations["top_tests"]
 
     assert durations["top_test_files"][0]["test_file"] == "tests/test_alpha.py"
     assert durations["top_test_files"][0]["duration_seconds"] == pytest.approx(4.5)
