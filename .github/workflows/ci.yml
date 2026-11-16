@@ -176,6 +176,9 @@ jobs:
           } elseif ($testExit -ne 0) {
               exit $testExit
           }
+          # GitHub's pwsh wrapper exits with the last native $LASTEXITCODE, so
+          # the tolerated exit 1 must be cleared explicitly.
+          exit 0
 
       - name: Analyze test durations and coverage contexts
         shell: pwsh
