@@ -4,7 +4,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
@@ -20,6 +20,39 @@ def build_participant_search_text(display_name: str | None, email: str | None) -
     """
     parts = [value for value in (display_name, email) if value]
     return " ".join(parts)
+
+
+def format_sent_at(raw_sent_at: object) -> str | None:
+    """Normalize a stored ``sent_at`` string for output.
+
+    - Offset-carrying ISO-8601 strings are returned byte-identical.
+    - Naive ISO-8601 strings (no UTC offset) are interpreted as UTC (matching
+      SQLite ``unixepoch(sent_at)``) and returned with an explicit ``+00:00``
+      offset.
+    - ``None``, blank, or unparseable values are returned unchanged.
+    """
+    if raw_sent_at is None:
+        return None
+    if isinstance(raw_sent_at, datetime):
+        aware = (
+            raw_sent_at
+            if raw_sent_at.tzinfo is not None
+            else raw_sent_at.replace(tzinfo=UTC)
+        )
+        return aware.isoformat()
+
+    raw_text = str(raw_sent_at)
+    stripped = raw_text.strip()
+    if not stripped:
+        return raw_text
+    try:
+        parsed = datetime.fromisoformat(stripped)
+    except ValueError:
+        return raw_text
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC).isoformat()
+    return raw_text
 
 
 @dataclass(frozen=True, slots=True)

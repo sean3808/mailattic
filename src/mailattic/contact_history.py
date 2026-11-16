@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 from collections import defaultdict
@@ -9,6 +10,7 @@ from pathlib import Path
 import toons
 
 from .datetime_bounds import (
+    coerce_to_taipei_aware,
     format_invalid_date_message,
     normalize_optional_date_text,
     whole_day_bound,
@@ -64,9 +66,11 @@ def aggregate_contact_history(
     # public Python entry point and a non-CLI caller never used --date-from.
     # The CLI names its own flags via its own pre-validation in cli.py.
     parsed_date_from = parse_date_bound(
-        normalized_date_from, parameter_name="date_from"
+        normalized_date_from, parameter_name="date_from", end_of_day=False
     )
-    parsed_date_to = parse_date_bound(normalized_date_to, parameter_name="date_to")
+    parsed_date_to = parse_date_bound(
+        normalized_date_to, parameter_name="date_to", end_of_day=True
+    )
 
     conn = connect_database(database_path, create=False, read_only=read_only)
     try:
@@ -89,41 +93,66 @@ def aggregate_contact_history(
     return result
 
 
-def parse_date_bound(value: str | None, *, parameter_name: str) -> date | None:
-    """Parse a `contact-history` date bound (`strptime` with `%Y-%m-%d`).
+_ISO_DATE_OR_DATETIME_EXPECTED = (
+    "a YYYY-MM-DD date (canonical, basic, or ISO week form) or an ISO-8601 timestamp"
+)
 
-    Shared by :func:`aggregate_contact_history` (``parameter_name`` =
-    ``date_from`` / ``date_to``, this module's own keyword names) and the
-    CLI's pre-validation in ``cli.py`` (``parameter_name`` = ``--date-from``
-    / ``--date-to``, the flag spelling) -- one parser, each caller raising
-    with the name its own callers actually used. Unchanged in what it
-    accepts -- see design.md > "Hold the whole-day rule in one dedicated
-    module, and keep parsing out of it". A `None`, empty, or
-    whitespace-only *value* means the filter was not supplied and returns
-    ``None`` rather than raising (design.md > "Reject a malformed date
-    instead of letting it match nothing, and treat a blank value as an
-    absent filter"). Any other value this parser does not accept raises
-    ``ValueError`` naming both the offending value and *parameter_name*.
+
+def parse_date_bound(
+    value: str | None,
+    *,
+    parameter_name: str,
+    end_of_day: bool = False,
+    allow_single_digit: bool = True,
+) -> datetime | None:
+    """Parse a date-or-timestamp bound into an offset-aware Asia/Taipei instant.
+
+    Uses ``bes search``'s ISO-8601 parser first: a date-only value
+    accepted by ``date.fromisoformat`` (canonical, basic, or ISO week
+    form) becomes the whole Asia/Taipei calendar day via
+    :func:`whole_day_bound`; an ISO-8601 timestamp accepted by
+    ``datetime.fromisoformat`` is passed through
+    :func:`coerce_to_taipei_aware` (preserving an explicit offset or
+    interpreting a naive timestamp as Asia/Taipei).
+
+    When *allow_single_digit* is ``True`` (the default for
+    ``contact-history``), if the ISO-8601 parser rejects *value*, falls
+    back to ``strptime("%Y-%m-%d")`` so single-digit forms such as
+    ``2026-7-1`` remain accepted as whole Asia/Taipei days.
+
+    ``None``, empty, or whitespace-only *value* means the filter was not
+    supplied and returns ``None`` rather than raising. Any other value
+    this parser does not accept raises ``ValueError`` naming both the
+    offending value and *parameter_name*.
     """
     checked = normalize_optional_date_text(value)
     if checked is None:
         return None
-    try:
-        # strptime does not tolerate surrounding whitespace, so a padded
-        # value is rejected here exactly as it was before this helper
-        # existed.
-        return datetime.strptime(checked, "%Y-%m-%d").date()
-    except ValueError as exc:
-        raise ValueError(
-            format_invalid_date_message(value, parameter_name, expected="YYYY-MM-DD")
-        ) from exc
+    with contextlib.suppress(ValueError):
+        parsed_date = date.fromisoformat(checked)
+        return whole_day_bound(parsed_date, end_of_day=end_of_day)
+    with contextlib.suppress(ValueError):
+        parsed_datetime = datetime.fromisoformat(checked)
+        return coerce_to_taipei_aware(parsed_datetime)
+    if allow_single_digit:
+        with contextlib.suppress(ValueError):
+            parsed_date = datetime.strptime(checked, "%Y-%m-%d").date()
+            return whole_day_bound(parsed_date, end_of_day=end_of_day)
+    expected = (
+        f"{_ISO_DATE_OR_DATETIME_EXPECTED} (or YYYY-M-D)"
+        if allow_single_digit
+        else _ISO_DATE_OR_DATETIME_EXPECTED
+    )
+    raise ValueError(
+        format_invalid_date_message(value, parameter_name, expected=expected)
+    )
 
 
 def _build_match_clause(
     query_type: str,
     query_value: str,
-    parsed_date_from: date | None,
-    parsed_date_to: date | None,
+    parsed_date_from: datetime | None,
+    parsed_date_to: datetime | None,
 ) -> tuple[str, list[object]]:
     """Return (WHERE clause fragment, parameters) for the message selector."""
     params: list[object] = []
@@ -150,10 +179,10 @@ def _build_match_clause(
 
     if parsed_date_from is not None:
         clause += " AND unixepoch(m.sent_at) >= unixepoch(?)"
-        params.append(whole_day_bound(parsed_date_from).isoformat())
+        params.append(parsed_date_from.isoformat())
     if parsed_date_to is not None:
         clause += " AND unixepoch(m.sent_at) <= unixepoch(?)"
-        params.append(whole_day_bound(parsed_date_to, end_of_day=True).isoformat())
+        params.append(parsed_date_to.isoformat())
 
     return clause, params
 
@@ -165,8 +194,8 @@ def _run_aggregation(
     query_type: str,
     date_from: str | None,
     date_to: str | None,
-    parsed_date_from: date | None,
-    parsed_date_to: date | None,
+    parsed_date_from: datetime | None,
+    parsed_date_to: datetime | None,
     attachments_limit: int,
 ) -> dict[str, object]:
     match_clause, params = _build_match_clause(

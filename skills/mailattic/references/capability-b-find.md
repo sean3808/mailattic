@@ -81,7 +81,7 @@ bes contact-history --contact alice@client.example --format json
 bes contact-history --domain client.com --date-from 2024-01-01 --date-to 2025-12-31 --format json
 ```
 
-- `--contact <email>` and `--domain <domain>` are **mutually exclusive, exactly one required**. Dates use `--date-from` / `--date-to` (YYYY-MM-DD; the names differ from `bes search`'s `--from-date`).
+- `--contact <email>` and `--domain <domain>` are **mutually exclusive, exactly one required**. Dates use `--date-from` / `--date-to` (accepting the same ISO-8601 dates and timestamps as `bes search`, plus `YYYY-M-D`; naive timestamps mean `Asia/Taipei`, not the machine timezone; note the flag names differ from `bes search`'s `--from-date`).
 - Returns one summary object: time span (first / last contact), total mail count, inbound/outbound ratio, every contact person at the domain (email + display_name + per-person frequency / last contact), attachment overview.
 - `--format` defaults to `table` (compact TOON format); for agent consumption use `--format json`. `--attachments-limit N` (default 20) controls the attachment-overview row count.
 - Direction (inbound / outbound) comes from the self-address set; contacts exclude bcc and self.
@@ -115,7 +115,7 @@ The flags are `--from-date` / `--to-date` (**not** `--date-from/--date-to`). Oth
 
 **Direction**: every record in `bes search --json` and `bes thread --format json` carries a `direction` field (value `outbound` / `inbound` / `null`). It is decided by whether the sender belongs to the self-address set declared with `bes identity`; `null` means the sender is missing (no guessing). **Do not compare sender domains yourself to decide direction**: colleagues and other people at the same domain would be misjudged as ours. Read this field. MCP `mail_search` / `mail_thread` responses have the same shape. There is currently no server-side `--direction inbound|outbound` filter; to filter, do it on the returned JSON.
 
-**What a date bound means**: a plain date (`2026-07-01`) = **the whole day in Asia/Taipei, both ends inclusive**, for the lower and the upper bound alike. `bes search` / `bes attachments` also accept a full timestamp: with an offset (`2026-07-01T12:00:00+08:00`) it selects that instant and is not widened to a whole day; **a timestamp without an offset is read as Taipei time**. `bes contact-history`'s `--date-from` / `--date-to` accept dates only (non-zero-padded forms such as `2026-7-1` are accepted too), not timestamps. A malformed date is an error (it names the bad value and the parameter), never silently zero results. Canonical rule: `docs/decisions/D-20260723-1-taipei-day-date-filter-semantics.md`.
+**What a date bound means**: a plain date (`2026-07-01`, `20260721`, or `2026-W30-2`) = **the whole day in Asia/Taipei, both ends inclusive**, for the lower and the upper bound alike. `bes search`, `bes attachments`, `bes contact-history` (`--date-from` / `--date-to`, which also keeps non-zero-padded `2026-7-1`), and MCP `mail_search` / `mail_contact_history` all accept full ISO-8601 timestamps too: with an offset (`2026-07-01T12:00:00+08:00` or `Z`) it selects that instant and is not widened to a whole day; **a timestamp without an offset is read as `Asia/Taipei`, not the machine's local timezone**. A malformed date is an error (it names the bad value and the parameter), never silently zero results. Canonical rule: `docs/decisions/D-20260723-1-taipei-day-date-filter-semantics.md`.
 
 `--keyword` supports a controlled FTS5 boolean syntax: uppercase `AND` / `OR` / `NOT`, parentheses, double-quoted phrases. Operators are case-sensitive; lowercase `and` / `or` / `not` are literal terms. Quote part numbers containing a hyphen as a phrase (example: `'"PEN-100"'`). `*` prefix, column filters, and `NEAR` are not supported.
 
@@ -309,7 +309,7 @@ bes attachments \
   --json
 ```
 
-It returns **one row per attachment** (not one per mail); each row has `attachment_id`, `message_db_id`, `rfc_message_id`, `dedup_key`, `sent_at`, `sender_email`, `subject`, `attachment_name`, `content_hash`, `storage_path`, `folder_path`, `exportable`, `carrying_messages`. To cite the source mail externally, use `rfc_message_id` / `dedup_key`; **never** use the integer `message_db_id` as a stable bookmark.
+It returns **one row per attachment** (not one per mail); each row has `attachment_id`, `message_db_id`, `rfc_message_id`, `dedup_key`, `sent_at` (naive values normalized with `+00:00`), `sent_at_epoch`, `sender_email`, `subject`, `attachment_name`, `content_hash`, `storage_path`, `folder_path`, `exportable`, `carrying_messages` (each also carrying `sent_at` and `sent_at_epoch`). To cite the source mail externally, use `rfc_message_id` / `dedup_key`; **never** use the integer `message_db_id` as a stable bookmark.
 
 To copy the matching payloads out, add `--copy-to`:
 

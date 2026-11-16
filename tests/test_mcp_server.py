@@ -973,6 +973,7 @@ class McpServerTests(unittest.TestCase):
             "sender_email",
             "direction",
             "sent_at",
+            "sent_at_epoch",
             "received_at",
             "message_id",
             "in_reply_to",
@@ -1964,6 +1965,7 @@ class McpServerTests(unittest.TestCase):
             "sender_email",
             "direction",
             "sent_at",
+            "sent_at_epoch",
             "received_at",
             "pst_source",
             "folder_path",
@@ -2360,11 +2362,9 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("2026-201", message)
         self.assertIn("from_date", message)
 
-    def test_single_digit_and_full_timestamp_forms_still_rejected(self) -> None:
-        """`mail_search`'s `date.fromisoformat` parser has never accepted a
-        single-digit-month/day form or a full ISO-8601 timestamp -- both
-        must still raise a ``ToolError``, unchanged by this change's
-        render-time coercion revert.
+    def test_single_digit_form_still_rejected(self) -> None:
+        """`mail_search` still rejects single-digit-month/day forms,
+        matching `bes search`'s ISO-8601 parser (`date.fromisoformat`).
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = self._create_boundary_fixture_db(Path(temp_dir))
@@ -2373,12 +2373,6 @@ class McpServerTests(unittest.TestCase):
             with self.assertRaises(ToolError):
                 self._call_mail_search(
                     server, sender="boundary@example.com", from_date="2026-7-1"
-                )
-            with self.assertRaises(ToolError):
-                self._call_mail_search(
-                    server,
-                    sender="boundary@example.com",
-                    from_date="2026-07-21T12:00:00",
                 )
 
     def test_blank_date_value_is_unsupplied_not_a_date_error(self) -> None:
@@ -3522,6 +3516,7 @@ class McpServerTests(unittest.TestCase):
                 "rfc_message_id",
                 "dedup_key",
                 "sent_at",
+                "sent_at_epoch",
                 "sender_email",
                 "subject",
             },
@@ -5587,6 +5582,7 @@ class MessagePayloadShapingTests(unittest.TestCase):
             "sender_email",
             "direction",
             "sent_at",
+            "sent_at_epoch",
             "received_at",
             "message_id",
             "in_reply_to",

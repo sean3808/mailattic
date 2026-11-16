@@ -407,6 +407,7 @@ def test_search_attachments_returns_attachment_rows_and_filters(
                 "rfc_message_id": row["rfc_message_id"],
                 "dedup_key": row["dedup_key"],
                 "sent_at": row["sent_at"],
+                "sent_at_epoch": row["sent_at_epoch"],
                 "sender_email": row["sender_email"],
                 "subject": row["subject"],
             }
@@ -538,7 +539,8 @@ def test_search_attachments_dedupe_content_hash_keeps_newest_and_null_hash_rows(
     shared_hash = attachment_env.content_hashes["shared"]
     shared_row = next(row for row in deduped_rows if row["content_hash"] == shared_hash)
     assert shared_row["attachment_id"] == attachment_env.attachment_ids["shared-newer"]
-    assert shared_row["sent_at"] == "2025-04-12T10:00:00"
+    # Stored naive; #84 prints naive sent_at with an explicit +00:00 offset.
+    assert shared_row["sent_at"] == "2025-04-12T10:00:00+00:00"
     carrying_ids = [
         message["message_db_id"] for message in shared_row["carrying_messages"]
     ]

@@ -50,7 +50,7 @@ message_fts(...)        -- FTS5 over subject/body/recipients/attachments
 message_attachments(...)
 ```
 
-`messages.id` is the db_id (int); `messages.message_id` is the RFC822 Message-ID string (may be None). `message_recipients.message_id` points at `messages.id` (not the RFC822 string) - confusing name, but that is how it is. `bes show <id>` / `bes thread <id>` locate by integer db_id; `bes draft-reply <message_id>` takes the original mail's stored RFC822 `messages.message_id` and rejects DB / archive row ids.
+`messages.id` is the db_id (int); `messages.message_id` is the RFC822 Message-ID string (may be None). `message_recipients.message_id` points at `messages.id` (not the RFC822 string) - confusing name, but that is how it is. `bes show <id>` / `bes thread <id>` locate by integer db_id; `bes draft-reply <message_id>` takes the original mail's stored RFC822 `messages.message_id` and rejects DB / archive row ids. JSON / MCP read outputs (`bes search --json`, `bes show --format json`, `bes thread --format json`, `bes attachments --json`, and MCP read tools) append `+00:00` to naive stored `sent_at` values (offset-carrying values print unchanged) and include `sent_at_epoch` (integer UTC seconds, or `null` when missing/unparseable).
 
 ## Fatal pitfalls (read before acting)
 

@@ -8,13 +8,14 @@ import os
 import socket
 import sys
 from collections.abc import Generator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import mailattic.imap_runtime as imap_runtime
-from mailattic import archive_scrape, imap_sync, outbound
+from mailattic import archive_scrape, imap_sync, outbound, outlook_pst
 
 
 class MailboxGuardError(Exception):
@@ -196,6 +197,20 @@ def guard_test_mailbox(request: pytest.FixtureRequest) -> Generator[None]:
         yield
     finally:
         _current_test_nodeid = previous
+
+
+@pytest.fixture(autouse=True)
+def pin_pst_machine_utc_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the PST reader's machine UTC offset seam to +08:00 for tests.
+
+    Hosted CI runs on UTC (``windows-latest``), while production runs on a
+    Taipei (+08:00) machine. Guard tests override this seam explicitly.
+    """
+    monkeypatch.setattr(
+        outlook_pst,
+        "get_machine_utc_offset",
+        lambda: timedelta(hours=8),
+    )
 
 
 @pytest.fixture
