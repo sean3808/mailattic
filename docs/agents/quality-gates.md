@@ -609,3 +609,38 @@ Neither green signal means anything more than stated above, and in particular:
   [`docs/global-install-and-release.md`](../global-install-and-release.md).
 
 The `hosted-full` status check is required on main for merge (#70).
+
+## Test duration and coverage measurement
+
+The `measure-test-metrics` job in `.github/workflows/ci.yml` runs only on the
+weekly schedule (`schedule`) and manual dispatch (`workflow_dispatch`). It is
+measurement-only and never acts as a PR merge gate.
+
+It invokes `scripts\invoke-pytest.ps1 -Route FullCoverage -CoverageRunId <id>`
+(which records `--cov-context=test` in `.coverage` alongside `junit.xml`) and
+then runs `scripts/analyze_test_metrics.py` to produce the artifact
+`test-measurement-reports`:
+
+- `durations.json`: `top_tests` (`nodeid`, `test_file`, `duration_seconds`,
+  `outcome`), `top_test_files` (`test_file`, `duration_seconds`, `test_count`),
+  `top_source_modules` (`source_file`, `total_touching_duration_seconds`,
+  `proportional_duration_seconds`, `touching_test_count`,
+  `touching_test_file_count`), plus `all_test_files` and `all_source_modules`.
+- `source-to-tests.json`: `source_to_test_files` mapping each `src/` file to
+  the sorted list of covering test files, plus `source_file_count`,
+  `covered_source_file_count`, `mapped_test_file_count`, and
+  `unreferenced_source_files`.
+- `audit-candidates.json`: `test_file_candidates` (test files whose covered
+  `src/` line set is a non-empty subset of another test file's),
+  `single_test_candidates` (single-test subset precision), and
+  `zero_src_coverage_test_files` (excluded from subset candidacy).
+- `summary.md`: human-readable Markdown summary of all three reports.
+
+Download the artifact from a completed run with:
+
+```powershell
+gh run download <run-id> -n test-measurement-reports -D .project-runtime/ci-metrics
+```
+
+Run this measurement locally only when CI is unavailable, to avoid loading the
+development workstation with a full instrumented suite run.
