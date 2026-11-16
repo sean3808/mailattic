@@ -309,7 +309,7 @@ bes attachments \
   --json
 ```
 
-It returns **one row per attachment** (not one per mail); each row has `attachment_id`, `message_db_id`, `rfc_message_id`, `dedup_key`, `sent_at`, `sender_email`, `subject`, `attachment_name`, `content_hash`, `storage_path`, `folder_path`, `exportable`, `carrying_messages`. To cite the source mail externally, use `rfc_message_id` / `dedup_key`; **never** use the integer `message_db_id` as a stable bookmark.
+It returns **one row per attachment** (not one per mail); each row has `attachment_id`, `message_db_id`, `rfc_message_id`, `dedup_key`, `sent_at` (naive values normalized with `+00:00`), `sent_at_epoch`, `sender_email`, `subject`, `attachment_name`, `content_hash`, `storage_path`, `folder_path`, `exportable`, `carrying_messages` (each also carrying `sent_at` and `sent_at_epoch`). To cite the source mail externally, use `rfc_message_id` / `dedup_key`; **never** use the integer `message_db_id` as a stable bookmark.
 
 To copy the matching payloads out, add `--copy-to`:
 

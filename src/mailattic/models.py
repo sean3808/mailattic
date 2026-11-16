@@ -4,7 +4,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
@@ -20,6 +20,42 @@ def build_participant_search_text(display_name: str | None, email: str | None) -
     """
     parts = [value for value in (display_name, email) if value]
     return " ".join(parts)
+
+
+def format_sent_at_and_epoch(raw_sent_at: object) -> tuple[str | None, int | None]:
+    """Normalize a stored ``sent_at`` value and compute its integer UTC epoch.
+
+    - Offset-carrying ISO-8601 strings are returned byte-identical alongside
+      their integer UTC epoch.
+    - Naive ISO-8601 strings (no UTC offset) are interpreted as UTC (matching
+      SQLite ``unixepoch(sent_at)``) and returned with an explicit ``+00:00``
+      offset.
+    - ``None``, blank, or unparseable values return ``(raw_sent_at, None)``
+      (never a sort sentinel).
+    """
+    if raw_sent_at is None:
+        return None, None
+    if isinstance(raw_sent_at, datetime):
+        aware = (
+            raw_sent_at
+            if raw_sent_at.tzinfo is not None
+            else raw_sent_at.replace(tzinfo=UTC)
+        )
+        return aware.isoformat(), int(aware.timestamp())
+
+    raw_text = str(raw_sent_at)
+    stripped = raw_text.strip()
+    if not stripped:
+        return raw_text, None
+    try:
+        parsed = datetime.fromisoformat(stripped)
+    except ValueError:
+        return raw_text, None
+
+    if parsed.tzinfo is None:
+        aware = parsed.replace(tzinfo=UTC)
+        return aware.isoformat(), int(aware.timestamp())
+    return raw_text, int(parsed.timestamp())
 
 
 @dataclass(frozen=True, slots=True)

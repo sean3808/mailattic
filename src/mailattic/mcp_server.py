@@ -923,6 +923,7 @@ def shape_message_payload(
         "sender_email": message.get("sender_email"),
         "direction": message.get("direction"),
         "sent_at": message.get("sent_at"),
+        "sent_at_epoch": message.get("sent_at_epoch"),
         "received_at": message.get("received_at"),
         "message_id": message.get("message_id"),
         "in_reply_to": message.get("in_reply_to"),
@@ -1081,6 +1082,7 @@ def shape_search_result_item(
         "sender_email": message.get("sender_email"),
         "direction": message.get("direction"),
         "sent_at": message.get("sent_at"),
+        "sent_at_epoch": message.get("sent_at_epoch"),
         "received_at": message.get("received_at"),
         "pst_source": message.get("pst_source"),
         "folder_path": _cap_presentation_string(
@@ -1252,6 +1254,7 @@ def _shape_attachment_carrying_message(
         "rfc_message_id": entry.get("rfc_message_id"),
         "dedup_key": entry.get("dedup_key"),
         "sent_at": entry.get("sent_at"),
+        "sent_at_epoch": entry.get("sent_at_epoch"),
         "sender_email": entry.get("sender_email"),
         "subject": _cap_presentation_string(
             entry.get("subject"),
@@ -1317,6 +1320,7 @@ def shape_attachment_search_item(
         "rfc_message_id": entry.get("rfc_message_id"),
         "dedup_key": entry.get("dedup_key"),
         "sent_at": entry.get("sent_at"),
+        "sent_at_epoch": entry.get("sent_at_epoch"),
         "sender_email": entry.get("sender_email"),
         "subject": _cap_presentation_string(
             entry.get("subject"), _SUBJECT_CAP, "subject", truncated_fields

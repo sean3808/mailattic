@@ -15,6 +15,7 @@ from pathlib import Path
 from .cjk_segmentation import _is_cjk, segment_cjk
 from .datetime_bounds import coerce_to_taipei_aware
 from .identity import compute_direction, extract_address, resolve_self_addresses
+from .models import format_sent_at_and_epoch
 from .storage import SYNC_STATE_KEY, connect_database
 
 # ---------------------------------------------------------------------------
@@ -1499,13 +1500,15 @@ def search_messages(
                 ]
                 if match_field == "body":
                     match_in = _match_location(normalized_body, offset)
+        sent_at, sent_at_epoch = format_sent_at_and_epoch(row["sent_at"])
         result: dict[str, object] = {
             "id": row["id"],
             "subject": row["subject"],
             "sender_name": row["sender_name"],
             "sender_email": row["sender_email"],
             "direction": compute_direction(row["sender_email"], self_addresses),
-            "sent_at": row["sent_at"],
+            "sent_at": sent_at,
+            "sent_at_epoch": sent_at_epoch,
             "received_at": row["received_at"],
             "pst_source": row["pst_source"],
             "folder_path": row["folder_path"],
@@ -1631,39 +1634,33 @@ def search_attachments(
     finally:
         connection.close()
 
-    results = [
-        {
-            "attachment_id": row["attachment_id"],
-            "message_db_id": row["message_db_id"],
-            "rfc_message_id": row["rfc_message_id"],
-            "dedup_key": row["dedup_key"],
-            "sent_at": row["sent_at"],
-            "sent_at_epoch": row["sent_at_epoch"],
-            "sender_email": row["sender_email"],
-            "subject": row["subject"],
-            "attachment_name": row["attachment_name"],
-            "size_bytes": row["size_bytes"],
-            "mime_type": row["mime_type"],
-            "content_hash": row["content_hash"],
-            "storage_path": row["storage_path"],
-            "folder_path": row["folder_path"],
-            "exportable": row["storage_path"] is not None,
-            "carrying_messages": [_message_summary_from_attachment_row(row)],
-        }
-        for row in rows
-    ]
+    results = []
+    for row in rows:
+        sent_at, sent_at_epoch = format_sent_at_and_epoch(row["sent_at"])
+        results.append(
+            {
+                "attachment_id": row["attachment_id"],
+                "message_db_id": row["message_db_id"],
+                "rfc_message_id": row["rfc_message_id"],
+                "dedup_key": row["dedup_key"],
+                "sent_at": sent_at,
+                "sent_at_epoch": sent_at_epoch,
+                "sender_email": row["sender_email"],
+                "subject": row["subject"],
+                "attachment_name": row["attachment_name"],
+                "size_bytes": row["size_bytes"],
+                "mime_type": row["mime_type"],
+                "content_hash": row["content_hash"],
+                "storage_path": row["storage_path"],
+                "folder_path": row["folder_path"],
+                "exportable": row["storage_path"] is not None,
+                "carrying_messages": [_message_summary_from_attachment_row(row)],
+            }
+        )
 
     if dedupe == "content-hash":
         results = _dedupe_attachment_results(results)
 
-    # sent_at_epoch only exists to give the dedupe sort keys below an
-    # absolute-instant comparison (same unixepoch() convention as every
-    # other ordering in this module) instead of comparing sent_at strings
-    # lexically across offsets -- it is not part of the public row shape.
-    for result in results:
-        result.pop("sent_at_epoch", None)
-        for message in result["carrying_messages"]:
-            message.pop("sent_at_epoch", None)
     return results
 
 
@@ -1750,13 +1747,15 @@ def get_message(
     finally:
         connection.close()
 
+    sent_at, sent_at_epoch = format_sent_at_and_epoch(row["sent_at"])
     return {
         "id": row["id"],
         "subject": row["subject"],
         "sender_name": row["sender_name"],
         "sender_email": row["sender_email"],
         "direction": compute_direction(row["sender_email"], self_addresses),
-        "sent_at": row["sent_at"],
+        "sent_at": sent_at,
+        "sent_at_epoch": sent_at_epoch,
         "received_at": row["received_at"],
         "body_text": row["body_text"],
         "message_id": row["message_id"],
@@ -2067,15 +2066,23 @@ def _attachment_name_extension(value: object) -> str:
     return candidate.suffix.lower()
 
 
+_SENT_AT_SORT_SENTINEL = -62135596800
+
+
+def _sent_at_epoch_sort_value(value: object) -> int:
+    return int(value) if isinstance(value, int) else _SENT_AT_SORT_SENTINEL
+
+
 def _message_summary_from_attachment_row(
     row: dict[str, object],
 ) -> dict[str, object]:
+    sent_at, sent_at_epoch = format_sent_at_and_epoch(row["sent_at"])
     return {
         "message_db_id": row["message_db_id"],
         "rfc_message_id": row["rfc_message_id"],
         "dedup_key": row["dedup_key"],
-        "sent_at": row["sent_at"],
-        "sent_at_epoch": row["sent_at_epoch"],
+        "sent_at": sent_at,
+        "sent_at_epoch": sent_at_epoch,
         "sender_email": row["sender_email"],
         "subject": row["subject"],
     }
@@ -2087,7 +2094,7 @@ def _attachment_result_sort_key(result: dict[str, object]) -> tuple[int, int, in
     # BY. Comparing sent_at strings lexically picks the wrong winner across
     # UTC offsets (issue #193).
     return (
-        int(result["sent_at_epoch"]),
+        _sent_at_epoch_sort_value(result["sent_at_epoch"]),
         int(result["message_db_id"]),
         -int(result["attachment_id"]),
     )
@@ -2119,7 +2126,10 @@ def _dedupe_attachment_results(
         winner_row = dict(winner)
         winner_row["carrying_messages"] = sorted(
             carrying_messages.values(),
-            key=lambda m: (int(m["sent_at_epoch"]), int(m["message_db_id"])),
+            key=lambda m: (
+                _sent_at_epoch_sort_value(m["sent_at_epoch"]),
+                int(m["message_db_id"]),
+            ),
             reverse=True,
         )
         deduped.append(winner_row)

@@ -14,7 +14,7 @@ import imaplib
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from email.parser import BytesHeaderParser
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
@@ -254,9 +254,15 @@ def _matches_without_message_id(
     if not db_sender or db_sender != item_sender:
         return False
     db_sent_at = _parse_aware_datetime(message.get("sent_at"))
-    if db_sent_at is None or sent_at is None or sent_at.tzinfo is None:
+    if db_sent_at is None or sent_at is None:
         return False
-    return abs((db_sent_at - sent_at).total_seconds()) <= _SENT_AT_TOLERANCE_SECONDS
+    candidate_sent_at = (
+        sent_at if sent_at.tzinfo is not None else sent_at.replace(tzinfo=UTC)
+    )
+    return (
+        abs((db_sent_at - candidate_sent_at).total_seconds())
+        <= _SENT_AT_TOLERANCE_SECONDS
+    )
 
 
 def _parse_aware_datetime(value: object) -> datetime | None:
@@ -267,7 +273,7 @@ def _parse_aware_datetime(value: object) -> datetime | None:
             parsed = datetime.fromisoformat(str(value or "").strip())
         except ValueError:
             return None
-    return parsed if parsed.tzinfo is not None else None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _resolve_pst_store(

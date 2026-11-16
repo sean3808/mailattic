@@ -97,7 +97,7 @@ Windows-native IMAP sync 從這次指定的 `--env-file` 讀取 `IMAP_SECURITY`�
 
 ## 日期 bound 語意（跨所有查詢介面）
 
-一個純日期值代表 **Asia/Taipei 該日整天、兩端 inclusive**（下界 `00:00:00+08:00`、上界 `23:59:59+08:00`）。`search` / `attachments` 另外接受完整 ISO-8601 timestamp，帶 offset 者選中該瞬間、**不帶 offset 者解讀為台北**（此為 breaking 變更，原本被當 UTC）。四個介面接受的日期語法本來就不同且刻意保持不同（`contact-history` 收 `2026-7-1` 不收 `20260721`；`mail_search` 相反），統一的只有「一天」的意義。儲存端沒有 offset 的 `sent_at` 一律解讀為 UTC（best-effort 既定限制）。完整規則見 [D-20260723-1](decisions/D-20260723-1-taipei-day-date-filter-semantics.md)。
+一個純日期值代表 **Asia/Taipei 該日整天、兩端 inclusive**（下界 `00:00:00+08:00`、上界 `23:59:59+08:00`）。`search` / `attachments` 另外接受完整 ISO-8601 timestamp，帶 offset 者選中該瞬間、**不帶 offset 者解讀為台北**（此為 breaking 變更，原本被當 UTC）。四個介面接受的日期語法本來就不同且刻意保持不同（`contact-history` 收 `2026-7-1` 不收 `20260721`；`mail_search` 相反），統一的只有「一天」的意義。儲存端沒有 offset 的 `sent_at` 一律解讀為 UTC（best-effort 既定限制）；查詢與檢視的 JSON 輸出（`search`、`show`、`thread`、`attachments` 及 `carrying_messages`）對不帶 offset 的 `sent_at` 補上 `+00:00`（帶 offset 者原樣輸出），並附帶整數秒 `sent_at_epoch`（缺失或無法解析時為 `null`）。完整規則見 [D-20260723-1](decisions/D-20260723-1-taipei-day-date-filter-semantics.md)。
 
 ## `search --full-body --json` contract
 
@@ -109,7 +109,7 @@ Windows-native IMAP sync 從這次指定的 `--env-file` 讀取 `IMAP_SECURITY`�
 ## `attachments` contract
 
 - `--message <db_id>` 只回傳該封信（`messages.id`）夾帶的附件；與既有所有 filter 及 `--copy-to` 為 AND 關係；若 `db_id` 不存在則回傳空結果、exit 0、不匯出任何檔案（filter 語意，非 lookup）
-- 一列一附件；輸出同時帶 `attachment_id`、`message_db_id`、穩定引用用的 `rfc_message_id` / `dedup_key`、`exportable`、`carrying_messages`
+- 一列一附件；輸出同時帶 `attachment_id`、`message_db_id`、穩定引用用的 `rfc_message_id` / `dedup_key`、`sent_at`、`sent_at_epoch`、`exportable`、`carrying_messages`（每筆亦帶 `sent_at`、`sent_at_epoch`）
 - 以附件形式轉寄的信（`message/rfc822`）整封算一列附件、可匯出（沒有檔名時以附信主旨加 `.eml` 命名）；其內文不併入外層信的本文與檢索，其內夾帶的附件不另列。退信通知（`multipart/report`）夾帶的原信則維持併入外層本文與檢索、不另立為附件，此為刻意設計以方便依原信內容檢索退信
 - 以附件形式轉寄的信在 Outlook 匯入路徑存為 `.msg`，在 RFC/maildir 匯入路徑存為 `.eml`。
 - `--copy-to` 只會複製 `storage_path` 非空的列；metadata-only attachment 會逐列回報 `skipped-non-exportable`，不是靜默忽略
