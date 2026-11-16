@@ -55,6 +55,7 @@ class OriginalExportResult:
     subject: str = ""
     sender: str = ""
     sent_at: str | None = None
+    sent_at_epoch: int | None = None
     detail: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -66,6 +67,7 @@ class OriginalExportResult:
             "subject": self.subject,
             "sender": self.sender,
             "sent_at": self.sent_at,
+            "sent_at_epoch": self.sent_at_epoch,
             "detail": self.detail,
         }
 
@@ -126,6 +128,12 @@ def _base_result(
 ) -> OriginalExportResult:
     """Failed-by-default result carrying the message identity; derive outcomes
     from it with ``dataclasses.replace``."""
+    raw_epoch = message.get("sent_at_epoch")
+    sent_at_epoch = (
+        raw_epoch
+        if isinstance(raw_epoch, int) and not isinstance(raw_epoch, bool)
+        else None
+    )
     return OriginalExportResult(
         status="failed",
         format=fmt,
@@ -133,6 +141,7 @@ def _base_result(
         subject=str(message.get("subject") or ""),
         sender=_format_sender_string(message),
         sent_at=str(message.get("sent_at") or ""),
+        sent_at_epoch=sent_at_epoch,
     )
 
 

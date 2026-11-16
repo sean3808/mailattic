@@ -76,6 +76,18 @@ def _seed_raw_messages(database_path: Path) -> None:
                 "dedup-bad",
                 "thread-2",
             ),
+            # id=6: Python fromisoformat parses (+0800 without colon), but SQLite
+            # unixepoch() returns NULL -- sent_at_epoch must match SQLite NULL.
+            (
+                6,
+                "No-Colon Offset Mail",
+                "Frank",
+                "frank@example.com",
+                "2025-03-26T14:42:33+0800",
+                "<nocolon@example.com>",
+                "dedup-nocolon",
+                "thread-2",
+            ),
         ]
         for (
             msg_id,
@@ -187,6 +199,9 @@ class SentAtEpochAndOffsetCliTests(unittest.TestCase):
             self.assertIsNone(by_id[4]["sent_at_epoch"])
             self.assertEqual(by_id[5]["sent_at"], "not-a-date")
             self.assertIsNone(by_id[5]["sent_at_epoch"])
+            # +0800 without colon: SQLite unixepoch() is NULL, so sent_at_epoch is null
+            self.assertEqual(by_id[6]["sent_at"], "2025-03-26T14:42:33+0800")
+            self.assertIsNone(by_id[6]["sent_at_epoch"])
 
     def test_bes_show_and_thread_json_carry_sent_at_epoch_and_offset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -295,6 +310,44 @@ class SentAtEpochAndOffsetCliTests(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             self.assertEqual(payload["status"], "not_found")
             self.assertEqual(payload["sent_at"], "2025-03-26T06:42:33+00:00")
+            self.assertEqual(payload["sent_at_epoch"], 1742971353)
+
+    def test_sqlite_unixepoch_null_governs_sent_at_epoch_when_python_parses(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "test.db"
+            _seed_raw_messages(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                sql_epoch = conn.execute(
+                    "SELECT unixepoch(sent_at) FROM messages WHERE id = 6"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertIsNone(sql_epoch)
+
+            shown = _run_cli_json(
+                ["show", "--database", str(db_path), "6", "--format", "json"]
+            )
+            assert isinstance(shown, dict)
+            self.assertEqual(shown["sent_at"], "2025-03-26T14:42:33+0800")
+            self.assertIsNone(shown["sent_at_epoch"])
+
+            att_rows = _run_cli_json(
+                [
+                    "attachments",
+                    "--database",
+                    str(db_path),
+                    "--message",
+                    "6",
+                    "--json",
+                ]
+            )
+            assert isinstance(att_rows, list)
+            self.assertEqual(len(att_rows), 1)
+            self.assertIsNone(att_rows[0]["sent_at_epoch"])
 
 
 class SentAtEpochAndOffsetMcpTests(unittest.TestCase):
@@ -340,6 +393,36 @@ class SentAtEpochAndOffsetMcpTests(unittest.TestCase):
             self.assertEqual(carrying[1]["sent_at"], "2025-03-26T06:42:33+00:00")
             self.assertEqual(carrying[1]["sent_at_epoch"], 1742971353)
             self.assertIsNone(carrying[4]["sent_at_epoch"])
+
+    def test_mcp_original_export_carries_sent_at_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "test.db"
+            _seed_raw_messages(db_path)
+            conn = connect_database(db_path)
+            try:
+                conn.execute(
+                    "UPDATE messages SET source_input_mode = 'outbound' "
+                    "WHERE id IN (1, 4)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            server = create_server(database_path=db_path)
+            dest_dir = str(Path(tmp_dir) / "exports")
+
+            res_naive = server._tool_manager.get_tool("mail_original_export").fn(  # type: ignore[attr-defined]
+                message_id=1, dest_dir=dest_dir
+            )
+            payload_naive = res_naive.structured_content
+            self.assertEqual(payload_naive["sent_at"], "2025-03-26T06:42:33+00:00")
+            self.assertEqual(payload_naive["sent_at_epoch"], 1742971353)
+
+            res_null = server._tool_manager.get_tool("mail_original_export").fn(  # type: ignore[attr-defined]
+                message_id=4, dest_dir=dest_dir
+            )
+            payload_null = res_null.structured_content
+            self.assertIsNone(payload_null["sent_at_epoch"])
 
 
 class OriginalExportNaiveSentAtTests(unittest.TestCase):

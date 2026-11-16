@@ -18,7 +18,7 @@
   - 輸入：`message_id`（整數 stored id 或其十進位字串），`dest_dir` 必須是絕對 host 路徑、至多 200 字元，不存在就建立。
   - 安全限制比照 `mail_attachment_export`：`dest_dir` 落在 CAS 或 Startup / Office 啟動目錄直接拒絕；永不覆寫（目的檔存在回 `skipped-existing`）。
   - 找不到時不報錯了事：`not_found` 只在來源完整搜過、沒有讀不到的項目、確實沒有這封信時回報；拿不準的情況（讀不到、找到多份、PST 沒在 Outlook 開啟、封存抓取的信沒有原信可取、沒有 Message-ID 且記錄位置失效）一律 `failed` 並在 `detail` 說明下一步（#53 裁決 3–6）。兩者都 `dest_path=null`，並回報 `subject`、`sender`、`sent_at` 提供人工線索。
-  - 輸出包含：`status`（`exported`／`skipped-existing`／`not_found`／`failed`）、`dest_path`、`format`（`msg`／`eml`）、`source_type`（`pst`／`imap`）、`subject`、`sender`、`sent_at`、`detail`。檔案寫入後才組回應，所以過長的 `subject`／`sender`／`detail` 依上限截短，並以 `truncated_fields` 記原長度，不會讓已完成的匯出變成錯誤。
+  - 輸出包含：`status`（`exported`／`skipped-existing`／`not_found`／`failed`）、`dest_path`、`format`（`msg`／`eml`）、`source_type`（`pst`／`imap`）、`subject`、`sender`、`sent_at`、`sent_at_epoch`、`detail`。檔案寫入後才組回應，所以過長的 `subject`／`sender`／`detail` 依上限截短，並以 `truncated_fields` 記原長度，不會讓已完成的匯出變成錯誤。
 - `mail_draft_reply`（issue `#189`，D-20260924-1）—— 對指定信件建立回信草稿（預設存於 `outbound/mcp-drafts/`），輸出 `draft_id`、完整 envelope、主旨、`fingerprint`（`.eml` bytes SHA-256）與呈審內文。草稿的 From 是 `MAILATTIC_SMTP_ENV_FILE` 寄件設定的帳號；讀不到設定時退回 `self_addresses` 表裡唯一的那一筆，零筆或多筆就拒絕擬稿（[D-20261013-1](decisions/D-20261013-1-mcp-draft-from-follows-smtp-account.md)）。
   - 輸入：`message_id`、`body_text`，選填 `to`、`cc`、`bcc`、`exclude`、`replace_recipients`、`attachments`。不提供 CLI 的 `--allow-archive-anchor`：那是「呼叫者已人工核對收件人」的聲明，CoWork 被信件內容誘導時不該能代為聲明。
   - 輸出包含：`draft_id`、`fingerprint`、`message_id`、`from`、`subject`、`to`、`cc`、`bcc`、`body_text`、`attachments`（含來源 host 路徑與大小），並帶 `response_truncated`：當 `body_text` 龐大時啟動降級階梯縮減內文（保留前後摘要），其餘 metadata 不截斷。**內文一旦被截斷，`fingerprint` 回 `null`**：使用者沒看到全文，就沒有「看過的草稿」可寄；草稿仍留在資料夾，但無法經 `mail_send` 寄出。
