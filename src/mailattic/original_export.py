@@ -1068,8 +1068,8 @@ def _find_imap_rfc822(
                     return rfc822, None
             except Exception:
                 unreadable_count += 1
-        elif rfc822 == b"":
-            unreadable_count += 1
+        # An empty recorded-UID body is left to the Message-ID search below,
+        # as before #67; it is not counted unreadable here.
 
     # 2. Try Message-ID search in the recorded folder
     if not db_msg_id:

@@ -2609,6 +2609,37 @@ def test_imap_message_moved_to_another_folder_exports(tmp_path: Path) -> None:
     assert Path(result.dest_path).read_bytes() == moved_eml
 
 
+def test_imap_recorded_uid_empty_then_full_search_is_not_found(
+    tmp_path: Path,
+) -> None:
+    # The recorded UID is left to the Message-ID search; when that search
+    # reads every folder and finds nothing, the message is really gone.
+    db_path, db_id = _seed_imap_message(
+        tmp_path,
+        folder_name="INBOX",
+        uid=42,
+        message_id="<stale42@mailattic.test>",
+        subject="Stale UID",
+    )
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={42: b""},
+        folders=[
+            ImapFolder("INBOX", "INBOX", "/"),
+            ImapFolder("Archive", "Archive", "/"),
+        ],
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=tmp_path / "exports",
+        imap_client=imap_client,
+    )
+
+    assert result.status == "not_found"
+
+
 def test_imap_other_folder_empty_fetch_fails_not_found(tmp_path: Path) -> None:
     # A SEARCH hit whose FETCH returns no bytes was not read, so the result
     # cannot be not_found (#53 ruling 3).
