@@ -970,14 +970,6 @@ class TestAcceptedSyntaxUnchanged(unittest.TestCase):
 
         self.assertEqual(summary["total_messages"], 1)
 
-    def test_basic_date_form_still_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            _assert_malformed_date_from_rejected(_make_db(tmp), "20260721")
-
-    def test_full_iso8601_timestamp_still_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            _assert_malformed_date_from_rejected(_make_db(tmp), "2026-07-21T12:00:00")
-
     def test_padded_date_still_rejected_not_stripped(self) -> None:
         """A whitespace-padded value must be rejected, exactly as it was
         before ``normalize_optional_date_text`` existed -- contact-history

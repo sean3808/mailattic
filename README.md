@@ -43,7 +43,7 @@ Most email tools for AI agents are live proxies. The agent asks, the server conn
 | Python API | In-process callers | `search_messages`, `SearchFilters`, `get_message` |
 | MCP server `bes-mcp` | Sandboxed assistants that cannot run a host CLI | Six read tools, plus attachment export, original export, reply draft, new-thread draft, and send |
 
-All three run the same query code, so a date filter or a keyword means the same thing in each.
+All three run the same query code, so a date filter or a keyword means the same thing in each. A plain date covers the whole `Asia/Taipei` day (inclusive at both ends), and a naive ISO-8601 timestamp without an offset is interpreted as `Asia/Taipei`, not the machine timezone.
 
 ```python
 from pathlib import Path

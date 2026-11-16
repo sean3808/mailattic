@@ -11,12 +11,11 @@ calls the two ``register_*`` entries; the domain rules stay in ``query.py``,
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import sqlite3
 import sys
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 from .attachment_store import (
@@ -26,12 +25,6 @@ from .attachment_store import (
 )
 from .contact_history import aggregate_contact_history, serialise_summary
 from .contact_history import parse_date_bound as _parse_contact_history_date_bound
-from .datetime_bounds import (
-    coerce_to_taipei_aware,
-    format_invalid_date_message,
-    normalize_optional_date_text,
-    whole_day_bound,
-)
 from .original_export import export_original_message
 from .query import (
     SearchFilters,
@@ -823,8 +816,12 @@ def _handle_contact_history(args: argparse.Namespace) -> int:
         # database: the CLI is the layer that knows its own flag spelling
         # (--date-from / --date-to); aggregate_contact_history's own
         # internal re-parse names its own keyword arguments instead.
-        _parse_contact_history_date_bound(args.date_from, parameter_name="--date-from")
-        _parse_contact_history_date_bound(args.date_to, parameter_name="--date-to")
+        _parse_contact_history_date_bound(
+            args.date_from, parameter_name="--date-from", end_of_day=False
+        )
+        _parse_contact_history_date_bound(
+            args.date_to, parameter_name="--date-to", end_of_day=True
+        )
         summary = aggregate_contact_history(
             database_path=args.database,
             contact=args.contact,
@@ -843,52 +840,24 @@ def _handle_contact_history(args: argparse.Namespace) -> int:
 def _parse_optional_datetime(value: str | None, *, end_of_day: bool) -> datetime | None:
     """Parse a `search` / `attachments` date-or-timestamp bound argument.
 
-    Branches on whether *value* carries a time component, mechanically
-    rather than via a list of blessed spellings (design.md > "Keep every
-    input form every surface already accepts, and define what each one
-    means"): a date-only value -- any form ``date.fromisoformat`` accepts
-    (canonical, basic, or ISO week date) -- becomes the whole Asia/Taipei
-    calendar day via :func:`whole_day_bound`; a full ISO-8601 timestamp is
-    passed through :func:`coerce_to_taipei_aware`, so an offset-aware
-    instant is used as given and a naive one is interpreted as Asia/Taipei.
+    Delegates to :func:`contact_history.parse_date_bound` with
+    ``allow_single_digit=False`` so a date-only value (canonical, basic,
+    or ISO week date) becomes the whole Asia/Taipei calendar day via
+    :func:`whole_day_bound` and a full ISO-8601 timestamp is passed through
+    :func:`coerce_to_taipei_aware` (offset-aware instant used as given,
+    naive instant interpreted as Asia/Taipei).
 
     ``None``, empty, or whitespace-only *value* denotes an unsupplied
-    filter and returns ``None`` -- not an error (design.md > "Reject a
-    malformed date instead of letting it match nothing, and treat a blank
-    value as an absent filter").
-
-    Raises ``ValueError`` naming both *value* and the parameter name --
-    derived from *end_of_day* as ``--to-date`` / ``--from-date``, the
-    fixed pair every call site here always passes -- when *value* is
-    neither a date this surface accepts nor a valid ISO-8601 timestamp.
+    filter and returns ``None``. Raises ``ValueError`` naming both
+    *value* and ``--to-date`` / ``--from-date`` on invalid input.
     """
-    checked = normalize_optional_date_text(value)
-    if checked is None:
-        return None
     parameter_name = "--to-date" if end_of_day else "--from-date"
-    with contextlib.suppress(ValueError):
-        # whole_day_bound receives an already-valid date and cannot raise
-        # ValueError, so this early return is safe inside the suppression.
-        # date.fromisoformat does not tolerate surrounding whitespace, so a
-        # padded value is rejected here exactly as it was before this
-        # helper existed.
-        parsed_date = date.fromisoformat(checked)
-        return whole_day_bound(parsed_date, end_of_day=end_of_day)
-    try:
-        # datetime.fromisoformat likewise rejects surrounding whitespace.
-        parsed_datetime = datetime.fromisoformat(checked)
-    except ValueError as exc:
-        raise ValueError(
-            format_invalid_date_message(
-                value,
-                parameter_name,
-                expected=(
-                    "a YYYY-MM-DD date (canonical, basic, or ISO week form) "
-                    "or an ISO-8601 timestamp"
-                ),
-            )
-        ) from exc
-    return coerce_to_taipei_aware(parsed_datetime)
+    return _parse_contact_history_date_bound(
+        value,
+        parameter_name=parameter_name,
+        end_of_day=end_of_day,
+        allow_single_digit=False,
+    )
 
 
 def _non_negative_int(value: str) -> int:

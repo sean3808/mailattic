@@ -4,7 +4,7 @@
 
 ## 目前能力面
 
-讀取工具六個：`mail_search`（找）／`mail_show`（開單封）／`mail_thread`（看整串）／`mail_contact_history`（歷年往來摘要；封數含 `inbound_count` / `outbound_count` / `unknown_count`，三者相加等於 `total_messages`）／`mail_attachments`（附件 metadata，永不回傳檔案內容）／`mail_sync_status`（同步新鮮度，零參數）。凡輸出 `sent_at` 的讀取工具（`mail_search`、`mail_show`、`mail_thread`、`mail_attachments` 及其 `carrying_messages`）對不帶時差的 `sent_at` 補上 `+00:00`（原帶時差者原樣保留），並附帶整數秒 `sent_at_epoch`（缺失或無法解析時為 `null`）。
+讀取工具六個：`mail_search`（找）／`mail_show`（開單封）／`mail_thread`（看整串）／`mail_contact_history`（歷年往來摘要；封數含 `inbound_count` / `outbound_count` / `unknown_count`，三者相加等於 `total_messages`）／`mail_attachments`（附件 metadata，永不回傳檔案內容）／`mail_sync_status`（同步新鮮度，零參數）。`mail_search`（`from_date` / `to_date`）與 `mail_contact_history`（`date_from` / `date_to`）的日期篩選皆與 `bes search` 一致：純日期（含 `YYYY-MM-DD`、`20260721`、`2026-W30-2`，`mail_contact_history` 另保留 `2026-7-1`）代表 `Asia/Taipei` 該日整天（兩端皆含），也接受帶時差或 `Z` 的 ISO-8601 timestamp；**不帶時差的 timestamp 一律視為 `Asia/Taipei`，而非機器所在時區**。凡輸出 `sent_at` 的讀取工具（`mail_search`、`mail_show`、`mail_thread`、`mail_attachments` 及其 `carrying_messages`）對不帶時差的 `sent_at` 補上 `+00:00`（原帶時差者原樣保留），並附帶整數秒 `sent_at_epoch`（缺失或無法解析時為 `null`）。
 
 寫入工具五個：
 - `mail_attachment_export`（issue `#28`，D-20260730-1 第 4 步 write tier）—— 把 CAS 已存的附件複製到呼叫端指定的 **host 絕對路徑**，回傳每筆落地後的絕對路徑，不回檔案內容。

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 from collections.abc import Callable, Sequence
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, TypedDict, cast
 
@@ -267,7 +267,9 @@ _MAIL_ATTACHMENTS_FILTER_HINT = (
 _KEYWORD_SYNTAX_HINT = (
     "Accepted syntax: uppercase AND / OR / NOT, parentheses, and double-quoted phrases."
 )
-_ISO_DATE_ONLY_EXPECTED = "a YYYY-MM-DD date (canonical, basic, or ISO week form)"
+_ISO_DATE_OR_DATETIME_EXPECTED = (
+    "a YYYY-MM-DD date (canonical, basic, or ISO week form) or an ISO-8601 timestamp"
+)
 
 # ---------------------------------------------------------------------------
 # Over-budget refusals (spec: "An over-budget refusal offers a correction
@@ -440,21 +442,31 @@ def _mail_contact_history_over_budget_error(
     form 2/3 boundary rule). Never names a record either way -- the
     summary's scalars are an aggregate over the matched set, not a row.
     """
-    parsed_from = parse_date_bound(date_from, parameter_name="date_from")
-    parsed_to = parse_date_bound(date_to, parameter_name="date_to")
-    if parsed_from is not None and parsed_to is not None and parsed_from == parsed_to:
-        return build_tool_error(
-            ValueError,
-            "mail_contact_history result exceeds the delivery budget of {budget} "
-            "characters even after reducing the contacts and attachments lists "
-            "to their minimum. date_from and date_to already name a single day "
-            "({day}), the narrowest range this tool "
-            "accepts, so the required summary payload alone exceeds the "
-            "budget. There is no further reduction available and no in-bridge "
-            "fallback.",
-            budget=MCP_RESPONSE_BUDGET_CHARS,
-            day=parsed_from.isoformat(),
-        )
+    parsed_from = parse_date_bound(
+        date_from, parameter_name="date_from", end_of_day=False
+    )
+    parsed_to = parse_date_bound(date_to, parameter_name="date_to", end_of_day=True)
+    if parsed_from is not None and parsed_to is not None:
+        single_day_label: str | None = None
+        if parsed_from == parsed_to:
+            single_day_label = parsed_from.isoformat()
+        elif parsed_from == whole_day_bound(
+            parsed_from.date(), end_of_day=False
+        ) and parsed_to == whole_day_bound(parsed_from.date(), end_of_day=True):
+            single_day_label = parsed_from.date().isoformat()
+        if single_day_label is not None:
+            return build_tool_error(
+                ValueError,
+                "mail_contact_history result exceeds the delivery budget of {budget} "
+                "characters even after reducing the contacts and attachments lists "
+                "to their minimum. date_from and date_to already name a single day "
+                "({day}), the narrowest range this tool "
+                "accepts, so the required summary payload alone exceeds the "
+                "budget. There is no further reduction available and no in-bridge "
+                "fallback.",
+                budget=MCP_RESPONSE_BUDGET_CHARS,
+                day=single_day_label,
+            )
     return build_tool_error(
         ValueError,
         "mail_contact_history result exceeds the delivery budget of {budget} "
@@ -1366,12 +1378,13 @@ def _normalize_text_filter(value: str | None) -> str | None:
 def _normalize_day_bound(value: str | None, *, end_of_day: bool) -> datetime | None:
     """Parse a `mail_search` `from_date` / `to_date` bound.
 
-    Uses this tool's own existing parser (`date.fromisoformat`), unchanged
-    in what it accepts -- including the basic-date and ISO-week-date forms
-    `20260721` and `2026-W30-2` it has always taken (design.md > "Move the
-    MCP tool onto the shared bound builder without changing what it
-    does"). The resulting date is handed to the shared, parse-free
-    :func:`whole_day_bound` instead of a private Asia/Taipei construction.
+    Uses the same ISO-8601 date-or-timestamp rules as the CLI search
+    parser (via :func:`parse_date_bound` with ``allow_single_digit=False``), after
+    stripping surrounding whitespace as ``mail_search`` has always done:
+    date-only forms (canonical, basic ``20260721``, or ISO week
+    ``2026-W30-2``) become the whole Asia/Taipei calendar day via
+    :func:`whole_day_bound`; ISO-8601 timestamps preserve an explicit UTC
+    offset or interpret naive readings as Asia/Taipei.
 
     ``None``, empty, or whitespace-only *value* means the filter was not
     supplied and returns ``None`` -- not an error, unchanged from today.
@@ -1382,8 +1395,14 @@ def _normalize_day_bound(value: str | None, *, end_of_day: bool) -> datetime | N
     # This tool strips before parsing on its own -- unchanged from before
     # the shared helper existed; the shared helper no longer does this.
     stripped = checked.strip()
+    param_name = "to_date" if end_of_day else "from_date"
     try:
-        parsed = date.fromisoformat(stripped)
+        return parse_date_bound(
+            stripped,
+            parameter_name=param_name,
+            end_of_day=end_of_day,
+            allow_single_digit=False,
+        )
     except ValueError as exc:
         # The formatter is shared with the CLI, so the date value remains a
         # builder fragment here; the delivery builder caps it before filling
@@ -1395,15 +1414,13 @@ def _normalize_day_bound(value: str | None, *, end_of_day: bool) -> datetime | N
         # accepted: the alternatives are restructuring the CLI-shared
         # datetime_bounds formatter or duplicating its wording here. Upgrade
         # path: return structured fields from it, then cap the value alone.
-        param_name = "to_date" if end_of_day else "from_date"
         raise build_tool_error(
             ValueError,
             format_invalid_date_message(
-                "{date_value}", param_name, expected=_ISO_DATE_ONLY_EXPECTED
+                "{date_value}", param_name, expected=_ISO_DATE_OR_DATETIME_EXPECTED
             ),
             date_value=value,
         ) from exc
-    return whole_day_bound(parsed, end_of_day=end_of_day)
 
 
 def _build_filters(
