@@ -170,13 +170,14 @@ def test_analyze_produces_all_three_reports_and_summary(tmp_path: Path) -> None:
         "src/mailattic/alpha.py",
         "src/mailattic/beta.py",
     ]
+    assert mapping["schema_version"] == 2
     assert mapping["source_to_test_files"]["src/mailattic/alpha.py"] == [
-        "tests/test_alpha.py",
-        "tests/test_subset.py",
+        {"test_file": "tests/test_alpha.py", "source": "dynamic"},
+        {"test_file": "tests/test_subset.py", "source": "dynamic"},
     ]
     assert mapping["source_to_test_files"]["src/mailattic/beta.py"] == [
-        "tests/test_alpha.py",
-        "tests/test_beta.py",
+        {"test_file": "tests/test_alpha.py", "source": "dynamic"},
+        {"test_file": "tests/test_beta.py", "source": "dynamic"},
     ]
 
     audit = json.loads((out_dir / "audit-candidates.json").read_text(encoding="utf-8"))
@@ -304,7 +305,7 @@ def test_parametrize_id_backslashes_survive_the_join(tmp_path: Path) -> None:
         (tmp_path / "reports" / "source-to-tests.json").read_text(encoding="utf-8")
     )
     assert mapping["source_to_test_files"]["src/mailattic/alpha.py"] == [
-        "tests/test_alpha.py"
+        {"test_file": "tests/test_alpha.py", "source": "dynamic"}
     ]
 
 
@@ -516,3 +517,174 @@ def test_identical_tests_produce_linear_output_and_truncate_supersets(
     assert base_group["members"] == ["tests/test_trunc.py::test_base"]
     assert base_group["superset_count"] == superset_n
     assert len(base_group["superset_tests"]) == audit_trunc["max_superset_groups"]
+
+
+def test_collect_static_source_to_tests_synthetic_repo(tmp_path: Path) -> None:
+    scripts_dir = str(REPO_ROOT / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import static_test_imports
+
+    repo = tmp_path / "repo"
+    pkg = repo / "src" / "mailattic"
+    pkg.mkdir(parents=True)
+    tests_dir = repo / "tests"
+    sub_dir = tests_dir / "sub"
+    sub_dir.mkdir(parents=True)
+
+    # Package with a -> b -> c via relative imports, plus x imported as submodule,
+    # plus isolated module unused.py.
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "a.py").write_text("from .b import fn_b\n", encoding="utf-8")
+    (pkg / "b.py").write_text("from . import c\n", encoding="utf-8")
+    (pkg / "c.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (pkg / "x.py").write_text("X = 2\n", encoding="utf-8")
+    (pkg / "fn_only.py").write_text("FN = 3\n", encoding="utf-8")
+    (pkg / "type_only.py").write_text("T = 4\n", encoding="utf-8")
+    (pkg / "unused.py").write_text("U = 5\n", encoding="utf-8")
+
+    # Root conftest imports mailattic.x (submodule via `from mailattic import x`)
+    (tests_dir / "conftest.py").write_text(
+        "from mailattic import x\n", encoding="utf-8"
+    )
+    # Helper module in tests/
+    (tests_dir / "_helpers.py").write_text(
+        "from mailattic import a\n", encoding="utf-8"
+    )
+    # Subdirectory conftest imports fn_only inside a fixture/function body
+    (sub_dir / "conftest.py").write_text(
+        "def make_thing():\n"
+        "    import mailattic.fn_only\n"
+        "    return mailattic.fn_only\n",
+        encoding="utf-8",
+    )
+
+    # Test at root: uses helper + TYPE_CHECKING-only import (excluded)
+    (tests_dir / "test_root.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    import mailattic.type_only\n"
+        "from tests import _helpers\n"
+        "def test_ok():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    # Test in sub/: inherits both tests/conftest.py and tests/sub/conftest.py
+    (sub_dir / "test_nested.py").write_text(
+        "def test_nested():\n    pass\n", encoding="utf-8"
+    )
+
+    data = static_test_imports.collect_static_source_to_tests(repo)
+
+    assert data.all_test_files == [
+        "tests/sub/test_nested.py",
+        "tests/test_root.py",
+    ]
+    assert data.all_src_files == [
+        "src/mailattic/__init__.py",
+        "src/mailattic/a.py",
+        "src/mailattic/b.py",
+        "src/mailattic/c.py",
+        "src/mailattic/fn_only.py",
+        "src/mailattic/type_only.py",
+        "src/mailattic/unused.py",
+        "src/mailattic/x.py",
+    ]
+    assert data.src_to_test_files == {
+        "src/mailattic/__init__.py": {
+            "tests/sub/test_nested.py",
+            "tests/test_root.py",
+        },
+        "src/mailattic/a.py": {"tests/test_root.py"},
+        "src/mailattic/b.py": {"tests/test_root.py"},
+        "src/mailattic/c.py": {"tests/test_root.py"},
+        "src/mailattic/fn_only.py": {"tests/sub/test_nested.py"},
+        "src/mailattic/x.py": {
+            "tests/sub/test_nested.py",
+            "tests/test_root.py",
+        },
+    }
+
+
+def test_source_to_tests_union_tags_unmeasured_src_and_summary_stats(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    pkg = repo / "src" / "mailattic"
+    pkg.mkdir(parents=True)
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(parents=True)
+
+    alpha = pkg / "alpha.py"
+    beta = pkg / "beta.py"
+    gamma = pkg / "gamma.py"  # Not measured in coverage DB at all
+    alpha.write_text("x = 1\n", encoding="utf-8")
+    beta.write_text("y = 2\n", encoding="utf-8")
+    gamma.write_text("z = 3\n", encoding="utf-8")
+
+    # test_dyn: dynamic only for alpha (no static import of alpha)
+    # test_both: both dynamic and static import for alpha; static only for gamma
+    # test_imp: static import only for alpha
+    (tests_dir / "test_dyn.py").write_text("", encoding="utf-8")
+    (tests_dir / "test_both.py").write_text(
+        "import mailattic.alpha\nimport mailattic.gamma\n", encoding="utf-8"
+    )
+    (tests_dir / "test_imp.py").write_text(
+        "from mailattic import alpha\n", encoding="utf-8"
+    )
+
+    junit_xml = tmp_path / "junit.xml"
+    _write_junit_xml(
+        junit_xml,
+        [
+            ("tests.test_dyn", "test_d", 0.2, "passed"),
+            ("tests.test_both", "test_b", 0.3, "passed"),
+            ("tests.test_imp", "test_i", 0.1, "passed"),
+        ],
+    )
+
+    cov_db = tmp_path / ".coverage"
+    _build_coverage_db(
+        cov_db,
+        lines_by_context={
+            "tests/test_dyn.py::test_d|run": {str(alpha): [1]},
+            "tests/test_both.py::test_b|run": {str(alpha): [1], str(beta): [1]},
+        },
+    )
+
+    out_dir = tmp_path / "reports"
+    result = _run_analyzer(junit_xml, cov_db, out_dir, repo_root=repo)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    mapping = json.loads((out_dir / "source-to-tests.json").read_text(encoding="utf-8"))
+    assert mapping["schema_version"] == 2
+    assert mapping["source_file_count"] == 3
+    assert mapping["covered_source_file_count"] == 3
+    assert mapping["mapped_test_file_count"] == 3
+    assert mapping["unreferenced_source_files"] == []
+    assert mapping["source_to_test_files"] == {
+        "src/mailattic/alpha.py": [
+            {"test_file": "tests/test_both.py", "source": "both"},
+            {"test_file": "tests/test_dyn.py", "source": "dynamic"},
+            {"test_file": "tests/test_imp.py", "source": "import"},
+        ],
+        "src/mailattic/beta.py": [
+            {"test_file": "tests/test_both.py", "source": "dynamic"},
+        ],
+        "src/mailattic/gamma.py": [
+            {"test_file": "tests/test_both.py", "source": "import"},
+        ],
+    }
+
+    # Counts per src file:
+    # dynamic-only: alpha=2, beta=1, gamma=0 -> avg 1.00, median 1.0
+    # import-only:  alpha=2, beta=0, gamma=1 -> avg 1.00, median 1.0
+    # union:        alpha=3, beta=1, gamma=1 -> avg 1.67, median 1.0
+    # share of all 3 test files: 1.67 / 3 = 55.6%
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "Dynamic-only test files per source file: avg 1.00, median 1.0" in summary
+    assert "Import-only test files per source file: avg 1.00, median 1.0" in summary
+    assert (
+        "Union test files per source file: avg 1.67, median 1.0 (55.6% of 3 test files)"
+        in summary
+    )

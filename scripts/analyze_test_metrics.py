@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import coverage
+from static_test_imports import StaticImportData, collect_static_source_to_tests
 
 
 @dataclass(frozen=True)
@@ -340,10 +342,15 @@ def check_nodeid_join(
 def build_reports(
     cases: list[TestCaseTiming],
     cov_ctx: CoverageContextData,
+    static_imports: StaticImportData | None = None,
     *,
     top_n: int,
 ) -> tuple[dict[str, object], dict[str, object], dict[str, object], str]:
     """Assemble the three JSON reports and Markdown summary."""
+    if static_imports is None:
+        static_imports = StaticImportData(
+            src_to_test_files={}, all_src_files=[], all_test_files=[]
+        )
     # 1. Durations
     sorted_tests = sorted(cases, key=lambda c: (-c.duration_seconds, c.nodeid))
     by_test_file: dict[str, _TestFileStats] = {}
@@ -424,24 +431,43 @@ def build_reports(
         "all_source_modules": sorted_source_modules,
     }
 
-    # 2. Source-to-tests mapping
-    mapping_dict = {
-        src: sorted(cov_ctx.src_to_test_files.get(src, set()))
-        for src in cov_ctx.all_src_files
-    }
-    unreferenced_sources = [src for src, tests in mapping_dict.items() if not tests]
+    # 2. Source-to-tests mapping (union of dynamic coverage + static AST imports)
+    mapping_src_files = sorted(
+        set(cov_ctx.all_src_files) | set(static_imports.all_src_files)
+    )
+    mapping_dict: dict[str, list[dict[str, str]]] = {}
+    dyn_counts: list[int] = []
+    imp_counts: list[int] = []
+    union_counts: list[int] = []
+    for src in mapping_src_files:
+        dyn_tests = cov_ctx.src_to_test_files.get(src, set())
+        imp_tests = static_imports.src_to_test_files.get(src, set())
+        entries: list[dict[str, str]] = []
+        for tf in sorted(dyn_tests | imp_tests):
+            if tf in dyn_tests and tf in imp_tests:
+                origin = "both"
+            elif tf in dyn_tests:
+                origin = "dynamic"
+            else:
+                origin = "import"
+            entries.append({"test_file": tf, "source": origin})
+        mapping_dict[src] = entries
+        dyn_counts.append(len(dyn_tests))
+        imp_counts.append(len(imp_tests))
+        union_counts.append(len(entries))
+
+    unreferenced_sources = [src for src, entries in mapping_dict.items() if not entries]
     all_mapped_test_files = sorted(
-        {tf for tests in mapping_dict.values() for tf in tests}
+        {entry["test_file"] for entries in mapping_dict.values() for entry in entries}
     )
     mapping_report = {
-        "schema_version": 1,
-        "source_file_count": len(cov_ctx.all_src_files),
-        "covered_source_file_count": len(cov_ctx.all_src_files)
-        - len(unreferenced_sources),
+        "schema_version": 2,
+        "source_file_count": len(mapping_src_files),
+        "covered_source_file_count": len(mapping_src_files) - len(unreferenced_sources),
         "mapped_test_file_count": len(all_mapped_test_files),
         "unreferenced_source_files": unreferenced_sources,
-        # Import-time lines carry no test context: tests depending on these
-        # files only through import are missing from source_to_test_files.
+        # Import-time lines carry no test context: dynamic coverage alone misses
+        # tests that depend on these files only through import.
         "source_files_with_uncontexted_lines": (
             cov_ctx.src_files_with_uncontexted_lines
         ),
@@ -530,6 +556,15 @@ def build_reports(
             f"{mod['touching_test_count']} | `{mod['source_file']}` |"
         )
 
+    dyn_avg = statistics.mean(dyn_counts) if dyn_counts else 0.0
+    dyn_median = statistics.median(dyn_counts) if dyn_counts else 0.0
+    imp_avg = statistics.mean(imp_counts) if imp_counts else 0.0
+    imp_median = statistics.median(imp_counts) if imp_counts else 0.0
+    union_avg = statistics.mean(union_counts) if union_counts else 0.0
+    union_median = statistics.median(union_counts) if union_counts else 0.0
+    total_test_files = len(set(static_imports.all_test_files) | set(by_test_file))
+    union_share = (union_avg / total_test_files) if total_test_files else 0.0
+
     md_lines.extend(
         [
             "",
@@ -540,6 +575,13 @@ def build_reports(
             f"{mapping_report['covered_source_file_count']}",
             "- Distinct test files referenced: "
             f"{mapping_report['mapped_test_file_count']}",
+            f"- Dynamic-only test files per source file: avg {dyn_avg:.2f}, "
+            f"median {dyn_median:.1f}",
+            f"- Import-only test files per source file: avg {imp_avg:.2f}, "
+            f"median {imp_median:.1f}",
+            f"- Union test files per source file: avg {union_avg:.2f}, "
+            f"median {union_median:.1f} "
+            f"({union_share:.1%} of {total_test_files} test files)",
             "",
             "## Audit Candidates (Subset Coverage)",
             "",
@@ -598,10 +640,12 @@ def main(argv: list[str] | None = None) -> int:
     failed = check_failed_tests(cases)
     cov_ctx = load_coverage_contexts(args.coverage_db, repo_root)
     unjoined = check_nodeid_join(cases, cov_ctx)
+    static_imports = collect_static_source_to_tests(repo_root)
 
     durations_report, mapping_report, audit_report, summary_md = build_reports(
         cases,
         cov_ctx,
+        static_imports,
         top_n=args.top_n,
     )
     durations_report["coverage_nodeids_missing_from_junit"] = unjoined
