@@ -245,7 +245,6 @@ def _find_subset_candidates(
     masks: dict[str, int],
     *,
     superset_list_name: str,
-    max_supersets: int = MAX_SUPERSET_GROUPS,
 ) -> list[dict[str, object]]:
     """Group identical non-empty bitmasks, then find subset/equal-group candidates."""
     groups_by_mask: dict[int, list[str]] = defaultdict(list)
@@ -284,7 +283,7 @@ def _find_subset_candidates(
                     "member_count": len(members_a),
                     "members": members_a,
                     "superset_count": len(supersets),
-                    superset_list_name: supersets[:max_supersets],
+                    superset_list_name: supersets[:MAX_SUPERSET_GROUPS],
                 }
             )
 
