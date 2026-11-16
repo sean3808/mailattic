@@ -65,7 +65,6 @@ from .models import (
     NormalizedMessage,
 )
 from .mutf7 import encode_mutf7
-from .outlook_pst import require_taipei_machine_timezone
 from .parser import strip_table_fidelity_warnings, subject_from_raw_headers
 from .query import (
     RecipientFamiliarity,
@@ -666,7 +665,6 @@ def build_quoted_reply_bodies(
             if dt.tzinfo is None:
                 # Stored timestamps without an offset mean UTC (D-20260723-1).
                 dt = dt.replace(tzinfo=UTC)
-            require_taipei_machine_timezone()
             sent_val = _outlook_sent_format(dt.astimezone(TAIPEI))
         except (ValueError, TypeError):
             sent_val = str(sent_at_raw)

@@ -66,32 +66,28 @@ def test_verify_outlook_item_rejects_non_taipei_machine_offset(
         _verify_outlook_item(_sample_outlook_item(), _sample_message_without_id())
 
 
-def test_build_quoted_reply_bodies_succeeds_when_machine_offset_is_utc_plus_8(
+@pytest.mark.parametrize(
+    "simulated_offset",
+    [timedelta(hours=9), timedelta(0)],
+)
+def test_build_quoted_reply_bodies_renders_taipei_time_regardless_of_machine_offset(
     monkeypatch: pytest.MonkeyPatch,
+    simulated_offset: timedelta,
 ) -> None:
     monkeypatch.setattr(
         outlook_pst, "get_machine_utc_offset", lambda: timedelta(hours=8)
     )
-    plain_body, html_body = build_quoted_reply_bodies(
+    taipei_plain, taipei_html = build_quoted_reply_bodies(
         _sample_original_for_reply(),
         "Reply text",
     )
-    assert "Sent:" in plain_body
-    assert "Reply text" in html_body
 
-
-@pytest.mark.parametrize(
-    ("simulated_offset", "expected_label"),
-    [
-        (timedelta(hours=9), "UTC+09:00"),
-        (timedelta(0), "UTC+00:00"),
-    ],
-)
-def test_build_quoted_reply_bodies_rejects_non_taipei_machine_offset(
-    monkeypatch: pytest.MonkeyPatch,
-    simulated_offset: timedelta,
-    expected_label: str,
-) -> None:
     monkeypatch.setattr(outlook_pst, "get_machine_utc_offset", lambda: simulated_offset)
-    with pytest.raises(RuntimeError, match=expected_label.replace("+", r"\+")):
-        build_quoted_reply_bodies(_sample_original_for_reply(), "Reply text")
+    other_plain, other_html = build_quoted_reply_bodies(
+        _sample_original_for_reply(),
+        "Reply text",
+    )
+
+    assert "Sent:" in other_plain
+    assert other_plain == taipei_plain
+    assert other_html == taipei_html
