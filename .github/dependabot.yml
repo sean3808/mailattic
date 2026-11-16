@@ -17,6 +17,10 @@ updates:
       interval: "monthly"
     labels:
       - "dependencies"
+    # #113: charset-normalizer 3.5.x misdetects short Big5 as shift_jis; pyproject caps it.
+    ignore:
+      - dependency-name: "charset-normalizer"
+        versions: [">=3.5"]
     groups:
       uv:
         patterns:

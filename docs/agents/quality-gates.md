@@ -637,19 +637,30 @@ then runs `scripts/analyze_test_metrics.py` to produce the artifact
   `proportional_duration_seconds`, `touching_test_count`,
   `touching_test_file_count`), plus the full lists `all_tests` (every test,
   same fields as `top_tests`), `all_test_files` and `all_source_modules`.
-- `source-to-tests.json`: `source_to_test_files` mapping each `src/` file to
-  the sorted list of covering test files, plus `source_file_count`,
-  `covered_source_file_count`, `mapped_test_file_count`,
-  `unreferenced_source_files`, and `source_files_with_uncontexted_lines`.
-  **Known gap**: lines that run at import or collection time carry no test
-  context, so a test that depends on a module only by importing it is missing
-  from that module's list. When selecting affected tests from this map, treat a
-  change to a file listed in `source_files_with_uncontexted_lines` that touches
-  module-level code (imports, constants, decorators, class bodies) as affecting
-  every test, not only the mapped ones.
-- `audit-candidates.json`: `test_file_candidates` (test files whose covered
-  `src/` line set is a non-empty subset of another test file's),
-  `single_test_candidates` (single-test subset precision), and
+- `source-to-tests.json` (`schema_version: 2`): `source_to_test_files` mapping
+  each `src/` file (including unmeasured `src/mailattic/*.py` files) to the
+  sorted list of `{"test_file": ..., "source": "dynamic" | "import" | "both"}`
+  entries formed by unioning per-test coverage contexts (`dynamic`) with
+  transitive stdlib `ast` imports from `tests/` and applicable `conftest.py`
+  files (`import`), plus `source_file_count`, `covered_source_file_count`,
+  `mapped_test_file_count`, `unreferenced_source_files`, and
+  `source_files_with_uncontexted_lines`.
+  **Known gap**: static AST scanning now covers direct and transitive
+  intra-repo imports (including `conftest.py` and `tests/` helpers, excluding
+  `if TYPE_CHECKING:` blocks), so tests that depend on a module only at import
+  or collection time or via a shared fixture are included. It still does not
+  cover dynamic `importlib` imports or subprocess-invoked CLI commands when no
+  coverage context or static import links them; when selecting affected tests,
+  changes to `source_files_with_uncontexted_lines` module-level code can still
+  affect tests that invoke the CLI only via subprocess without importing
+  `mailattic`.
+- `audit-candidates.json` (`schema_version: 2`): `test_file_candidates` and
+  `single_test_candidates` group entries with identical non-empty `src/`
+  covered-line bitmasks once per group (`members`, `member_count`,
+  `covered_line_count`, `superset_count`, and `superset_test_files` /
+  `superset_tests` truncated to `max_superset_groups`), plus
+  `test_file_candidate_group_count`, `test_file_candidate_count`,
+  `single_test_candidate_group_count`, `single_test_candidate_count`, and
   `zero_src_coverage_test_files` (excluded from subset candidacy).
 - `summary.md`: human-readable Markdown summary of all three reports.
 
@@ -666,7 +677,8 @@ Limits to keep in mind when reading the reports:
   and the attribution can shift between runs.
 - **A subset candidate is not a deletion candidate.** Coverage compares executed
   lines only, not inputs, assertions or the promise a test guards; tests with
-  identical coverage list each other. Each removal still needs its own ticket.
+  identical coverage are grouped together. Each removal still needs its own
+  ticket.
 - **Per-test contexts need the CTracer core.** With coverage 7.15 on Python
   3.13 the default core is CTracer. On Python 3.14+ coverage defaults to the
   `sysmon` core, which drops dynamic contexts (coverage warning

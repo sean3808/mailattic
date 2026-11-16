@@ -9,7 +9,7 @@
 - **Interfaces**: CLI `bes` (subcommands print JSON) + Python API. The cross-project hub is the **`mailattic` skill** (dev-canonical in this repo's `skills/`; the SSOT is the downstream release copy), not bare `bes` calls.
 - **CoWork**: the sandbox cannot run a host CLI, so an MCP server reaches it through the Claude Desktop bridge (six read tools, five write tools) → [`docs/mcp-server-contract.md`](docs/mcp-server-contract.md). Whether the sandbox can see the DB and CAS directory depends on per-session mounts, so it is not an interface (`#28` §1 / §2.2); host subagents are unaffected.
 - **Dual-track**: Outlook handles daily send and receive (the human interface); this DB handles long-term accumulation. The two coexist through the message-id dedup gate.
-- **This repo is the public home** (`sean3808/mailattic`, [D-20261010-1](docs/decisions/D-20261010-1-showcase-ships-ahead-of-remoteization-in-a-fresh-repo.md)): daily development and issues happen here. The earlier private repo is frozen as an archive; its commit history and original threads were not carried over, so an unlinked `#NNN` in the docs is usually a private-era ticket that cannot be looked up here. Issues, PRs, and commits carry placeholders only: no real mail content, real domains, or real addresses (the pre-commit check blocks them). Debugging that needs real mail as evidence keeps that evidence on the local machine.
+- **This repo is the public home** (`sean3808/mailattic`, [D-20261010-1](docs/decisions/D-20261010-1-showcase-ships-ahead-of-remoteization-in-a-fresh-repo.md)): daily development and issues happen here. The earlier private repo is frozen as an archive; its commit history and original threads were not carried over, so an unlinked `#NNN` in the docs is usually a private-era ticket that cannot be looked up here. Issues, PRs, and commits carry placeholders only: no real mail content, real domains, or real addresses (the pre-commit check blocks them). This includes mailbox folder names and PST file names, which often carry customer or vendor names and real addresses; dispatch briefs that ask a Worker to report on real mail list these fields as forbidden too. Debugging that needs real mail as evidence keeps that evidence on the local machine.
 - **The human-facing front page** is [`README.md`](README.md) (English first; [`README.zh-TW.md`](README.zh-TW.md) is the Traditional Chinese edition, and the two change together). This file is the rules for agents.
 
 **Out of scope**: enterprise mail server / eDiscovery / GUI client / push notifications / semantic vector search (FTS5 keyword only) / attachment OCR / task tracking (chasing commitments belongs to a task tool, [D-20260603-1](docs/decisions/D-20260603-1-no-task-or-commitment-tracking.md)) / a product for third parties to import their own mailboxes (open source here is a showcase; no cross-platform cost is paid for hypothetical users, [D-20260813-2](docs/decisions/D-20260813-2-open-source-is-showcase-not-product.md)). A request that lands on this list gets reported before any work starts.
@@ -33,7 +33,7 @@ uv run --locked --exact pyright            # scans only mcp_server.py / mcp_deli
 
 Choosing a route, and the canonical deptry / pip-audit commands with their exit-code meanings → [`docs/agents/quality-gates.md`](docs/agents/quality-gates.md). **A non-zero gate is not a found defect by itself**: the gate may have failed to run. Read the output.
 
-The production DB `mailattic.db` (repo root, several GB) is the **default target** of every entry point. Prototypes, experiments, and one-off scripts always pass an explicit `--database` pointing at a scratch path. Backup snapshots live in `backups/`.
+The production DB `mailattic.db` (several GB) is the **default target** of every entry point. It is **not** in this repo's root: every entry point resolves it as `--database` > `MAILATTIC_DB` > the hard-coded absolute default (`DEFAULT_DB_NAME` in `storage.py`, `DEFAULT_DATABASE_PATH` in `imap_sync.py`), which points outside this repo. To find it, read `MAILATTIC_DB` and those two constants; never assume a path. Prototypes, experiments, and one-off scripts always pass an explicit `--database` pointing at a scratch path. Backup snapshots live in a `backups/` directory next to the DB file.
 
 ## Architecture map (`src/mailattic/`)
 
@@ -163,7 +163,7 @@ Global install, DB path resolution, the daily schedule, the scratch maildir, the
 
 - **Tagging never rebuilds**: `release.ps1` builds first, and only then does the guard let the tag through.
 - **The global `bes` is a build snapshot**: `uv run bes` in the repo runs the working tree, while other projects' subagents run the last released wheel; a cross-project change takes effect only after a release. The MCP server uses `uv run --project` and follows the working tree; restarting Claude Desktop picks it up.
-- **When query results look wrong, first confirm which DB was hit**: `--database` flag > `MAILATTIC_DB` > the hard-coded absolute default pointing at the repo root.
+- **When query results look wrong, first confirm which DB was hit**: `--database` flag > `MAILATTIC_DB` > the hard-coded absolute default in `storage.py` / `imap_sync.py` (outside this repo, not its root).
 
 ## Where to look first
 
