@@ -696,7 +696,6 @@ def _com_wall_clock_to_aware(value: Any) -> datetime | None:
     """
     if value is None:
         return None
-    require_taipei_machine_timezone()
     return datetime(
         value.year,
         value.month,
