@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import coverage
+from static_test_imports import StaticImportData, collect_static_source_to_tests
 
 
 @dataclass(frozen=True)
@@ -238,51 +240,56 @@ def load_coverage_contexts(coverage_db: Path, repo_root: Path) -> CoverageContex
     )
 
 
+MAX_SUPERSET_GROUPS = 10
+
+
 def _find_subset_candidates(
     masks: dict[str, int],
     *,
-    key_name: str,
     superset_list_name: str,
-    extra_fn=None,
 ) -> list[dict[str, object]]:
-    """Find entries whose non-empty bitmask is a subset of at least one other entry."""
-    items = [
-        (name, mask, mask.bit_count()) for name, mask in masks.items() if mask != 0
+    """Group identical non-empty bitmasks, then find subset/equal-group candidates."""
+    groups_by_mask: dict[int, list[str]] = defaultdict(list)
+    for name, mask in masks.items():
+        if mask != 0:
+            groups_by_mask[mask].append(name)
+
+    groups = [
+        (mask, mask.bit_count(), sorted(names))
+        for mask, names in groups_by_mask.items()
     ]
-    items.sort(key=lambda item: (item[2], item[0]))
+    groups.sort(key=lambda g: (g[1], g[2][0]))
 
     candidates: list[dict[str, object]] = []
-    for i, (name_a, mask_a, count_a) in enumerate(items):
+    for i, (mask_a, count_a, members_a) in enumerate(groups):
         supersets: list[dict[str, object]] = []
-        for j in range(len(items)):
-            if i == j:
-                continue
-            name_b, mask_b, count_b = items[j]
-            if count_b < count_a:
+        for j in range(i + 1, len(groups)):
+            mask_b, count_b, members_b = groups[j]
+            if count_b <= count_a:
                 continue
             if (mask_a & mask_b) == mask_a:
-                superset_entry: dict[str, object] = {
-                    key_name: name_b,
-                    "covered_line_count": count_b,
-                    "equal": count_a == count_b,
-                }
-                if extra_fn is not None:
-                    superset_entry.update(extra_fn(name_b))
-                supersets.append(superset_entry)
-        if supersets:
+                supersets.append(
+                    {
+                        "members": members_b,
+                        "member_count": len(members_b),
+                        "covered_line_count": count_b,
+                    }
+                )
+        if len(members_a) >= 2 or supersets:
             supersets.sort(
-                key=lambda s: (-int(s["covered_line_count"]), str(s[key_name]))
+                key=lambda s: (-int(s["covered_line_count"]), str(s["members"][0]))
             )
-            entry: dict[str, object] = {
-                key_name: name_a,
-                "covered_line_count": count_a,
-                superset_list_name: supersets,
-            }
-            if extra_fn is not None:
-                entry.update(extra_fn(name_a))
-            candidates.append(entry)
+            candidates.append(
+                {
+                    "covered_line_count": count_a,
+                    "member_count": len(members_a),
+                    "members": members_a,
+                    "superset_count": len(supersets),
+                    superset_list_name: supersets[:MAX_SUPERSET_GROUPS],
+                }
+            )
 
-    candidates.sort(key=lambda c: (int(c["covered_line_count"]), str(c[key_name])))
+    candidates.sort(key=lambda c: (int(c["covered_line_count"]), str(c["members"][0])))
     return candidates
 
 
@@ -335,10 +342,15 @@ def check_nodeid_join(
 def build_reports(
     cases: list[TestCaseTiming],
     cov_ctx: CoverageContextData,
+    static_imports: StaticImportData | None = None,
     *,
     top_n: int,
 ) -> tuple[dict[str, object], dict[str, object], dict[str, object], str]:
     """Assemble the three JSON reports and Markdown summary."""
+    if static_imports is None:
+        static_imports = StaticImportData(
+            src_to_test_files={}, all_src_files=[], all_test_files=[]
+        )
     # 1. Durations
     sorted_tests = sorted(cases, key=lambda c: (-c.duration_seconds, c.nodeid))
     by_test_file: dict[str, _TestFileStats] = {}
@@ -419,24 +431,43 @@ def build_reports(
         "all_source_modules": sorted_source_modules,
     }
 
-    # 2. Source-to-tests mapping
-    mapping_dict = {
-        src: sorted(cov_ctx.src_to_test_files.get(src, set()))
-        for src in cov_ctx.all_src_files
-    }
-    unreferenced_sources = [src for src, tests in mapping_dict.items() if not tests]
+    # 2. Source-to-tests mapping (union of dynamic coverage + static AST imports)
+    mapping_src_files = sorted(
+        set(cov_ctx.all_src_files) | set(static_imports.all_src_files)
+    )
+    mapping_dict: dict[str, list[dict[str, str]]] = {}
+    dyn_counts: list[int] = []
+    imp_counts: list[int] = []
+    union_counts: list[int] = []
+    for src in mapping_src_files:
+        dyn_tests = cov_ctx.src_to_test_files.get(src, set())
+        imp_tests = static_imports.src_to_test_files.get(src, set())
+        entries: list[dict[str, str]] = []
+        for tf in sorted(dyn_tests | imp_tests):
+            if tf in dyn_tests and tf in imp_tests:
+                origin = "both"
+            elif tf in dyn_tests:
+                origin = "dynamic"
+            else:
+                origin = "import"
+            entries.append({"test_file": tf, "source": origin})
+        mapping_dict[src] = entries
+        dyn_counts.append(len(dyn_tests))
+        imp_counts.append(len(imp_tests))
+        union_counts.append(len(entries))
+
+    unreferenced_sources = [src for src, entries in mapping_dict.items() if not entries]
     all_mapped_test_files = sorted(
-        {tf for tests in mapping_dict.values() for tf in tests}
+        {entry["test_file"] for entries in mapping_dict.values() for entry in entries}
     )
     mapping_report = {
-        "schema_version": 1,
-        "source_file_count": len(cov_ctx.all_src_files),
-        "covered_source_file_count": len(cov_ctx.all_src_files)
-        - len(unreferenced_sources),
+        "schema_version": 2,
+        "source_file_count": len(mapping_src_files),
+        "covered_source_file_count": len(mapping_src_files) - len(unreferenced_sources),
         "mapped_test_file_count": len(all_mapped_test_files),
         "unreferenced_source_files": unreferenced_sources,
-        # Import-time lines carry no test context: tests depending on these
-        # files only through import are missing from source_to_test_files.
+        # Import-time lines carry no test context: dynamic coverage alone misses
+        # tests that depend on these files only through import.
         "source_files_with_uncontexted_lines": (
             cov_ctx.src_files_with_uncontexted_lines
         ),
@@ -450,19 +481,25 @@ def build_reports(
     )
     test_file_candidates = _find_subset_candidates(
         cov_ctx.test_file_masks,
-        key_name="test_file",
         superset_list_name="superset_test_files",
     )
     single_test_candidates = _find_subset_candidates(
         cov_ctx.nodeid_masks,
-        key_name="nodeid",
         superset_list_name="superset_tests",
-        extra_fn=lambda nid: {"test_file": nid.split("::", 1)[0]},
+    )
+    test_file_candidate_count = sum(
+        int(c["member_count"]) for c in test_file_candidates
+    )
+    single_test_candidate_count = sum(
+        int(c["member_count"]) for c in single_test_candidates
     )
     audit_report = {
-        "schema_version": 1,
-        "test_file_candidate_count": len(test_file_candidates),
-        "single_test_candidate_count": len(single_test_candidates),
+        "schema_version": 2,
+        "max_superset_groups": MAX_SUPERSET_GROUPS,
+        "test_file_candidate_group_count": len(test_file_candidates),
+        "test_file_candidate_count": test_file_candidate_count,
+        "single_test_candidate_group_count": len(single_test_candidates),
+        "single_test_candidate_count": single_test_candidate_count,
         "zero_src_coverage_test_file_count": len(zero_src_test_files),
         "zero_src_coverage_test_files": zero_src_test_files,
         "test_file_candidates": test_file_candidates,
@@ -519,6 +556,15 @@ def build_reports(
             f"{mod['touching_test_count']} | `{mod['source_file']}` |"
         )
 
+    dyn_avg = statistics.mean(dyn_counts) if dyn_counts else 0.0
+    dyn_median = statistics.median(dyn_counts) if dyn_counts else 0.0
+    imp_avg = statistics.mean(imp_counts) if imp_counts else 0.0
+    imp_median = statistics.median(imp_counts) if imp_counts else 0.0
+    union_avg = statistics.mean(union_counts) if union_counts else 0.0
+    union_median = statistics.median(union_counts) if union_counts else 0.0
+    total_test_files = len(set(static_imports.all_test_files) | set(by_test_file))
+    union_share = (union_avg / total_test_files) if total_test_files else 0.0
+
     md_lines.extend(
         [
             "",
@@ -529,11 +575,22 @@ def build_reports(
             f"{mapping_report['covered_source_file_count']}",
             "- Distinct test files referenced: "
             f"{mapping_report['mapped_test_file_count']}",
+            # Each side counted on its own (pairs tagged "both" count on both
+            # sides), unlike the exclusive "dynamic"/"import" tags in the JSON.
+            f"- Coverage-map test files per source file: avg {dyn_avg:.2f}, "
+            f"median {dyn_median:.1f}",
+            f"- Static-import-map test files per source file: avg {imp_avg:.2f}, "
+            f"median {imp_median:.1f}",
+            f"- Union test files per source file: avg {union_avg:.2f}, "
+            f"median {union_median:.1f} "
+            f"({union_share:.1%} of {total_test_files} test files)",
             "",
             "## Audit Candidates (Subset Coverage)",
             "",
-            f"- Test-file subset candidates: {len(test_file_candidates)}",
-            f"- Single-test subset candidates: {len(single_test_candidates)}",
+            f"- Test-file subset candidates: {test_file_candidate_count} "
+            f"across {len(test_file_candidates)} groups",
+            f"- Single-test subset candidates: {single_test_candidate_count} "
+            f"across {len(single_test_candidates)} groups",
             "- Test files with zero `src/` coverage (excluded from subset check): "
             f"{len(zero_src_test_files)}",
         ]
@@ -542,17 +599,26 @@ def build_reports(
         md_lines.extend(
             [
                 "",
-                "| Candidate Test File | Lines | Superset Test Files (sample) |",
-                "|---|---:|---|",
+                "| Candidate Test File(s) | Members | Lines | "
+                "Superset Test File Groups (sample) |",
+                "|---|---:|---:|---|",
             ]
         )
         for cand in test_file_candidates[:top_n]:
+            members_sample = ", ".join(f"`{m}`" for m in cand["members"][:3])
+            if cand["member_count"] > 3:
+                members_sample += f" (+{cand['member_count'] - 3})"
             supers = ", ".join(
-                f"`{s['test_file']}` ({s['covered_line_count']})"
+                f"`{s['members'][0]}`"
+                + (f" (+{s['member_count'] - 1})" if s["member_count"] > 1 else "")
+                + f" ({s['covered_line_count']})"
                 for s in cand["superset_test_files"][:3]
             )
+            if not supers:
+                supers = "-"
             md_lines.append(
-                f"| `{cand['test_file']}` | {cand['covered_line_count']} | {supers} |"
+                f"| {members_sample} | {cand['member_count']} | "
+                f"{cand['covered_line_count']} | {supers} |"
             )
 
     return durations_report, mapping_report, audit_report, "\n".join(md_lines) + "\n"
@@ -576,10 +642,12 @@ def main(argv: list[str] | None = None) -> int:
     failed = check_failed_tests(cases)
     cov_ctx = load_coverage_contexts(args.coverage_db, repo_root)
     unjoined = check_nodeid_join(cases, cov_ctx)
+    static_imports = collect_static_source_to_tests(repo_root)
 
     durations_report, mapping_report, audit_report, summary_md = build_reports(
         cases,
         cov_ctx,
+        static_imports,
         top_n=args.top_n,
     )
     durations_report["coverage_nodeids_missing_from_junit"] = unjoined
