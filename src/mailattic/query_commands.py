@@ -23,8 +23,11 @@ from .attachment_store import (
     export_attachments,
     resolve_store_root,
 )
-from .contact_history import aggregate_contact_history, serialise_summary
-from .contact_history import parse_date_bound as _parse_contact_history_date_bound
+from .contact_history import (
+    aggregate_contact_history,
+    parse_date_bound,
+    serialise_summary,
+)
 from .original_export import export_original_message
 from .query import (
     SearchFilters,
@@ -816,12 +819,8 @@ def _handle_contact_history(args: argparse.Namespace) -> int:
         # database: the CLI is the layer that knows its own flag spelling
         # (--date-from / --date-to); aggregate_contact_history's own
         # internal re-parse names its own keyword arguments instead.
-        _parse_contact_history_date_bound(
-            args.date_from, parameter_name="--date-from", end_of_day=False
-        )
-        _parse_contact_history_date_bound(
-            args.date_to, parameter_name="--date-to", end_of_day=True
-        )
+        parse_date_bound(args.date_from, parameter_name="--date-from", end_of_day=False)
+        parse_date_bound(args.date_to, parameter_name="--date-to", end_of_day=True)
         summary = aggregate_contact_history(
             database_path=args.database,
             contact=args.contact,
@@ -852,7 +851,7 @@ def _parse_optional_datetime(value: str | None, *, end_of_day: bool) -> datetime
     *value* and ``--to-date`` / ``--from-date`` on invalid input.
     """
     parameter_name = "--to-date" if end_of_day else "--from-date"
-    return _parse_contact_history_date_bound(
+    return parse_date_bound(
         value,
         parameter_name=parameter_name,
         end_of_day=end_of_day,
