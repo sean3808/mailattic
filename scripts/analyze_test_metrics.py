@@ -283,6 +283,24 @@ def _find_subset_candidates(
     return candidates
 
 
+# The CI job tolerates a few failed tests (wall-clock budgets break under
+# per-test coverage tracing). Above this share the coverage map is too
+# incomplete to guide test selection, so the analysis fails instead.
+MAX_FAILED_TEST_RATIO = 0.01
+
+
+def check_failed_tests(cases: list[TestCaseTiming]) -> list[str]:
+    """Return failed/errored nodeids; raise if too many to trust the reports."""
+    failed = sorted(c.nodeid for c in cases if c.outcome in {"failure", "error"})
+    if len(failed) > MAX_FAILED_TEST_RATIO * len(cases):
+        sample = ", ".join(failed[:5])
+        raise ValueError(
+            f"{len(failed)} of {len(cases)} tests failed or errored (e.g. {sample}); "
+            "too many for the coverage map to be complete."
+        )
+    return failed
+
+
 # Above this share of coverage-context nodeids missing from the JUnit XML, the
 # two sources are joined wrongly and per-module durations would silently shrink.
 MAX_UNJOINED_CONTEXT_RATIO = 0.01
@@ -552,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
 
     repo_root = args.repo_root.resolve()
     cases = parse_junit_xml(args.junit_xml, repo_root)
+    failed = check_failed_tests(cases)
     cov_ctx = load_coverage_contexts(args.coverage_db, repo_root)
     unjoined = check_nodeid_join(cases, cov_ctx)
 
@@ -561,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
         top_n=args.top_n,
     )
     durations_report["coverage_nodeids_missing_from_junit"] = unjoined
+    durations_report["failed_tests"] = failed
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for name, payload in (

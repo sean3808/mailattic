@@ -168,7 +168,8 @@ jobs:
           # This job measures; hosted-full is the gate. Exit 1 means the suite
           # ran and some tests failed (wall-clock tests can exceed their budget
           # under per-test coverage tracing), so the reports are still produced
-          # and the failure is surfaced as a warning. Any other non-zero exit
+          # and the failure is surfaced as a warning; the analysis step fails
+          # the job if more than 1% of tests failed. Any other non-zero exit
           # means the suite did not run as measured, and the job fails.
           if ($testExit -eq 1) {
               Write-Host "::warning title=tests failed under measurement::invoke-pytest -Route FullCoverage exited 1; failed tests are listed with outcome 'failure' in durations.json all_tests."

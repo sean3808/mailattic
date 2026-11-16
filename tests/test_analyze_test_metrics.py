@@ -202,6 +202,7 @@ def test_analyze_produces_all_three_reports_and_summary(tmp_path: Path) -> None:
     # Every coverage context joined to a JUnit test (test_docs_only has JUnit
     # only, which is fine: it touches no src/ line).
     assert durations["coverage_nodeids_missing_from_junit"] == []
+    assert durations["failed_tests"] == []
 
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "Top Slowest Tests" in summary
@@ -258,6 +259,53 @@ def test_analyze_fails_loudly_when_coverage_nodeids_do_not_join_junit(
     result = _run_analyzer(junit_xml, cov_db, out_dir, repo_root=repo)
     assert result.returncode != 0
     assert "no matching junit test" in (result.stdout + result.stderr).lower()
+
+
+def _failure_ratio_fixture(
+    tmp_path: Path, *, total: int, failed: int
+) -> subprocess.CompletedProcess[str]:
+    repo = tmp_path / "repo"
+    (repo / "src" / "mailattic").mkdir(parents=True)
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_alpha.py").write_text("", encoding="utf-8")
+    src_file = repo / "src" / "mailattic" / "alpha.py"
+    src_file.write_text("x = 1\n", encoding="utf-8")
+
+    junit_xml = tmp_path / "junit.xml"
+    _write_junit_xml(
+        junit_xml,
+        [
+            (
+                "tests.test_alpha",
+                f"test_{i}",
+                0.01,
+                "failure" if i < failed else "passed",
+            )
+            for i in range(total)
+        ],
+    )
+    cov_db = tmp_path / ".coverage"
+    _build_coverage_db(
+        cov_db,
+        lines_by_context={"tests/test_alpha.py::test_0|run": {str(src_file): [1]}},
+    )
+    return _run_analyzer(junit_xml, cov_db, tmp_path / "reports", repo_root=repo)
+
+
+def test_analyze_tolerates_a_few_failed_tests_and_lists_them(tmp_path: Path) -> None:
+    # 1 of 100 is at the 1% limit: still reported, failures listed.
+    result = _failure_ratio_fixture(tmp_path, total=100, failed=1)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    durations = json.loads(
+        (tmp_path / "reports" / "durations.json").read_text(encoding="utf-8")
+    )
+    assert durations["failed_tests"] == ["tests/test_alpha.py::test_0"]
+
+
+def test_analyze_fails_loudly_when_too_many_tests_failed(tmp_path: Path) -> None:
+    result = _failure_ratio_fixture(tmp_path, total=100, failed=2)
+    assert result.returncode != 0
+    assert "too many for the coverage map" in (result.stdout + result.stderr)
 
 
 def test_analyze_fails_loudly_on_missing_or_empty_junit(tmp_path: Path) -> None:
