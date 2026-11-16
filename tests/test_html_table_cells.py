@@ -12,6 +12,7 @@ code before #14 phase 1; every other test encodes new behaviour.
 
 from __future__ import annotations
 
+import gc
 import time
 
 import pytest
@@ -323,35 +324,101 @@ def test_text_outside_tables_is_unchanged() -> None:
 # --- performance (PC-231) -------------------------------------------------
 
 
-def test_large_table_converts_quickly() -> None:
-    # Pins unchanged behaviour on speed: guards against a quadratic grid.
-    rows = "".join(
-        "<tr>" + "".join(f"<td>r{r}c{c}</td>" for c in range(20)) + "</tr>"
-        for r in range(2000)
-    )
-    html = f"<table>{rows}</table>"
-    start = time.perf_counter()
+# Timing is compared inside one process (growth between two sizes, or against a
+# linear control), never against an absolute number of seconds: a hosted runner
+# or coverage tracing slows both sides alike, so the ratio stays put (#104).
+# Doubling the input costs ~2x when linear and ~4x when quadratic; 3.0 sits
+# between the two. A quadratic term trips it once it costs about twice the
+# linear work at the larger size.
+_DOUBLING_MAX_RATIO = 3.0
+# Measured locally: the guarded (plain-fallback) path runs at ~1.0x the linear
+# control; with the slot-limit guard removed the carry-over grid runs at
+# ~3.3-4x. 2.0 sits between the two with headroom on each side.
+_GUARD_VS_CONTROL_MAX_RATIO = 2.0
+_TIMING_REPEATS = 5
+
+
+def _report(request: pytest.FixtureRequest, message: str) -> None:
+    """Print once into the run output even when pytest captures stdout (E4)."""
+    reporter = request.config.pluginmanager.getplugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(message)
+    else:
+        print(message)
+
+
+def _seconds(html: str) -> float:
+    """One conversion, timed with the garbage collector out of the way.
+
+    Collecting first and pausing the collector while timing (as ``timeit``
+    does) keeps a full collection of the pytest session's objects from landing
+    inside one side of the ratio.
+    """
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        start = time.perf_counter()
+        _html_to_text(html)
+        return time.perf_counter() - start
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def _time_ratio(subject: str, baseline: str) -> float:
+    """Best subject time over best baseline time.
+
+    The two sides are timed alternately, so a slow stretch on a shared runner
+    hits both; each side's minimum filters the remaining scheduler noise.
+    """
+    best_subject = best_baseline = float("inf")
+    for _ in range(_TIMING_REPEATS):
+        best_subject = min(best_subject, _seconds(subject))
+        best_baseline = min(best_baseline, _seconds(baseline))
+    return best_subject / best_baseline
+
+
+def test_large_table_converts_quickly(request: pytest.FixtureRequest) -> None:
+    # Guards against a quadratic grid: doubling the rows must not cost ~4x.
+    def build(row_count: int) -> str:
+        rows = "".join(
+            "<tr>" + "".join(f"<td>r{r}c{c}</td>" for c in range(20)) + "</tr>"
+            for r in range(row_count)
+        )
+        return f"<table>{rows}</table>"
+
+    html = build(2000)
     lines = _lines(html)
-    elapsed = time.perf_counter() - start
     assert len(lines) == 2000
     assert lines[0].startswith("r0c0 | r0c1 |")
-    assert elapsed < 1.0
+    # 4000 vs 2000 rows: at 20 slots per row a quadratic term needs this many
+    # rows before it outweighs the linear parsing cost.
+    ratio = _time_ratio(build(4000), html)
+    _report(request, f"large table: 4000 rows / 2000 rows time ratio = {ratio:.2f}")
+    assert ratio <= _DOUBLING_MAX_RATIO
 
 
-def test_many_rowspan_100_cells_convert_quickly() -> None:
+def test_many_rowspan_100_cells_convert_quickly(
+    request: pytest.FixtureRequest,
+) -> None:
     # Speed pin: every row adds a rowspan=100 cell, so about 100 carried
     # slots live per row. 900 rows stay under the 100,000-slot cap (the real
     # grid, carried slots included; spec-1d) and still render as a grid.
-    rows = "".join(
-        f"<tr><td rowspan=100>a{r}</td><td>b{r}</td></tr>" for r in range(900)
-    )
-    html = f"<table>{rows}</table>"
-    start = time.perf_counter()
+    def build(row_count: int) -> str:
+        rows = "".join(
+            f"<tr><td rowspan=100>a{r}</td><td>b{r}</td></tr>" for r in range(row_count)
+        )
+        return f"<table>{rows}</table>"
+
+    html = build(900)
     lines = _lines(html)
-    elapsed = time.perf_counter() - start
     assert len(lines) == 900
     assert _warning() not in lines
-    assert elapsed < 1.0
+    # Half size, not double: 1800 rows would cross the slot cap.
+    ratio = _time_ratio(html, build(450))
+    _report(request, f"rowspan 100: 900 rows / 450 rows time ratio = {ratio:.2f}")
+    assert ratio <= _DOUBLING_MAX_RATIO
 
 
 # --- review round 1 fixes (spec-1d) ----------------------------------------
@@ -403,20 +470,32 @@ def test_layout_container_with_one_filled_cell_per_row_does_not_warn() -> None:
     assert _lines(html) == ["A | B", "Footer"]
 
 
-def test_rowspan_carry_over_beyond_slot_limit_warns_and_stays_fast() -> None:
+def test_rowspan_carry_over_beyond_slot_limit_warns_and_stays_fast(
+    request: pytest.FixtureRequest,
+) -> None:
     # rows x max_row_width stays under the pre-check, but rowspan carry-over
     # widens the real grid to millions of slots.
-    rows = "".join(
-        "<tr>" + "".join(f"<td rowspan=100>r{r}c{c}</td>" for c in range(100)) + "</tr>"
-        for r in range(1000)
-    )
-    html = f"<table>{rows}</table>"
-    start = time.perf_counter()
+    def build(rowspan: int) -> str:
+        rows = "".join(
+            "<tr>"
+            + "".join(f"<td rowspan={rowspan}>r{r}c{c}</td>" for c in range(100))
+            + "</tr>"
+            for r in range(1000)
+        )
+        return f"<table>{rows}</table>"
+
+    html = build(100)
     lines = _lines(html)
-    elapsed = time.perf_counter() - start
     assert lines[0] == _warning()
     assert " | " not in "\n".join(lines)  # plain fallback, no grid
-    assert elapsed < 2.0
+    # Control: same cell count and markup size, no carry-over (a linear grid).
+    # Without the guard the carried slots dwarf it.
+    ratio = _time_ratio(html, build(1))
+    _report(
+        request,
+        f"rowspan carry-over guard: guarded / linear control time ratio = {ratio:.2f}",
+    )
+    assert ratio <= _GUARD_VS_CONTROL_MAX_RATIO
 
 
 def test_cells_without_a_row_tag_open_an_implicit_row_and_keep_slots() -> None:
