@@ -498,11 +498,32 @@ _PST_UNCONFIRMED = (
     None,
     "A matching table row was found but could not be confirmed.",
 )
+_MAX_PST_FAILURE_REASON_CHARS = 200
 
 
 class _VerificationError(Exception):
     """An item was opened but checking its identity raised (a read error),
     as opposed to the EntryID lookup itself failing."""
+
+
+def _format_pst_failure_reason(exc: BaseException) -> str:
+    """Format a PST read exception as ``Type: message``, unwrapped and capped."""
+    cause = (
+        exc.__cause__
+        if isinstance(exc, _VerificationError) and exc.__cause__ is not None
+        else exc
+    )
+    msg = " ".join(str(cause).split())
+    reason = f"{type(cause).__name__}: {msg}" if msg else type(cause).__name__
+    if len(reason) > _MAX_PST_FAILURE_REASON_CHARS:
+        return reason[: _MAX_PST_FAILURE_REASON_CHARS - 3] + "..."
+    return reason
+
+
+def _append_failure_reason(detail: str, reason: str | None) -> str:
+    if not reason:
+        return detail
+    return f"{detail} ({reason})"
 
 
 def _is_same_pst_folder(
@@ -532,6 +553,14 @@ class _PstItemSearch:
         self._store_id = store_id
         self._message = message
         self._tally = tally
+        self._confirm_error: str | None = None
+        self._unlisted_error: str | None = None
+
+    def _unconfirmed_result(self) -> tuple[None, str]:
+        return (
+            None,
+            _append_failure_reason(_PST_UNCONFIRMED[1], self._confirm_error),
+        )
 
     def open_verified(self, entry: str) -> Any | None:
         item = (
@@ -574,7 +603,8 @@ class _PstItemSearch:
                 return None
             try:
                 item = self.open_verified(entry)
-            except Exception:
+            except Exception as exc:
+                self._confirm_error = _format_pst_failure_reason(exc)
                 return None
             if item is None:
                 return None
@@ -593,8 +623,10 @@ class _PstItemSearch:
                 break
             try:
                 item = self.open_verified(entry)
-            except Exception:
+            except Exception as exc:
                 self._tally.unreadable += 1
+                if self._unlisted_error is None:
+                    self._unlisted_error = _format_pst_failure_reason(exc)
                 continue
             if item is not None:
                 found.append(item)
@@ -642,7 +674,7 @@ class _PstItemSearch:
 
         folder_found = self._resolve_candidates(folder_hits, folder_unlisted)
         if folder_found is None:
-            return target_folder, _PST_UNCONFIRMED
+            return target_folder, self._unconfirmed_result()
         if folder_found:
             if table_incomplete:
                 return target_folder, (
@@ -711,10 +743,13 @@ class _PstItemSearch:
             candidates, self._tally.take_unlisted_id_entries()
         )
         if found is None:
-            return _PST_UNCONFIRMED
+            return self._unconfirmed_result()
         if found:
             return _single_match(found, _PST_AMBIGUOUS)
-        return _nothing_found(self._tally.unreadable)
+        item_none, detail = _nothing_found(self._tally.unreadable)
+        if detail is not None and self._unlisted_error is not None:
+            return item_none, _append_failure_reason(detail, self._unlisted_error)
+        return item_none, detail
 
 
 def _find_pst_item(
