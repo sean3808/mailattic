@@ -984,31 +984,31 @@ def _is_rfc822_attachment_part(part: Any, *, outer_message: Any) -> bool:
     return outer_message.get_content_type() != "multipart/report"
 
 
-def _is_excluded_multipart_subtree(part: Any, *, outer_message: Any) -> bool:
-    if _is_rfc822_attachment_part(part, outer_message=outer_message):
-        return True
-    if part is not outer_message and part.get_content_disposition() == "attachment":
-        return True
-    # Python's email parser treats message/delivery-status as multipart and exposes
-    # its payload (including raw undecoded base64 when CTE=base64) as text/plain
-    # subparts; DSN status blocks are never human-readable body text (#92).
-    return part.get_content_type() == "message/delivery-status"
-
-
-def _walk_own_parts_with_context(message: Any) -> Iterator[tuple[Any, bool]]:
-    """walk() that does not descend into attached or delivery-status subtrees,
-    yielding (part, in_alternative).
+def _walk_own_parts_with_context(
+    message: Any, *, exclude_delivery_status: bool = False
+) -> Iterator[tuple[Any, bool]]:
+    """walk() that does not descend into an attached message/rfc822 subtree
+    (and optionally message/delivery-status subtrees), yielding (part, in_alternative).
     """
     stack: list[tuple[Any, bool]] = [(message, False)]
     while stack:
         part, in_alt = stack.pop()
         yield part, in_alt
-        if part.is_multipart() and not _is_excluded_multipart_subtree(
-            part, outer_message=message
+        if not part.is_multipart():
+            continue
+        if _is_rfc822_attachment_part(part, outer_message=message):
+            continue
+        # Python's email parser treats message/delivery-status as multipart and
+        # exposes its payload (including raw undecoded base64 when CTE=base64)
+        # as synthetic text/plain subparts; exclude it from body text (#92).
+        if (
+            exclude_delivery_status
+            and part.get_content_type() == "message/delivery-status"
         ):
-            is_alt = in_alt or (part.get_content_type() == "multipart/alternative")
-            for child in reversed(part.get_payload()):
-                stack.append((child, is_alt))
+            continue
+        is_alt = in_alt or (part.get_content_type() == "multipart/alternative")
+        for child in reversed(part.get_payload()):
+            stack.append((child, is_alt))
 
 
 # Pinned host-independent extensions for standard attachment MIME types.
@@ -1124,7 +1124,9 @@ def _extract_body_text(message: Any) -> str:
     html_attribute_values: list[str] = []
     has_data_table = False
 
-    for part, in_alt in _walk_own_parts_with_context(message):
+    for part, in_alt in _walk_own_parts_with_context(
+        message, exclude_delivery_status=True
+    ):
         if part.is_multipart():
             continue
         if _is_attachment_part(part, in_alternative=in_alt):

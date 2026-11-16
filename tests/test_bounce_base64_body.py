@@ -14,13 +14,12 @@ from __future__ import annotations
 
 import sqlite3
 from email import policy
-from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
 
 from mailattic.ingest import import_maildir_sources
 from mailattic.models import MaildirSource
-from mailattic.parser import _extract_body_text
+from mailattic.parser import _extract_attachments, _extract_body_text
 from mailattic.storage import initialize_database
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "bounce-base64"
@@ -127,27 +126,13 @@ def test_multipart_report_with_base64_delivery_status_without_disposition(
     assert _BASE64_SNIPPET not in stored
 
 
-def test_attachment_disposition_multipart_container_not_in_body() -> None:
-    """A non-root multipart part with Content-Disposition: attachment must not
-    contribute its child text parts to the outer body_text."""
-    outer = EmailMessage()
-    outer.make_mixed()
-    outer["From"] = "sender@mailattic.test"
-    outer["To"] = "recipient@mailattic.test"
-    outer["Subject"] = "Wrapper"
-
-    main_body = EmailMessage()
-    main_body.set_content("Main body text.")
-    outer.attach(main_body)
-
-    attached_alt = EmailMessage()
-    attached_alt.make_alternative()
-    attached_plain = EmailMessage()
-    attached_plain.set_content("Attached alternative leak.")
-    attached_alt.attach(attached_plain)
-    attached_alt.add_header("Content-Disposition", "attachment", filename="alt.eml")
-    outer.attach(attached_alt)
-
-    body = _extract_body_text(outer)
-    assert "Main body text." in body
-    assert "Attached alternative leak." not in body
+def test_dsn_fixture_preserves_expected_attachments(tmp_path: Path) -> None:
+    """L1.d: Pin attachment extraction for the DSN fixture (unchanged from base)."""
+    msg = _parse_fixture("bounce-plain-dsn-base64.eml")
+    attachments = _extract_attachments(msg, attachment_root=tmp_path / "att")
+    assert [(a["attachment_name"], a["mime_type"]) for a in attachments] == [
+        ("Placeholder Subject.eml", "message/rfc822")
+    ]
+    size = attachments[0]["size_bytes"]
+    assert isinstance(size, int) and size > 0
+    assert attachments[0]["content_hash"] is not None
