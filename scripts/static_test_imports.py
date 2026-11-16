@@ -59,18 +59,18 @@ def _iter_runtime_import_nodes(
     return imports
 
 
-def _ancestor_init_files(target: Path, stop_dir: Path) -> list[Path]:
-    """Return ``__init__.py`` files from target's package up to ``stop_dir``."""
-    inits: list[Path] = []
+def _ancestor_files(target: Path, stop_dir: Path, filename: str) -> list[Path]:
+    """Return existing ``filename`` files from target's dir up to ``stop_dir``."""
+    found: list[Path] = []
     current = target.parent
     while True:
-        init_file = current / "__init__.py"
-        if init_file.is_file():
-            inits.append(init_file)
+        candidate = current / filename
+        if candidate.is_file():
+            found.append(candidate)
         if current == stop_dir or current == current.parent:
             break
         current = current.parent
-    return inits
+    return found
 
 
 class _ImportResolver:
@@ -121,10 +121,10 @@ class _ImportResolver:
     def _resolve_dotted(self, mod_name: str) -> list[Path]:
         if mod_name in self.src_module_to_path:
             target = self.src_module_to_path[mod_name]
-            return [target, *_ancestor_init_files(target, self.src_pkg_dir)]
+            return [target, *_ancestor_files(target, self.src_pkg_dir, "__init__.py")]
         if mod_name in self.test_module_to_path:
             target = self.test_module_to_path[mod_name]
-            return [target, *_ancestor_init_files(target, self.tests_dir)]
+            return [target, *_ancestor_files(target, self.tests_dir, "__init__.py")]
         return []
 
     def _resolve_relative(self, current_file: Path, node: ast.ImportFrom) -> list[Path]:
@@ -144,26 +144,24 @@ class _ImportResolver:
         found: list[Path] = []
         if node.module:
             mod_parts = node.module.split(".")
-            target_dir = base_dir.joinpath(*mod_parts)
+            search_dir = base_dir.joinpath(*mod_parts)
             candidates = [
                 base_dir.joinpath(*mod_parts[:-1], f"{mod_parts[-1]}.py"),
-                target_dir / "__init__.py",
+                search_dir / "__init__.py",
             ]
-            for alias in node.names:
-                if alias.name != "*":
-                    candidates.append(target_dir / f"{alias.name}.py")
-                    candidates.append(target_dir / alias.name / "__init__.py")
         else:
+            search_dir = base_dir
             candidates = [base_dir / "__init__.py"]
-            for alias in node.names:
-                if alias.name != "*":
-                    candidates.append(base_dir / f"{alias.name}.py")
-                    candidates.append(base_dir / alias.name / "__init__.py")
+
+        for alias in node.names:
+            if alias.name != "*":
+                candidates.append(search_dir / f"{alias.name}.py")
+                candidates.append(search_dir / alias.name / "__init__.py")
 
         for cand in candidates:
             if cand.is_file():
                 found.append(cand)
-                found.extend(_ancestor_init_files(cand, stop_dir))
+                found.extend(_ancestor_files(cand, stop_dir, "__init__.py"))
         return found
 
     def direct_imports(self, file_path: Path) -> list[Path]:
@@ -203,20 +201,6 @@ class _ImportResolver:
         return resolved
 
 
-def _applicable_conftests(test_file: Path, tests_dir: Path) -> list[Path]:
-    """Return existing conftest.py files from test_file's dir up to tests_dir."""
-    conftests: list[Path] = []
-    current = test_file.parent
-    while True:
-        candidate = current / "conftest.py"
-        if candidate.is_file():
-            conftests.append(candidate)
-        if current == tests_dir or current == current.parent:
-            break
-        current = current.parent
-    return conftests
-
-
 def collect_static_source_to_tests(repo_root: Path) -> StaticImportData:
     """Scan ``tests/`` and ``src/mailattic/`` to build static import mapping."""
     resolved_root = repo_root.resolve()
@@ -241,7 +225,10 @@ def collect_static_source_to_tests(repo_root: Path) -> StaticImportData:
 
     for test_path in test_files:
         test_rel = test_path.relative_to(resolved_root).as_posix()
-        seeds = [test_path, *_applicable_conftests(test_path, resolver.tests_dir)]
+        seeds = [
+            test_path,
+            *_ancestor_files(test_path, resolver.tests_dir, "conftest.py"),
+        ]
         queue: deque[Path] = deque(seeds)
         visited: set[Path] = set(seeds)
 
