@@ -623,7 +623,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12" },
-    { name = "charset-normalizer", specifier = ">=3.4.7" },
+    { name = "charset-normalizer", specifier = ">=3.4.7,<3.5" },
     { name = "mcp", specifier = ">=2.2,<3" },
     { name = "pydantic", specifier = ">=2.11" },
     { name = "pywin32", marker = "sys_platform == 'win32'", specifier = ">=312" },
