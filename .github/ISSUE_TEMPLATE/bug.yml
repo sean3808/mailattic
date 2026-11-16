@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a bug in mailattic
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please replace any real email addresses, names, subjects, or message bodies with placeholders (for example, `user@mailattic.test`).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: |
+        Running `uv run bes search --sender user@mailattic.test` returned ...
+    validations:
+      required: true
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Commands, flags, or minimal de-identified sample input.
+      placeholder: |
+        1. `uv run bes ...`
+        2. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and `bes` / commit version.
+      placeholder: "Windows 11, Python 3.13, commit abc1234"
+    validations:
+      required: false
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      description: This is a public repository. Real mail data must never be posted here.
+      options:
+        - label: I confirm this report contains no real email addresses, names, subjects, or message bodies (placeholders such as `user@mailattic.test` only).
+          required: true

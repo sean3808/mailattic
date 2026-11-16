@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose an improvement or new capability
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Note: `mailattic` is scoped as a personal historical mail query backend (`README.md`). Please check out-of-scope items in `AGENTS.md` before proposing a new feature.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What problem does this solve? Use placeholder examples only (e.g., `user@mailattic.test`).
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behaviour or CLI/MCP/API change you have in mind.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      description: This is a public repository. Real mail data must never be posted here.
+      options:
+        - label: I confirm this request contains no real email addresses, names, subjects, or message bodies (placeholders such as `user@mailattic.test` only).
+          required: true
