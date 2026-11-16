@@ -617,7 +617,12 @@ The `hosted-full` status check is required on main for merge (#70).
 
 The `measure-test-metrics` job in `.github/workflows/ci.yml` runs only on the
 weekly schedule (`schedule`) and manual dispatch (`workflow_dispatch`). It is
-measurement-only and never acts as a PR merge gate.
+measurement-only and never acts as a PR merge gate. Per-test coverage tracing
+slows the suite, so wall-clock tests (for example the conversion-speed checks in
+`tests/test_html_table_cells.py`) can fail here while passing in `hosted-full`.
+A launcher exit of 1 (tests ran, some failed) therefore becomes a run warning
+and the reports are still produced; the failed tests carry outcome `failure` in
+`durations.json`. Any other non-zero exit fails the job.
 
 It invokes `scripts\invoke-pytest.ps1 -Route FullCoverage -CoverageRunId <id>`
 (which records `--cov-context=test` in `.coverage` alongside `junit.xml`) and
