@@ -373,7 +373,12 @@ class NativeImapClient:
         # Listing entries skipped by the latest call; read right after it.
         self.skipped_listings.clear()
         result: list[ImapFolder] = []
+        previous_was_literal = False
         for raw in data or []:
+            # Update before any `continue`, so a literal that is skipped
+            # (#308) still marks the next element as its trailer.
+            after_literal = previous_was_literal
+            previous_was_literal = isinstance(raw, tuple)
             if raw is None:
                 continue
             if isinstance(raw, tuple):
@@ -390,15 +395,22 @@ class NativeImapClient:
                     else str(raw)
                 )
             parsed = _parse_list_entry(text)
-            if parsed is not None:
-                wire_name, delimiter = parsed
-                result.append(
-                    ImapFolder(
-                        display_name=decode_mutf7(wire_name),
-                        wire_name=wire_name,
-                        delimiter=delimiter,
-                    )
+            if parsed is None:
+                if after_literal and text.strip() in ("", ")"):
+                    # imaplib's trailing element after a literal tuple.
+                    continue
+                # #95: an unparseable complete line must not look like a
+                # complete listing; callers report the skip.
+                self.skipped_listings.append(_unparseable_listing_reason(text))
+                continue
+            wire_name, delimiter = parsed
+            result.append(
+                ImapFolder(
+                    display_name=decode_mutf7(wire_name),
+                    wire_name=wire_name,
+                    delimiter=delimiter,
                 )
+            )
         return result
 
     def get_uidvalidity(self, folder_name: str) -> int:
@@ -541,6 +553,17 @@ def _read_quoted(text: str) -> str | None:
             out.append(c)
             i += 1
     return None
+
+
+_UNPARSEABLE_LISTING_PREFIX_CAP = 80
+
+
+def _unparseable_listing_reason(text: str) -> str:
+    """Skip reason for a LIST line the parser rejected (raw line capped)."""
+    line = text.strip()
+    shown = line[:_UNPARSEABLE_LISTING_PREFIX_CAP]
+    suffix = "..." if len(line) > _UNPARSEABLE_LISTING_PREFIX_CAP else ""
+    return f"LIST line could not be parsed: {shown!r}{suffix}"
 
 
 def _list_text_from_literal(raw: tuple) -> str:
