@@ -348,7 +348,23 @@ def _find_pst_folder_by_path(
     root_folder: Any, folder_path: str, tally: _ScanTally
 ) -> Any | None:
     """Navigate Outlook folder hierarchy matching *folder_path*; a subfolder
-    that cannot be read is counted in *tally*."""
+    that cannot be read is counted in *tally*.
+
+    Residual risk (accepted, see #90 and D-20260908-1):
+        If a child folder with the same name as *root_folder* existed at import
+        time and was later renamed or deleted in Outlook, skipping the first
+        segment restarts lookup from *root_folder* and can apply the "recorded
+        folder holds exactly one -> prefer it" exception to a different folder
+        (worst case: a duplicate in another folder is not flagged as ambiguous).
+        Export still passes through ``_verify_outlook_item`` Message-ID
+        verification, so a wrong message is never exported. This risk is
+        accepted because dropping the exception on skip would forfeit the #71
+        speedup and #53 ruling 5 on the normal path, and triggering it requires
+        an ordinary Outlook folder rename/delete rather than a deliberate
+        collision (see D-20260908-1 in:
+    docs/decisions/D-20260908-1-guards-defend-confused-deputy-not-deliberate-collision.md
+        ).
+    """
     parts = [p.strip() for p in re.split(r"[/\\]", folder_path) if p.strip()]
     if not parts:
         # PST ingest records a message in the store root as "/".
