@@ -519,19 +519,48 @@ def _base64_line_share(text: str) -> float:
     return sum(1 for line in lines if _BASE64_LINE_RE.match(line)) / len(lines)
 
 
-_STYLE_SCRIPT_RE = re.compile(
-    r"<(style|script)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
-)
-_CSS_RULE_BODY_RE = re.compile(r"\{[^{}]*:[^{}]*\}")
+# Bodies run to ~1.5M characters, so every pattern here must stay linear: no
+# unbounded run that can be re-scanned from many start positions (PC-231).
+# mail_parser._html_to_text is not reused: during extraction it is wrapped by
+# _record_table_flag, and calling it here would flip the recorder (#122).
+_TAG_BLOCK_OPEN_RE = re.compile(r"<(style|script)\b", re.IGNORECASE)
+_TAG_BLOCK_CLOSE_RES = {
+    name: re.compile(rf"</{name}\s*>", re.IGNORECASE) for name in ("style", "script")
+}
+_CSS_RULE_BODY_RE = re.compile(r"\{[^{}:]*:[^{}]*\}")
 _CSS_FONT_DECL_RE = re.compile(
-    r"(?:[a-z-]*font[a-z-]*|mso-[a-z-]+)\s*:[^;{}\n]*;?", re.IGNORECASE
+    r"\b(?:font|mso)[a-z-]{0,64}\s*:[^;{}\n]{0,256};?", re.IGNORECASE
 )
+
+
+def _drop_tag_blocks(text: str) -> str:
+    """Drop closed <style>/<script> blocks in one forward pass; an opening
+    tag with no closing tag after it is left as is."""
+    parts: list[str] = []
+    pos = 0
+    search_from = 0
+    unclosed: set[str] = set()
+    while opening := _TAG_BLOCK_OPEN_RE.search(text, search_from):
+        name = opening.group(1).lower()
+        closing = None
+        if name not in unclosed:
+            closing = _TAG_BLOCK_CLOSE_RES[name].search(text, opening.end())
+        if closing is None:
+            unclosed.add(name)
+            search_from = opening.end()
+            continue
+        parts.append(text[pos : opening.start()])
+        parts.append(" ")
+        pos = search_from = closing.end()
+    parts.append(text[pos:])
+    return "".join(parts)
 
 
 def _strip_style_text(text: str) -> str:
-    """Drop style/script blocks and CSS declarations, whose CJK font names
-    would otherwise inflate the CJK count of an old body (#122)."""
-    text = _STYLE_SCRIPT_RE.sub(" ", text)
+    """Drop style/script blocks and CSS declarations (rule bodies, and
+    brace-less ones such as inline ``style="font-family:..."``), whose CJK
+    font names would otherwise inflate the CJK count of an old body (#122)."""
+    text = _drop_tag_blocks(text)
     text = _CSS_RULE_BODY_RE.sub(" ", text)
     return _CSS_FONT_DECL_RE.sub(" ", text)
 
@@ -541,13 +570,18 @@ def _degradation_reason(old: str, new: str) -> str | None:
     into Latin-1 high characters), ``"base64"`` (readable text turned into
     mostly raw base64 lines), or None. When it cannot be told, None (keep the
     rewrite decision to the caller; PC-230)."""
-    old_cjk = _count_range(_strip_style_text(old), 0x4E00, 0x9FFF)
+    # Stripping only lowers the old count, so skip it when the cheap counts
+    # already rule mojibake out.
     if (
-        old_cjk >= _MOJIBAKE_OLD_CJK_MIN
-        and _count_range(new, 0x4E00, 0x9FFF) < _MOJIBAKE_CJK_KEEP_RATIO * old_cjk
-        and _count_range(new, 0x00A1, 0x00FF) >= _MOJIBAKE_LATIN1_MIN
+        _count_range(new, 0x00A1, 0x00FF) >= _MOJIBAKE_LATIN1_MIN
+        and _count_range(old, 0x4E00, 0x9FFF) >= _MOJIBAKE_OLD_CJK_MIN
     ):
-        return "mojibake"
+        old_cjk = _count_range(_strip_style_text(old), 0x4E00, 0x9FFF)
+        if (
+            old_cjk >= _MOJIBAKE_OLD_CJK_MIN
+            and _count_range(new, 0x4E00, 0x9FFF) < _MOJIBAKE_CJK_KEEP_RATIO * old_cjk
+        ):
+            return "mojibake"
     if (
         _base64_line_share(new) > _BASE64_NEW_MIN_SHARE
         and _base64_line_share(old) < _BASE64_OLD_MAX_SHARE
