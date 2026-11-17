@@ -18,7 +18,7 @@ import pytest
 # between the two. A quadratic term trips it once it costs about twice the
 # linear work at the larger size.
 DOUBLING_MAX_RATIO = 3.0
-DEFAULT_REPEATS = 5
+_REPEATS = 5
 
 
 def report(request: pytest.FixtureRequest, message: str) -> None:
@@ -30,23 +30,10 @@ def report(request: pytest.FixtureRequest, message: str) -> None:
         print(message)
 
 
-def measure_seconds(fn: Callable[[], object]) -> float:
-    """Run *fn* once and return elapsed seconds with GC paused.
-
-    Collecting first and pausing the collector while timing (as ``timeit``
-    does) keeps a full collection of the pytest session's objects from landing
-    inside one side of the ratio.
-    """
-    gc.collect()
-    was_enabled = gc.isenabled()
-    gc.disable()
-    try:
-        start = time.perf_counter()
-        fn()
-        return time.perf_counter() - start
-    finally:
-        if was_enabled:
-            gc.enable()
+def _seconds(fn: Callable[[], object]) -> float:
+    start = time.perf_counter()
+    fn()
+    return time.perf_counter() - start
 
 
 def time_ratio(
@@ -57,9 +44,20 @@ def time_ratio(
 
     The two sides are timed alternately, so a slow stretch on a shared runner
     hits both; each side's minimum filters the remaining scheduler noise.
+    Collecting once up front and pausing the collector for the whole loop (as
+    ``timeit`` does) keeps a full collection of the pytest session's objects
+    from landing inside one side of the ratio, without paying a full
+    collection per measurement.
     """
-    best_subject = best_baseline = float("inf")
-    for _ in range(DEFAULT_REPEATS):
-        best_subject = min(best_subject, measure_seconds(subject))
-        best_baseline = min(best_baseline, measure_seconds(baseline))
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        best_subject = best_baseline = float("inf")
+        for _ in range(_REPEATS):
+            best_subject = min(best_subject, _seconds(subject))
+            best_baseline = min(best_baseline, _seconds(baseline))
+    finally:
+        if was_enabled:
+            gc.enable()
     return best_subject / max(best_baseline, 1e-9)
