@@ -870,6 +870,144 @@ def _write_original_file(
     return replace(base, status="exported", dest_path=destination_path)
 
 
+def _is_same_pst_store(a: Any, b: Any) -> bool:
+    if a is b:
+        return True
+    try:
+        id_a = getattr(a, "StoreID", None)
+        id_b = getattr(b, "StoreID", None)
+        if isinstance(id_a, str) and isinstance(id_b, str) and id_a and id_a == id_b:
+            return True
+    except Exception:
+        pass
+    try:
+        fp_a = getattr(a, "FilePath", None)
+        fp_b = getattr(b, "FilePath", None)
+        if isinstance(fp_a, str) and isinstance(fp_b, str) and fp_a and fp_b:
+            return _normalized_windows_path(fp_a) == _normalized_windows_path(fp_b)
+    except Exception:
+        pass
+    return False
+
+
+def _store_basename(store: Any) -> str:
+    try:
+        fp = getattr(store, "FilePath", None)
+        if isinstance(fp, str) and fp.strip():
+            return Path(fp).name
+    except Exception:
+        pass
+    return "unknown.pst"
+
+
+def _list_known_pst_sources(database_path: str | Path) -> list[str]:
+    """Return distinct PST source paths recorded in the DB."""
+    connection = connect_database(database_path, create=False, read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT DISTINCT pst_source FROM messages WHERE pst_source IS NOT NULL"
+        ).fetchall()
+    finally:
+        connection.close()
+    sources: list[str] = []
+    for row in rows:
+        raw = str(row[0] or "").strip()
+        if raw and classify_message_source({"pst_source": raw}) == "pst":
+            sources.append(raw)
+    return sources
+
+
+def _resolve_other_pst_stores(
+    namespace: Any,
+    recorded_store: Any,
+    known_pst_sources: Sequence[str],
+) -> tuple[list[Any], str | None]:
+    """Map DB-known PST sources to mounted stores, excluding *recorded_store*."""
+    other_stores: list[Any] = []
+    for source in known_pst_sources:
+        raw = str(source or "").strip()
+        if not raw or classify_message_source({"pst_source": raw}) != "pst":
+            continue
+        candidate, store_problem = _resolve_pst_store(namespace, raw)
+        if store_problem is not None:
+            return [], store_problem
+        if candidate is None:
+            continue
+        if _is_same_pst_store(candidate, recorded_store):
+            continue
+        if any(_is_same_pst_store(candidate, seen) for seen in other_stores):
+            continue
+        other_stores.append(candidate)
+    return other_stores, None
+
+
+def _find_pst_item_in_other_stores(
+    namespace: Any,
+    recorded_store: Any,
+    message: Mapping[str, object],
+    known_pst_sources: Sequence[str],
+) -> tuple[Any | None, str | None, str | None]:
+    """Search other DB-known mounted PST stores by Message-ID only."""
+    db_msg_id = message.get("message_id")
+    if not db_msg_id:
+        return None, None, None
+
+    other_stores, store_problem = _resolve_other_pst_stores(
+        namespace, recorded_store, known_pst_sources
+    )
+    if store_problem is not None:
+        return None, store_problem, None
+
+    expected = normalize_message_id(str(db_msg_id))
+    matches: list[tuple[str, Any]] = []
+    errors: list[str] = []
+
+    for other_store in other_stores:
+        store_name = _store_basename(other_store)
+        tally = _ScanTally()
+        try:
+            store_id = getattr(other_store, "StoreID", None)
+        except Exception:
+            store_id = None
+
+        try:
+            root_folder = other_store.GetRootFolder()
+        except Exception as exc:
+            errors.append(f"PST root folder access failed ({store_name}): {exc}")
+            continue
+        if root_folder is None:
+            errors.append(f"PST root folder is unavailable ({store_name})")
+            continue
+
+        search = _PstItemSearch(namespace, store_id, message, tally)
+        item, err = search.search_store(root_folder, expected, skip_folder=None)
+        if err is not None:
+            errors.append(err)
+            continue
+        if item is not None:
+            if tally.unreadable > 0:
+                errors.append(
+                    f"Target item found in {store_name}, but {tally.unreadable} "
+                    "items/folders could not be read, so uniqueness could not "
+                    "be proven."
+                )
+                continue
+            matches.append((store_name, item))
+
+    if len(matches) > 1:
+        return (
+            None,
+            f"Ambiguous: the message was found in {len(matches)} mounted PSTs "
+            f"({len(matches)} matches)",
+            None,
+        )
+    if errors:
+        return None, errors[0], None
+    if len(matches) == 1:
+        return matches[0][1], None, matches[0][0]
+    return None, None, None
+
+
 def export_from_pst(
     message: Mapping[str, object],
     destination_path: Path,
@@ -877,6 +1015,7 @@ def export_from_pst(
     overwrite: bool = False,
     skip_existing: bool = False,
     outlook_reader: Any | None = None,
+    known_pst_sources: Sequence[str] | None = None,
 ) -> OriginalExportResult:
     base = _base_result(message, "msg", "pst")
 
@@ -911,23 +1050,36 @@ def export_from_pst(
         )
 
     item, err = _find_pst_item(namespace, store, message)
+    found_store_name: str | None = None
     if err is not None:
         return replace(base, detail=err)
     if item is None:
-        return replace(
-            base, status="not_found", detail="Original message not found in PST."
-        )
+        if known_pst_sources is not None and message.get("message_id"):
+            item, err, found_store_name = _find_pst_item_in_other_stores(
+                namespace, store, message, known_pst_sources
+            )
+            if err is not None:
+                return replace(base, detail=err)
+        if item is None:
+            return replace(
+                base, status="not_found", detail="Original message not found in PST."
+            )
 
     def write_item(tmp_path: Path) -> None:
         item.SaveAs(str(tmp_path), 3)  # olMSG = 3
 
-    return _write_original_file(
+    result = _write_original_file(
         destination_path,
         base,
         overwrite=overwrite,
         skip_existing=skip_existing,
         save_to_tmp=write_item,
     )
+    if result.status == "exported" and found_store_name:
+        return replace(
+            result, detail=f"Found in another mounted PST: {found_store_name}"
+        )
+    return result
 
 
 def _verify_imap_rfc822(rfc822: bytes, message: Mapping[str, object]) -> bool:
@@ -1304,12 +1456,20 @@ def export_original_message(
     destination_path = dest_dir / filename
 
     if source_type == "pst":
+        try:
+            known_pst_sources = _list_known_pst_sources(database_path)
+        except Exception as exc:
+            return replace(
+                _base_result(message, fmt, source_type),
+                detail=f"could not list other PST sources: {exc}",
+            )
         return export_from_pst(
             message,
             destination_path,
             overwrite=overwrite,
             skip_existing=skip_existing,
             outlook_reader=outlook_reader,
+            known_pst_sources=known_pst_sources,
         )
     return export_from_imap(
         message,
