@@ -146,15 +146,17 @@ def persist_message(
     # busy_timeout here; no nested transaction management in this function.
     connection.execute("PRAGMA busy_timeout = 5000;")
 
+    candidates = message.dedup_key_candidates
+    placeholders = ", ".join("?" for _ in candidates)
     existing_row = connection.execute(
-        """
+        f"""
         SELECT id
         FROM messages
         WHERE (? IS NOT NULL AND message_id = ?)
-           OR dedup_key = ?
+           OR dedup_key IN ({placeholders})
         LIMIT 1
         """,
-        [message.message_id, message.message_id, message.dedup_key],
+        [message.message_id, message.message_id, *candidates],
     ).fetchone()
     if existing_row is not None:
         stored_id = int(existing_row["id"])

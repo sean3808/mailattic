@@ -698,7 +698,7 @@ def _matches_stored_dedup_key(
         )
     except Exception:
         return False  # identity unprovable: fail closed
-    return fresh.dedup_key == keys[0]
+    return keys[0] in fresh.dedup_key_candidates
 
 
 def _local_folder_dirs(account_root: Path) -> dict[str, Path]:

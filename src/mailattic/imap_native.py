@@ -223,18 +223,19 @@ def prune_ingested_maildir(
                 continue
 
             message_id = normalized.message_id
-            dedup_key = normalized.dedup_key
+            candidates = normalized.dedup_key_candidates
+            placeholders = ", ".join("?" for _ in candidates)
 
             # --- DB lookup ---------------------------------------------------
             try:
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT id FROM messages
                     WHERE (? IS NOT NULL AND message_id = ?)
-                       OR dedup_key = ?
+                       OR dedup_key IN ({placeholders})
                     LIMIT 1
                     """,
-                    [message_id, message_id, dedup_key],
+                    [message_id, message_id, *candidates],
                 ).fetchone()
             except Exception:
                 # DB read error: retain (fail-safe)

@@ -4,12 +4,13 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
 
 _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+_TAIPEI_TZ = timezone(timedelta(hours=8))
 
 
 def build_participant_search_text(display_name: str | None, email: str | None) -> str:
@@ -162,17 +163,46 @@ class NormalizedMessage:
     def attachment_search_text(self) -> str:
         return " ".join(name for name in self.attachment_names if name)
 
+    @staticmethod
+    def _is_aware_datetime(dt: datetime | None) -> bool:
+        return dt is not None and dt.tzinfo is not None and dt.utcoffset() is not None
+
+    def _fallback_sent_at_text(self) -> str:
+        if self.sent_at is None:
+            return ""
+        if self._is_aware_datetime(self.sent_at):
+            return self.sent_at.astimezone(UTC).isoformat()
+        return self.sent_at.isoformat()
+
+    def _fallback_dedup_key_for_fields(self, fields: dict[str, str]) -> str:
+        fingerprint = sha256(
+            json.dumps(fields, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return f"fallback:{fingerprint}"
+
     @property
     def dedup_key(self) -> str:
         if self.message_id:
             return f"message-id:{self.message_id}"
+        return self._fallback_dedup_key_for_fields(self._fallback_dedup_key_fields())
 
-        fingerprint = sha256(
-            json.dumps(self._fallback_dedup_key_fields(), sort_keys=True).encode(
-                "utf-8"
+    @property
+    def dedup_key_candidates(self) -> tuple[str, ...]:
+        """Candidate dedup keys ordered from canonical UTC to legacy offsets."""
+        if self.message_id or not self._is_aware_datetime(self.sent_at):
+            return (self.dedup_key,)
+        assert self.sent_at is not None
+        sent_texts = dict.fromkeys(
+            (
+                self.sent_at.astimezone(UTC).isoformat(),
+                self.sent_at.isoformat(),
+                self.sent_at.astimezone(_TAIPEI_TZ).isoformat(),
             )
-        ).hexdigest()
-        return f"fallback:{fingerprint}"
+        )
+        return tuple(
+            self._fallback_dedup_key_for_fields(self._fallback_dedup_key_fields(text))
+            for text in sent_texts
+        )
 
     @property
     def dedup_basis(self) -> str:
@@ -205,12 +235,15 @@ class NormalizedMessage:
             sort_keys=True,
         )
 
-    def _fallback_dedup_key_fields(self) -> dict[str, str]:
-        sent_text = self.sent_at.isoformat() if self.sent_at else ""
+    def _fallback_dedup_key_fields(
+        self, sent_text: str | None = None
+    ) -> dict[str, str]:
         return {
             "body_sha256": sha256(self.body_text.encode("utf-8")).hexdigest(),
             "sender": self.sender.search_text,
-            "sent_at": sent_text,
+            "sent_at": self._fallback_sent_at_text()
+            if sent_text is None
+            else sent_text,
             "subject": self.subject,
         }
 
