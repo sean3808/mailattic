@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from time import perf_counter
 
 import pytest
 
@@ -11,31 +12,32 @@ from tests._timing import DOUBLING_MAX_RATIO, report, time_ratio
 
 _SENTENCE = "Please quote the price and shipment date. "
 
-# 4x input: linear ~4x, quadratic ~16x. Generous margin against noise.
-_BODY_4X_MAX_RATIO = 10.0
+
+def _best_time(text: str, repeats: int = 3) -> float:
+    best = float("inf")
+    for _ in range(repeats):
+        start = perf_counter()
+        render_text(text)
+        best = min(best, perf_counter() - start)
+    return best
 
 
-def test_render_text_cost_is_not_quadratic_on_long_english_body(
-    request: pytest.FixtureRequest,
-) -> None:
+def test_render_text_cost_is_not_quadratic_on_long_english_body():
     # Sizes big enough that the linear path takes milliseconds, not microseconds:
     # under xdist load a ~1 ms baseline makes the ratio jitter.
     small = (_SENTENCE * 3200)[:32_000]
     large = (_SENTENCE * 12800)[:128_000]
-    ratio = time_ratio(lambda: render_text(large), lambda: render_text(small))
-    report(request, f"render_text english body: 128k / 32k time ratio = {ratio:.2f}")
-    assert ratio < _BODY_4X_MAX_RATIO, (
-        f"4x input cost {ratio:.1f}x (quadratic would be ~16x)"
-    )
+    ratio = _best_time(large, 5) / max(_best_time(small, 5), 1e-6)
+    # 4x input: linear ~4x, quadratic ~16x. Generous margin against noise.
+    assert ratio < 10, f"4x input cost {ratio:.1f}x (quadratic would be ~16x)"
 
 
 # At N=8000, linear cases took 1-7 ms, where xdist scheduler jitter swamps a
 # ratio. Enlarging to 40k vs 80k puts every baseline at 11-148 ms; measured
-# locally across all 9 shapes: 1.93x-2.23x. 3.0 sits between linear (~2x) and
-# quadratic (~4x).
+# locally across all 9 shapes: 1.91x-2.62x. DOUBLING_MAX_RATIO (3.0) sits
+# between linear (~2x) and quadratic (~4x).
 _SELECTOR_BASELINE_N = 40_000
 _SELECTOR_LARGE_N = 80_000
-_SELECTOR_DOUBLING_MAX_RATIO = DOUBLING_MAX_RATIO
 
 
 def _not_css_block(n: int) -> str:
@@ -86,4 +88,4 @@ def test_render_text_stays_fast_on_long_selector_runs(
         request,
         f"render_text selector ({case_id}): 80k / 40k time ratio = {ratio:.2f}",
     )
-    assert ratio <= _SELECTOR_DOUBLING_MAX_RATIO
+    assert ratio <= DOUBLING_MAX_RATIO

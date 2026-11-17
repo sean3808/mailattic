@@ -52,8 +52,6 @@ def measure_seconds(fn: Callable[[], object]) -> float:
 def time_ratio(
     subject: Callable[[], object],
     baseline: Callable[[], object],
-    *,
-    repeats: int = DEFAULT_REPEATS,
 ) -> float:
     """Best *subject* time over best *baseline* time.
 
@@ -61,7 +59,7 @@ def time_ratio(
     hits both; each side's minimum filters the remaining scheduler noise.
     """
     best_subject = best_baseline = float("inf")
-    for _ in range(repeats):
+    for _ in range(DEFAULT_REPEATS):
         best_subject = min(best_subject, measure_seconds(subject))
         best_baseline = min(best_baseline, measure_seconds(baseline))
     return best_subject / max(best_baseline, 1e-9)

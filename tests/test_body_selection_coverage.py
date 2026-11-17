@@ -428,9 +428,9 @@ def test_html_only_data_table_has_no_plain_warning() -> None:
 
 # --- linear time (doubling input stays near 2x, never quadratic ~4x) --------
 
-# Measured locally: 20k->40k matching words ~2.1x, 1x->2x noise runs ~2.1x,
-# 20k->40k missing tokens ~2.1x. 3.0 sits between linear (~2x) and quadratic (~4x).
-_COVERAGE_DOUBLING_MAX_RATIO = DOUBLING_MAX_RATIO
+# Measured locally: 20k->40k matching words ~2.03-2.22x, 1x->2x noise runs
+# ~1.75-1.89x, 20k->40k missing tokens ~1.80-2.01x. DOUBLING_MAX_RATIO (3.0)
+# sits between linear (~2x) and quadratic (~4x).
 
 
 def test_matching_large_bodies_are_decided_in_linear_time(
@@ -451,7 +451,7 @@ def test_matching_large_bodies_are_decided_in_linear_time(
         request,
         f"coverage matching bodies: 40k / 20k words time ratio = {ratio:.2f}",
     )
-    assert ratio <= _COVERAGE_DOUBLING_MAX_RATIO
+    assert ratio <= DOUBLING_MAX_RATIO
 
 
 def test_near_miss_noise_runs_stay_linear(request: pytest.FixtureRequest) -> None:
@@ -471,7 +471,7 @@ def test_near_miss_noise_runs_stay_linear(request: pytest.FixtureRequest) -> Non
         request,
         f"coverage noise runs: 2x / 1x scale time ratio = {ratio:.2f}",
     )
-    assert ratio <= _COVERAGE_DOUBLING_MAX_RATIO
+    assert ratio <= DOUBLING_MAX_RATIO
 
 
 def test_many_distinct_missing_tokens_fall_back_in_linear_time(
@@ -491,7 +491,7 @@ def test_many_distinct_missing_tokens_fall_back_in_linear_time(
         request,
         f"coverage missing tokens: 40k / 20k words time ratio = {ratio:.2f}",
     )
-    assert ratio <= _COVERAGE_DOUBLING_MAX_RATIO
+    assert ratio <= DOUBLING_MAX_RATIO
 
 
 def test_short_plain_body_cannot_be_dropped_whole() -> None:

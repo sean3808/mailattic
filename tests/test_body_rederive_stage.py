@@ -1924,11 +1924,6 @@ def test_degradation_reason_ignores_css_text_leaked_outside_style_tags():
     assert stage_module._degradation_reason(old, VISIBLE_CJK + ACCENTED) is None
 
 
-# Measured locally across the 5 shapes (baselines 7.5-55 ms): 1.75x-2.05x
-# on 2x input. 3.0 sits between linear (~2x) and quadratic (~4x).
-_STRIP_STYLE_DOUBLING_MAX_RATIO = DOUBLING_MAX_RATIO
-
-
 @pytest.mark.parametrize(
     "build_filler",
     [
@@ -1960,7 +1955,10 @@ def test_strip_style_text_stays_linear_on_long_near_matches(request, build_fille
         request,
         f"strip_style_text ({case_id}): 2x / 1x scale time ratio = {ratio:.2f}",
     )
-    assert ratio <= _STRIP_STYLE_DOUBLING_MAX_RATIO
+    # Measured locally across the 5 shapes (baselines 7.5-55 ms): 1.75x-2.29x
+    # on 2x input. DOUBLING_MAX_RATIO (3.0) sits between linear (~2x) and
+    # quadratic (~4x).
+    assert ratio <= DOUBLING_MAX_RATIO
 
 
 def test_pst_degraded_rewrites_are_kept_and_good_rewrite_still_staged(
