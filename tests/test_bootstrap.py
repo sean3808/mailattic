@@ -1652,7 +1652,10 @@ class BootstrapTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
 
-    def test_readpst_parser_omits_j_flag_by_default(self) -> None:
+    def test_readpst_parser_runs_serially_by_default(self) -> None:
+        # readpst's default parallel mode is nondeterministic: it can drop a
+        # message or stop early and still exit 0 (#123). Without an explicit
+        # parallel_jobs the parser must ask for serial mode with "-j 0".
         with tempfile.TemporaryDirectory() as temp_dir:
             stub_readpst = _write_stub_readpst(Path(temp_dir))
             parser = ReadpstParser(
@@ -1666,7 +1669,10 @@ class BootstrapTests(unittest.TestCase):
             )
 
             self.assertEqual(command[0], str(stub_readpst.resolve()))
-            self.assertNotIn("-j", command)
+            self.assertEqual(command.count("-j"), 1)
+            j_index = command.index("-j")
+            self.assertEqual(command[j_index + 1], "0")
+            self.assertEqual(command[j_index + 2], "-o")
 
     def test_readpst_parser_includes_j_flag_when_set(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

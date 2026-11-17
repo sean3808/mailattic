@@ -491,9 +491,12 @@ class ReadpstParser:
             )
 
     def _build_readpst_command(self, source_path: Path, output_root: Path) -> list[str]:
-        command = [str(self._readpst_path), "-r", "-q"]
-        if self._parallel_jobs is not None:
-            command += ["-j", str(self._parallel_jobs)]
+        # readpst's own default forks children per folder, and that mode is
+        # nondeterministic: a run can drop a message from a parent folder or
+        # stop early, still exiting 0 (#123). "-j 0" turns forking off; only an
+        # explicit parallel_jobs opts back into it.
+        jobs = self._parallel_jobs if self._parallel_jobs is not None else 0
+        command = [str(self._readpst_path), "-r", "-q", "-j", str(jobs)]
         command += ["-o", str(output_root), str(source_path)]
         return command
 
