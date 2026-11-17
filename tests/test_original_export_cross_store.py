@@ -683,3 +683,77 @@ def test_cross_store_ignores_recorded_entry_id_and_dedups_relocated_source(
     assert result.status == "exported"
     assert dest.read_bytes().endswith(b"entry-new-id")
     assert result.detail == "Found in another mounted PST: archive.pst"
+
+
+def test_found_by_recorded_entry_id_never_calls_get_root_folder(
+    tmp_path: Path,
+) -> None:
+    recorded_pst = str(tmp_path / "account.pst")
+    target_id = "<by-entry@example.test>"
+
+    direct_item = FakeOutlookItem("entry-direct", "Direct", target_id)
+    recorded_root = FakeOutlookFolder(
+        "Root",
+        folders=[FakeOutlookFolder("Inbox", [direct_item])],
+    )
+    recorded_store = _SpyOutlookStore(recorded_pst, recorded_root)
+    namespace = FakeOutlookNamespace(
+        [recorded_store], items_by_id={"entry-direct": direct_item}
+    )
+    recorded_store.root_calls = 0
+    dest = tmp_path / "exports" / "direct.msg"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    result = export_from_pst(
+        _base_message(
+            recorded_pst, message_id=target_id, logical_locator="entry-direct"
+        ),
+        dest,
+        outlook_reader=FakeOutlookReader(namespace),
+        known_pst_sources=[recorded_pst],
+    )
+
+    assert result.status == "exported"
+    assert recorded_store.root_calls == 0
+
+
+def test_found_in_recorded_store_never_calls_known_pst_sources_loader(
+    tmp_path: Path,
+) -> None:
+    recorded_pst = str(tmp_path / "account.pst")
+    target_id = "<lazy-skip@example.test>"
+    db_path, ids = _seed_db_with_pst_rows(
+        tmp_path,
+        [
+            {
+                "pst_path": recorded_pst,
+                "message_id": target_id,
+                "entry_id": "entry-here",
+                "subject": "Found In Recorded",
+            }
+        ],
+    )
+
+    recorded_root = FakeOutlookFolder(
+        "Root",
+        folders=[
+            FakeOutlookFolder(
+                "Inbox", [FakeOutlookItem("entry-here", "Found In Recorded", target_id)]
+            )
+        ],
+    )
+    namespace = FakeOutlookNamespace([FakeOutlookStore(recorded_pst, recorded_root)])
+
+    with patch(
+        "mailattic.original_export._list_known_pst_sources",
+        side_effect=sqlite3.OperationalError("should not be called"),
+    ):
+        result = export_original_message(
+            db_path,
+            ids[0],
+            tmp_path / "exports",
+            outlook_reader=FakeOutlookReader(namespace),
+        )
+
+    assert result.status == "exported"
+    assert result.detail is None
