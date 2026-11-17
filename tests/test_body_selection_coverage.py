@@ -24,7 +24,6 @@ Assumptions encoded: the warning and the plain body are separated by a newline
 
 from __future__ import annotations
 
-import time
 from collections import Counter
 from email import message_from_bytes, policy
 from email.message import EmailMessage
@@ -32,6 +31,7 @@ from email.message import EmailMessage
 import pytest
 
 import mailattic.parser as parser
+from tests._timing import DOUBLING_MAX_RATIO, report, time_ratio
 
 PREFIX = "[表格失真提示]"
 
@@ -426,46 +426,72 @@ def test_html_only_data_table_has_no_plain_warning() -> None:
     assert PREFIX not in body
 
 
-# --- linear time (300k-character bodies decided in < 2 s) -------------------
+# --- linear time (doubling input stays near 2x, never quadratic ~4x) --------
+
+# Measured locally: 20k->40k matching words ~2.1x, 1x->2x noise runs ~2.1x,
+# 20k->40k missing tokens ~2.1x. 3.0 sits between linear (~2x) and quadratic (~4x).
+_COVERAGE_DOUBLING_MAX_RATIO = DOUBLING_MAX_RATIO
 
 
-def test_matching_large_bodies_are_decided_in_linear_time() -> None:
+def test_matching_large_bodies_are_decided_in_linear_time(
+    request: pytest.FixtureRequest,
+) -> None:
     # pins unchanged behaviour
-    words = " ".join(f"word{i}" for i in range(40_000))  # ~ 300k characters
-    plain = f"{words}\n{TABLE_FLATTENED}"
-    html = f"<html><body><p>{words}</p>{TABLE_HTML}</body></html>"
-    msg = _alternative(plain, html)
-    start = time.perf_counter()
-    body = _parse(msg)
-    elapsed = time.perf_counter() - start
-    assert elapsed < 2.0
-    _assert_html_won(body)
+    def build(word_count: int) -> EmailMessage:
+        words = " ".join(f"word{i}" for i in range(word_count))
+        plain = f"{words}\n{TABLE_FLATTENED}"
+        html = f"<html><body><p>{words}</p>{TABLE_HTML}</body></html>"
+        return _alternative(plain, html)
+
+    small_msg = build(20_000)
+    large_msg = build(40_000)  # ~ 300k characters
+    _assert_html_won(_parse(large_msg))
+    ratio = time_ratio(lambda: _parse(large_msg), lambda: _parse(small_msg))
+    report(
+        request,
+        f"coverage matching bodies: 40k / 20k words time ratio = {ratio:.2f}",
+    )
+    assert ratio <= _COVERAGE_DOUBLING_MAX_RATIO
 
 
-def test_near_miss_noise_runs_stay_linear() -> None:
+def test_near_miss_noise_runs_stay_linear(request: pytest.FixtureRequest) -> None:
     # PC-231: long runs that almost look like an address or URL (no "@", no
     # "://") must not make the decision quadratic. Same run on both sides.
-    run = "a" * 200_000 + " " + ("x" * 50 + ".") * 4_000
-    plain = f"{run}\n{TABLE_FLATTENED}"
-    html = f"<html><body><p>{run}</p>{TABLE_HTML}</body></html>"
-    msg = _alternative(plain, html)
-    start = time.perf_counter()
-    body = _parse(msg)
-    elapsed = time.perf_counter() - start
-    assert elapsed < 2.0
-    _assert_html_won(body)
+    def build(scale: int) -> EmailMessage:
+        run = "a" * (100_000 * scale) + " " + ("x" * 50 + ".") * (2_000 * scale)
+        plain = f"{run}\n{TABLE_FLATTENED}"
+        html = f"<html><body><p>{run}</p>{TABLE_HTML}</body></html>"
+        return _alternative(plain, html)
+
+    small_msg = build(1)
+    large_msg = build(2)
+    _assert_html_won(_parse(large_msg))
+    ratio = time_ratio(lambda: _parse(large_msg), lambda: _parse(small_msg))
+    report(
+        request,
+        f"coverage noise runs: 2x / 1x scale time ratio = {ratio:.2f}",
+    )
+    assert ratio <= _COVERAGE_DOUBLING_MAX_RATIO
 
 
-def test_many_distinct_missing_tokens_fall_back_in_linear_time() -> None:
-    words = " ".join(f"word{i}" for i in range(40_000))
-    plain = f"{words}\n{TABLE_FLATTENED}"
-    html = f"<html><body>{TABLE_HTML}</body></html>"
-    msg = _alternative(plain, html)
-    start = time.perf_counter()
-    body = _parse(msg)
-    elapsed = time.perf_counter() - start
-    assert elapsed < 2.0
-    _assert_plain_fallback(body, plain)
+def test_many_distinct_missing_tokens_fall_back_in_linear_time(
+    request: pytest.FixtureRequest,
+) -> None:
+    def build(word_count: int) -> tuple[EmailMessage, str]:
+        words = " ".join(f"word{i}" for i in range(word_count))
+        plain = f"{words}\n{TABLE_FLATTENED}"
+        html = f"<html><body>{TABLE_HTML}</body></html>"
+        return _alternative(plain, html), plain
+
+    small_msg, _ = build(20_000)
+    large_msg, large_plain = build(40_000)
+    _assert_plain_fallback(_parse(large_msg), large_plain)
+    ratio = time_ratio(lambda: _parse(large_msg), lambda: _parse(small_msg))
+    report(
+        request,
+        f"coverage missing tokens: 40k / 20k words time ratio = {ratio:.2f}",
+    )
+    assert ratio <= _COVERAGE_DOUBLING_MAX_RATIO
 
 
 def test_short_plain_body_cannot_be_dropped_whole() -> None:

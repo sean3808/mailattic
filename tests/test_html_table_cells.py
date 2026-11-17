@@ -12,12 +12,10 @@ code before #14 phase 1; every other test encodes new behaviour.
 
 from __future__ import annotations
 
-import gc
-import time
-
 import pytest
 
 from mailattic.parser import _html_to_text
+from tests._timing import DOUBLING_MAX_RATIO, report, time_ratio
 
 
 def _lines(html: str) -> list[str]:
@@ -324,59 +322,10 @@ def test_text_outside_tables_is_unchanged() -> None:
 # --- performance (PC-231) -------------------------------------------------
 
 
-# Timing is compared inside one process (growth between two sizes, or against a
-# linear control), never against an absolute number of seconds: a hosted runner
-# or coverage tracing slows both sides alike, so the ratio stays put (#104).
-# Doubling the input costs ~2x when linear and ~4x when quadratic; 3.0 sits
-# between the two. A quadratic term trips it once it costs about twice the
-# linear work at the larger size.
-_DOUBLING_MAX_RATIO = 3.0
 # Measured locally: the guarded (plain-fallback) path runs at ~1.0x the linear
 # control; with the slot-limit guard removed the carry-over grid runs at
 # ~3.3-4x. 2.0 sits between the two with headroom on each side.
 _GUARD_VS_CONTROL_MAX_RATIO = 2.0
-_TIMING_REPEATS = 5
-
-
-def _report(request: pytest.FixtureRequest, message: str) -> None:
-    """Print once into the run output even when pytest captures stdout (E4)."""
-    reporter = request.config.pluginmanager.getplugin("terminalreporter")
-    if reporter is not None:
-        reporter.write_line(message)
-    else:
-        print(message)
-
-
-def _seconds(html: str) -> float:
-    """One conversion, timed with the garbage collector out of the way.
-
-    Collecting first and pausing the collector while timing (as ``timeit``
-    does) keeps a full collection of the pytest session's objects from landing
-    inside one side of the ratio.
-    """
-    gc.collect()
-    was_enabled = gc.isenabled()
-    gc.disable()
-    try:
-        start = time.perf_counter()
-        _html_to_text(html)
-        return time.perf_counter() - start
-    finally:
-        if was_enabled:
-            gc.enable()
-
-
-def _time_ratio(subject: str, baseline: str) -> float:
-    """Best subject time over best baseline time.
-
-    The two sides are timed alternately, so a slow stretch on a shared runner
-    hits both; each side's minimum filters the remaining scheduler noise.
-    """
-    best_subject = best_baseline = float("inf")
-    for _ in range(_TIMING_REPEATS):
-        best_subject = min(best_subject, _seconds(subject))
-        best_baseline = min(best_baseline, _seconds(baseline))
-    return best_subject / best_baseline
 
 
 def test_large_table_converts_quickly(request: pytest.FixtureRequest) -> None:
@@ -389,14 +338,15 @@ def test_large_table_converts_quickly(request: pytest.FixtureRequest) -> None:
         return f"<table>{rows}</table>"
 
     html = build(2000)
+    large_html = build(4000)
     lines = _lines(html)
     assert len(lines) == 2000
     assert lines[0].startswith("r0c0 | r0c1 |")
     # 4000 vs 2000 rows: at 20 slots per row a quadratic term needs this many
     # rows before it outweighs the linear parsing cost.
-    ratio = _time_ratio(build(4000), html)
-    _report(request, f"large table: 4000 rows / 2000 rows time ratio = {ratio:.2f}")
-    assert ratio <= _DOUBLING_MAX_RATIO
+    ratio = time_ratio(lambda: _html_to_text(large_html), lambda: _html_to_text(html))
+    report(request, f"large table: 4000 rows / 2000 rows time ratio = {ratio:.2f}")
+    assert ratio <= DOUBLING_MAX_RATIO
 
 
 def test_many_rowspan_100_cells_convert_quickly(
@@ -412,13 +362,14 @@ def test_many_rowspan_100_cells_convert_quickly(
         return f"<table>{rows}</table>"
 
     html = build(900)
+    half_html = build(450)
     lines = _lines(html)
     assert len(lines) == 900
     assert _warning() not in lines
     # Half size, not double: 1800 rows would cross the slot cap.
-    ratio = _time_ratio(html, build(450))
-    _report(request, f"rowspan 100: 900 rows / 450 rows time ratio = {ratio:.2f}")
-    assert ratio <= _DOUBLING_MAX_RATIO
+    ratio = time_ratio(lambda: _html_to_text(html), lambda: _html_to_text(half_html))
+    report(request, f"rowspan 100: 900 rows / 450 rows time ratio = {ratio:.2f}")
+    assert ratio <= DOUBLING_MAX_RATIO
 
 
 # --- review round 1 fixes (spec-1d) ----------------------------------------
@@ -485,13 +436,14 @@ def test_rowspan_carry_over_beyond_slot_limit_warns_and_stays_fast(
         return f"<table>{rows}</table>"
 
     html = build(100)
+    control_html = build(1)
     lines = _lines(html)
     assert lines[0] == _warning()
     assert " | " not in "\n".join(lines)  # plain fallback, no grid
     # Control: same cell count and markup size, no carry-over (a linear grid).
     # Without the guard the carried slots dwarf it.
-    ratio = _time_ratio(html, build(1))
-    _report(
+    ratio = time_ratio(lambda: _html_to_text(html), lambda: _html_to_text(control_html))
+    report(
         request,
         f"rowspan carry-over guard: guarded / linear control time ratio = {ratio:.2f}",
     )
