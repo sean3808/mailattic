@@ -21,7 +21,6 @@ import json
 import mailbox
 import sqlite3
 import sys
-import time
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -39,6 +38,7 @@ from mailattic.models import ExtractionResult, IngestFailure  # noqa: E402
 from mailattic.mutf7 import encode_mutf7  # noqa: E402
 from mailattic.parser import ReadpstParser  # noqa: E402
 from mailattic.storage import connect_database, initialize_database  # noqa: E402
+from tests._timing import DOUBLING_MAX_RATIO, report, time_ratio  # noqa: E402
 
 PLAIN_FLAT = "Item Qty Price A 1 5"
 TABLE_HTML = (
@@ -1925,22 +1925,40 @@ def test_degradation_reason_ignores_css_text_leaked_outside_style_tags():
 
 
 @pytest.mark.parametrize(
-    "filler",
+    "build_filler",
     [
-        pytest.param("a" * 200_000, id="letters"),
-        pytest.param("font-" * 40_000, id="font-prefixes"),
-        pytest.param("mso-" + "a-" * 100_000, id="mso-declaration"),
-        pytest.param("{" + "a:b " * 50_000, id="unclosed-rule-body"),
-        pytest.param("<style>" * 30_000, id="unclosed-style-tags"),
+        pytest.param(lambda scale: "a" * (scale * 1_000_000), id="letters"),
+        pytest.param(lambda scale: "font-" * (scale * 40_000), id="font-prefixes"),
+        pytest.param(
+            lambda scale: "mso-" + "a-" * (scale * 200_000), id="mso-declaration"
+        ),
+        pytest.param(
+            lambda scale: "{" + "a:b " * (scale * 100_000), id="unclosed-rule-body"
+        ),
+        pytest.param(
+            lambda scale: "<style>" * (scale * 30_000), id="unclosed-style-tags"
+        ),
     ],
 )
-def test_strip_style_text_stays_linear_on_long_near_matches(filler):
+def test_strip_style_text_stays_linear_on_long_near_matches(request, build_filler):
     # Each shape took seconds at 50k characters with the first patterns and
     # grew quadratically; bodies reach ~1.5M characters (PC-231).
-    old = "中文內容備貨出口通知單" * 2 + filler
-    started = time.perf_counter()
-    stage_module._strip_style_text(old)
-    assert time.perf_counter() - started < 2.0
+    prefix = "中文內容備貨出口通知單" * 2
+    small = prefix + build_filler(1)
+    large = prefix + build_filler(2)
+    ratio = time_ratio(
+        lambda: stage_module._strip_style_text(large),
+        lambda: stage_module._strip_style_text(small),
+    )
+    case_id = request.node.callspec.id
+    report(
+        request,
+        f"strip_style_text ({case_id}): 2x / 1x scale time ratio = {ratio:.2f}",
+    )
+    # Measured locally across the 5 shapes (baselines 7.5-55 ms): 1.75x-2.29x
+    # on 2x input. DOUBLING_MAX_RATIO (3.0) sits between linear (~2x) and
+    # quadratic (~4x).
+    assert ratio <= DOUBLING_MAX_RATIO
 
 
 def test_pst_degraded_rewrites_are_kept_and_good_rewrite_still_staged(
