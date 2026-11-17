@@ -527,7 +527,9 @@ _TAG_BLOCK_OPEN_RE = re.compile(r"<(style|script)\b", re.IGNORECASE)
 _TAG_BLOCK_CLOSE_RES = {
     name: re.compile(rf"</{name}\s*>", re.IGNORECASE) for name in ("style", "script")
 }
-_CSS_RULE_BODY_RE = re.compile(r"\{[^{}:]*:[^{}]*\}")
+# A rule body must open with a bare CSS property name, so visible JSON such
+# as ``{"key":"value"}`` in a plain-text body is not mistaken for CSS.
+_CSS_RULE_BODY_RE = re.compile(r"\{\s*[a-z-]{1,64}\s*:[^{}]*\}", re.IGNORECASE)
 # A value stops at a quote or angle bracket, so a brace-less declaration
 # inside an attribute (``style="font-family:Arial"``) never runs past the
 # attribute or tag end into visible text; a quoted font name is one unit.

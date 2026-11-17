@@ -1912,6 +1912,12 @@ def test_degradation_reason_font_rule_stops_at_attribute_end(style_attr):
     assert stage_module._degradation_reason(old, new) == "mojibake"
 
 
+def test_degradation_reason_keeps_visible_json_out_of_css_rule_bodies():
+    visible = '{"通知":"中文內容備貨出口通知單請查收附件"}\n' * 3
+    new = visible.encode("utf-8").decode("latin-1")
+    assert stage_module._degradation_reason(visible, new) == "mojibake"
+
+
 def test_degradation_reason_ignores_css_text_leaked_outside_style_tags():
     leaked = "p { font-family: 微軟正黑體, 新細明體; }\n" * 60
     old = f"{VISIBLE_CJK}\n{leaked}"
