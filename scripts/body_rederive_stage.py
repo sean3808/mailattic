@@ -519,12 +519,29 @@ def _base64_line_share(text: str) -> float:
     return sum(1 for line in lines if _BASE64_LINE_RE.match(line)) / len(lines)
 
 
+_STYLE_SCRIPT_RE = re.compile(
+    r"<(style|script)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+)
+_CSS_RULE_BODY_RE = re.compile(r"\{[^{}]*:[^{}]*\}")
+_CSS_FONT_DECL_RE = re.compile(
+    r"(?:[a-z-]*font[a-z-]*|mso-[a-z-]+)\s*:[^;{}\n]*;?", re.IGNORECASE
+)
+
+
+def _strip_style_text(text: str) -> str:
+    """Drop style/script blocks and CSS declarations, whose CJK font names
+    would otherwise inflate the CJK count of an old body (#122)."""
+    text = _STYLE_SCRIPT_RE.sub(" ", text)
+    text = _CSS_RULE_BODY_RE.sub(" ", text)
+    return _CSS_FONT_DECL_RE.sub(" ", text)
+
+
 def _degradation_reason(old: str, new: str) -> str | None:
     """Why *new* is visibly worse than *old*: ``"mojibake"`` (CJK text turned
     into Latin-1 high characters), ``"base64"`` (readable text turned into
     mostly raw base64 lines), or None. When it cannot be told, None (keep the
     rewrite decision to the caller; PC-230)."""
-    old_cjk = _count_range(old, 0x4E00, 0x9FFF)
+    old_cjk = _count_range(_strip_style_text(old), 0x4E00, 0x9FFF)
     if (
         old_cjk >= _MOJIBAKE_OLD_CJK_MIN
         and _count_range(new, 0x4E00, 0x9FFF) < _MOJIBAKE_CJK_KEEP_RATIO * old_cjk

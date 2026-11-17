@@ -1848,6 +1848,42 @@ def test_degradation_reason_ignores_base64_in_both():
     assert stage_module._degradation_reason(OLD_TEXT, half) is None
 
 
+CSS_BLOCK = (
+    "<style>"
+    + "p { font-family: 微軟正黑體, 新細明體; mso-fareast-font-family: 新細明體; }\n"
+    * 60
+    + "</style>"
+)
+VISIBLE_CJK = "測試內容"
+ACCENTED = "café résumé naïve " * 10
+
+
+def test_degradation_reason_ignores_cjk_in_css_of_old_body():
+    old = f"<html><head>{CSS_BLOCK}</head><body><p>{VISIBLE_CJK}</p></body></html>"
+    new = f"<html><body><p>{VISIBLE_CJK} {ACCENTED}</p></body></html>"
+    assert stage_module._degradation_reason(old, new) is None
+
+
+def test_degradation_reason_still_flags_real_mojibake_with_css_present():
+    visible = "中文內容備貨出口通知單請查收附件" * 3
+    old = f"<html><head>{CSS_BLOCK}</head><body><p>{visible}</p></body></html>"
+    new = visible.encode("utf-8").decode("latin-1")
+    assert stage_module._degradation_reason(old, new) == "mojibake"
+    assert stage_module._degradation_reason(visible, new) == "mojibake"
+
+
+def test_degradation_reason_ignores_old_body_whose_cjk_is_only_css():
+    old = f"<html><head>{CSS_BLOCK}</head><body><p>Plain text</p></body></html>"
+    new = f"<html><body><p>Plain text {ACCENTED}</p></body></html>"
+    assert stage_module._degradation_reason(old, new) is None
+
+
+def test_degradation_reason_ignores_css_text_leaked_outside_style_tags():
+    leaked = "p { font-family: 微軟正黑體, 新細明體; }\n" * 60
+    old = f"{VISIBLE_CJK}\n{leaked}"
+    assert stage_module._degradation_reason(old, VISIBLE_CJK + ACCENTED) is None
+
+
 def test_pst_degraded_rewrites_are_kept_and_good_rewrite_still_staged(
     tmp_path, stub_readpst
 ):
