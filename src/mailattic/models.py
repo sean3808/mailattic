@@ -4,13 +4,14 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
 
+from .datetime_bounds import TAIPEI
+
 _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
-_TAIPEI_TZ = timezone(timedelta(hours=8))
 
 
 def build_participant_search_text(display_name: str | None, email: str | None) -> str:
@@ -163,18 +164,17 @@ class NormalizedMessage:
     def attachment_search_text(self) -> str:
         return " ".join(name for name in self.attachment_names if name)
 
-    @staticmethod
-    def _is_aware_datetime(dt: datetime | None) -> bool:
-        return dt is not None and dt.tzinfo is not None and dt.utcoffset() is not None
-
     def _fallback_sent_at_text(self) -> str:
-        if self.sent_at is None:
+        """Canonical (#85): aware instants render in UTC; naive/None as before."""
+        sent_at = self.sent_at
+        if sent_at is None:
             return ""
-        if self._is_aware_datetime(self.sent_at):
-            return self.sent_at.astimezone(UTC).isoformat()
-        return self.sent_at.isoformat()
+        if sent_at.utcoffset() is None:
+            return sent_at.isoformat()
+        return sent_at.astimezone(UTC).isoformat()
 
-    def _fallback_dedup_key_for_fields(self, fields: dict[str, str]) -> str:
+    def _fallback_key(self, sent_text: str) -> str:
+        fields = self._fallback_dedup_key_fields(sent_text)
         fingerprint = sha256(
             json.dumps(fields, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -184,25 +184,26 @@ class NormalizedMessage:
     def dedup_key(self) -> str:
         if self.message_id:
             return f"message-id:{self.message_id}"
-        return self._fallback_dedup_key_for_fields(self._fallback_dedup_key_fields())
+        return self._fallback_key(self._fallback_sent_at_text())
 
     @property
     def dedup_key_candidates(self) -> tuple[str, ...]:
-        """Candidate dedup keys ordered from canonical UTC to legacy offsets."""
-        if self.message_id or not self._is_aware_datetime(self.sent_at):
+        """Keys a stored copy of this mail may carry: canonical first, then legacy.
+
+        Keys stored before #85 rendered ``sent_at`` with whatever offset the
+        import path gave it -- the mail's own offset, or Taipei for the PST
+        path. They are never rewritten, so duplicate lookups try them too.
+        """
+        sent_at = self.sent_at
+        if self.message_id or sent_at is None or sent_at.utcoffset() is None:
             return (self.dedup_key,)
-        assert self.sent_at is not None
-        sent_texts = dict.fromkeys(
-            (
-                self.sent_at.astimezone(UTC).isoformat(),
-                self.sent_at.isoformat(),
-                self.sent_at.astimezone(_TAIPEI_TZ).isoformat(),
+        legacy = (
+            self._fallback_key(text)
+            for text in dict.fromkeys(
+                (sent_at.isoformat(), sent_at.astimezone(TAIPEI).isoformat())
             )
         )
-        return tuple(
-            self._fallback_dedup_key_for_fields(self._fallback_dedup_key_fields(text))
-            for text in sent_texts
-        )
+        return tuple(dict.fromkeys((self.dedup_key, *legacy)))
 
     @property
     def dedup_basis(self) -> str:
@@ -229,21 +230,19 @@ class NormalizedMessage:
                     "pst_source": self.pst_source,
                     "recipient_search_text": self.recipient_search_text,
                 },
-                "key_fields": self._fallback_dedup_key_fields(),
+                "key_fields": self._fallback_dedup_key_fields(
+                    self._fallback_sent_at_text()
+                ),
                 "method": "fallback",
             },
             sort_keys=True,
         )
 
-    def _fallback_dedup_key_fields(
-        self, sent_text: str | None = None
-    ) -> dict[str, str]:
+    def _fallback_dedup_key_fields(self, sent_text: str) -> dict[str, str]:
         return {
             "body_sha256": sha256(self.body_text.encode("utf-8")).hexdigest(),
             "sender": self.sender.search_text,
-            "sent_at": self._fallback_sent_at_text()
-            if sent_text is None
-            else sent_text,
+            "sent_at": sent_text,
             "subject": self.subject,
         }
 
