@@ -31,6 +31,7 @@ from .quarantine import (
 from .storage import (
     close_self_healed_failures,
     connect_database,
+    find_existing_message_id,
     initialize_database,
     set_imap_progress,
 )
@@ -222,27 +223,15 @@ def prune_ingested_maildir(
                 counts["kept_unparseable"] += 1
                 continue
 
-            message_id = normalized.message_id
-            candidates = normalized.dedup_key_candidates
-            placeholders = ", ".join("?" for _ in candidates)
-
             # --- DB lookup ---------------------------------------------------
             try:
-                row = conn.execute(
-                    f"""
-                    SELECT id FROM messages
-                    WHERE (? IS NOT NULL AND message_id = ?)
-                       OR dedup_key IN ({placeholders})
-                    LIMIT 1
-                    """,
-                    [message_id, message_id, *candidates],
-                ).fetchone()
+                existing_id = find_existing_message_id(conn, normalized)
             except Exception:
                 # DB read error: retain (fail-safe)
                 counts["kept_not_in_db"] += 1
                 continue
 
-            if row is None:
+            if existing_id is None:
                 counts["kept_not_in_db"] += 1
             else:
                 try:

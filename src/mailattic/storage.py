@@ -137,18 +137,14 @@ def initialize_database(database_path: str | Path) -> Path:
     return path
 
 
-def persist_message(
+def find_existing_message_id(
     connection: sqlite3.Connection,
     message: NormalizedMessage,
-) -> PersistResult:
-    # Design: atomicity for the thread_key merge + insert is provided by the
-    # caller's SAVEPOINT (ingest.py._persist_extraction_results).  We only set
-    # busy_timeout here; no nested transaction management in this function.
-    connection.execute("PRAGMA busy_timeout = 5000;")
-
+) -> int | None:
+    """Return the stored id matching *message* by message_id or dedup_key_candidates."""
     candidates = message.dedup_key_candidates
     placeholders = ", ".join("?" for _ in candidates)
-    existing_row = connection.execute(
+    row = connection.execute(
         f"""
         SELECT id
         FROM messages
@@ -158,8 +154,20 @@ def persist_message(
         """,
         [message.message_id, message.message_id, *candidates],
     ).fetchone()
-    if existing_row is not None:
-        stored_id = int(existing_row["id"])
+    return int(row[0]) if row is not None else None
+
+
+def persist_message(
+    connection: sqlite3.Connection,
+    message: NormalizedMessage,
+) -> PersistResult:
+    # Design: atomicity for the thread_key merge + insert is provided by the
+    # caller's SAVEPOINT (ingest.py._persist_extraction_results).  We only set
+    # busy_timeout here; no nested transaction management in this function.
+    connection.execute("PRAGMA busy_timeout = 5000;")
+
+    stored_id = find_existing_message_id(connection, message)
+    if stored_id is not None:
         return PersistResult(
             inserted=False,
             stored_message_id=stored_id,

@@ -84,6 +84,65 @@ def test_fallback_dedup_key_same_instant_different_offsets_match() -> None:
     assert msg_taipei.dedup_key == msg_utc.dedup_key
 
 
+def _insert_legacy_message(
+    connection,
+    *,
+    sent_at_text: str,
+    pst_source: str,
+    locator: str,
+    source_input_mode: str,
+    source_requested_from: str,
+    dedup_key: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO messages (
+            subject,
+            sender_name,
+            sender_email,
+            sent_at,
+            received_at,
+            body_text,
+            message_id,
+            in_reply_to,
+            references_header,
+            pst_source,
+            folder_path,
+            logical_locator,
+            source_input_mode,
+            source_requested_from,
+            dedup_key,
+            dedup_basis,
+            recipient_search_text,
+            attachment_search_text,
+            raw_headers
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            "Synthetic quote inquiry",
+            "Alex Example",
+            "alex@example.com",
+            sent_at_text,
+            sent_at_text,
+            "Hello,\nPlease see the synthetic test message body.\n",
+            None,
+            None,
+            None,
+            pst_source,
+            "Inbox",
+            locator,
+            source_input_mode,
+            source_requested_from,
+            dedup_key,
+            "{}",
+            "Pat Example pat@example.com",
+            "",
+            None,
+        ],
+    )
+    connection.commit()
+
+
 def test_persist_message_matches_legacy_taipei_key_when_utc_arrives(
     tmp_path: Path,
 ) -> None:
@@ -102,53 +161,15 @@ def test_persist_message_matches_legacy_taipei_key_when_utc_arrives(
     database_path = initialize_database(tmp_path / "legacy_dedup.db")
     connection = connect_database(database_path)
     try:
-        connection.execute(
-            """
-            INSERT INTO messages (
-                subject,
-                sender_name,
-                sender_email,
-                sent_at,
-                received_at,
-                body_text,
-                message_id,
-                in_reply_to,
-                references_header,
-                pst_source,
-                folder_path,
-                logical_locator,
-                source_input_mode,
-                source_requested_from,
-                dedup_key,
-                dedup_basis,
-                recipient_search_text,
-                attachment_search_text,
-                raw_headers
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                msg_utc.subject,
-                msg_utc.sender.display_name,
-                msg_utc.sender.email,
-                instant_taipei.isoformat(),
-                instant_taipei.isoformat(),
-                msg_utc.body_text,
-                None,
-                None,
-                None,
-                msg_utc.pst_source,
-                msg_utc.folder_path,
-                msg_utc.logical_locator,
-                msg_utc.source_input_mode,
-                msg_utc.source_requested_from,
-                legacy_taipei_key,
-                "{}",
-                msg_utc.recipient_search_text,
-                "",
-                None,
-            ],
+        _insert_legacy_message(
+            connection,
+            sent_at_text=instant_taipei.isoformat(),
+            pst_source=msg_utc.pst_source,
+            locator=msg_utc.logical_locator,
+            source_input_mode=msg_utc.source_input_mode,
+            source_requested_from=msg_utc.source_requested_from,
+            dedup_key=legacy_taipei_key,
         )
-        connection.commit()
 
         result = persist_message(connection, msg_utc)
         assert result.inserted is False
@@ -233,53 +254,15 @@ def test_matches_stored_dedup_key_accepts_legacy_taipei_key(tmp_path: Path) -> N
     database_path = initialize_database(tmp_path / "matches_legacy.db")
     connection = connect_database(database_path)
     try:
-        connection.execute(
-            """
-            INSERT INTO messages (
-                subject,
-                sender_name,
-                sender_email,
-                sent_at,
-                received_at,
-                body_text,
-                message_id,
-                in_reply_to,
-                references_header,
-                pst_source,
-                folder_path,
-                logical_locator,
-                source_input_mode,
-                source_requested_from,
-                dedup_key,
-                dedup_basis,
-                recipient_search_text,
-                attachment_search_text,
-                raw_headers
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                "Synthetic quote inquiry",
-                "Alex Example",
-                "alex@example.com",
-                instant_taipei.isoformat(),
-                instant_taipei.isoformat(),
-                "Hello,\nPlease see the synthetic test message body.\n",
-                None,
-                None,
-                None,
-                pst_source,
-                "Inbox",
-                locator,
-                "maildir",
-                str(maildir_root),
-                legacy_taipei_key,
-                "{}",
-                "Pat Example pat@example.com",
-                "",
-                None,
-            ],
+        _insert_legacy_message(
+            connection,
+            sent_at_text=instant_taipei.isoformat(),
+            pst_source=pst_source,
+            locator=locator,
+            source_input_mode="maildir",
+            source_requested_from=str(maildir_root),
+            dedup_key=legacy_taipei_key,
         )
-        connection.commit()
 
         assert (
             _matches_stored_dedup_key(connection, source, eml_path, pst_source, locator)
