@@ -21,6 +21,7 @@ import json
 import mailbox
 import sqlite3
 import sys
+import time
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -1846,6 +1847,100 @@ def test_degradation_reason_ignores_base64_in_both():
     # Half base64 is not "more than half".
     half = B64_LINES.splitlines()[0] + "\nshort text"
     assert stage_module._degradation_reason(OLD_TEXT, half) is None
+
+
+CSS_BLOCK = (
+    "<style>"
+    + "p { font-family: 微軟正黑體, 新細明體; mso-fareast-font-family: 新細明體; }\n"
+    * 60
+    + "</style>"
+)
+VISIBLE_CJK = "測試內容"
+ACCENTED = "café résumé naïve " * 10
+
+
+@pytest.mark.parametrize(
+    ("head", "visible"),
+    [
+        pytest.param(CSS_BLOCK, VISIBLE_CJK, id="style-block-with-visible-cjk"),
+        pytest.param(CSS_BLOCK, "Plain text", id="style-block-only-cjk"),
+        pytest.param(
+            "<script>var 標題 = 微軟正黑體新細明體;</script>" * 20,
+            VISIBLE_CJK,
+            id="script-block-without-css-syntax",
+        ),
+        pytest.param(
+            "<style>p { color: red }</style><script>x = 1</script>",
+            VISIBLE_CJK
+            + '<span style="font-family:微軟正黑體;mso-fareast-font-family:新細明體">'
+            + "x</span>" * 30,
+            id="inline-style-attribute-without-braces",
+        ),
+        pytest.param(
+            "",
+            VISIBLE_CJK
+            + "<span style=\"font-family:'微軟正黑體','新細明體'\">x</span>" * 30,
+            id="inline-style-attribute-with-quoted-font-names",
+        ),
+    ],
+)
+def test_degradation_reason_ignores_old_body_cjk_from_style_text(head, visible):
+    old = f"<html><head>{head}</head><body><p>{visible}</p></body></html>"
+    new = f"<html><body><p>{VISIBLE_CJK} {ACCENTED}</p></body></html>"
+    assert stage_module._degradation_reason(old, new) is None
+
+
+def test_degradation_reason_still_flags_real_mojibake_with_css_present():
+    visible = "中文內容備貨出口通知單請查收附件" * 3
+    old = f"<html><head>{CSS_BLOCK}</head><body><p>{visible}</p></body></html>"
+    new = visible.encode("utf-8").decode("latin-1")
+    assert stage_module._degradation_reason(old, new) == "mojibake"
+    assert stage_module._degradation_reason(visible, new) == "mojibake"
+
+
+@pytest.mark.parametrize(
+    "style_attr",
+    [
+        pytest.param('style="font-family:Arial"', id="double-quoted-no-semicolon"),
+        pytest.param("style='mso-ansi-language:EN'", id="single-quoted-no-semicolon"),
+    ],
+)
+def test_degradation_reason_font_rule_stops_at_attribute_end(style_attr):
+    visible = "中文內容備貨出口通知單請查收附件" * 3
+    old = f"<html><body><span {style_attr}>{visible}</span></body></html>"
+    new = visible.encode("utf-8").decode("latin-1")
+    assert stage_module._degradation_reason(old, new) == "mojibake"
+
+
+def test_degradation_reason_keeps_visible_json_out_of_css_rule_bodies():
+    visible = '{"通知":"中文內容備貨出口通知單請查收附件"}\n' * 3
+    new = visible.encode("utf-8").decode("latin-1")
+    assert stage_module._degradation_reason(visible, new) == "mojibake"
+
+
+def test_degradation_reason_ignores_css_text_leaked_outside_style_tags():
+    leaked = "p { font-family: 微軟正黑體, 新細明體; }\n" * 60
+    old = f"{VISIBLE_CJK}\n{leaked}"
+    assert stage_module._degradation_reason(old, VISIBLE_CJK + ACCENTED) is None
+
+
+@pytest.mark.parametrize(
+    "filler",
+    [
+        pytest.param("a" * 200_000, id="letters"),
+        pytest.param("font-" * 40_000, id="font-prefixes"),
+        pytest.param("mso-" + "a-" * 100_000, id="mso-declaration"),
+        pytest.param("{" + "a:b " * 50_000, id="unclosed-rule-body"),
+        pytest.param("<style>" * 30_000, id="unclosed-style-tags"),
+    ],
+)
+def test_strip_style_text_stays_linear_on_long_near_matches(filler):
+    # Each shape took seconds at 50k characters with the first patterns and
+    # grew quadratically; bodies reach ~1.5M characters (PC-231).
+    old = "中文內容備貨出口通知單" * 2 + filler
+    started = time.perf_counter()
+    stage_module._strip_style_text(old)
+    assert time.perf_counter() - started < 2.0
 
 
 def test_pst_degraded_rewrites_are_kept_and_good_rewrite_still_staged(
