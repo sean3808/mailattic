@@ -292,7 +292,7 @@ uv run bes db verify-cas --attachment-root <work-dir>\attachments
 
 <!-- from lesson-lookup/mail-sync -->
 - **Windows MinGW build 的 readpst `-j` 是啞 flag（永遠 single-thread）**：`-j` 上游靠 `fork()` 平行，Windows MinGW 無 fork emulation → silently ignored。辨識：binary 目錄無 `cygwin1.dll`/`msys-2.0.dll` = 純 MinGW = 沒 fork。驗證：啟動後看 `Get-Process readpst` 是否 N+1 process。要平行走 Python 層 ProcessPoolExecutor（PST 級）或 Linux container；MSYS2 build 綁 libpst issue #7（>0.71 parallel mail loss）不建議。同判準適用任何 Unix-origin C 工具在 Windows「應平行卻 single-thread」。 `[jean-wan-mail-platform 2026-05]`
-- **Linux／WSL 的 readpst 預設平行模式會漏信**（#123）：同一份 PST 五次直接跑只有一次完整，有時少 1 封，有時整批子資料夾沒輸出，exit 仍是 0。`ReadpstParser` 沒指定 `parallel_jobs` 時一律帶 `-j 0`（關掉 fork）；Windows MinGW build 本來就忽略 `-j`，行為不變。
+- **Linux／WSL 的 readpst 預設平行模式會漏信**（#123）：同一份 PST 五次直接跑只有一次完整，有時少 1 封，有時整批子資料夾沒輸出，exit 仍是 0。`ReadpstParser` 沒指定 `parallel_jobs` 時一律帶 `-j 0`（關掉 fork）。Windows 端未實測：本機沒有安裝 Windows 版 readpst（上表：只有 coverage-report phase 用得到），依上一條紀錄 MinGW build 會忽略 `-j`，推測不受影響；之後裝回 `.tools\libpst\` 時，先對小 PST 跑一次確認它接受 `-j 0`。
 
 <!-- from lesson-lookup/mail-sync -->
 - **readpst `-e`（個別 .eml）vs `-r`（mbox concat）產生不同 MIME tree**：mbox 模式對嵌套 `message/rfc822` 展開更深（1 vs 77 attachment parts 極端案例），重 extraction 對既有 DB 比對會大量 false mismatch + mis-pairing 風險。重 extract 比對 ingest 結果**必須用同一組 readpst flags**（記下原 ingest 的）；對不齊時唯一安全路是 fresh re-ingest，不要 backfill 對齊。 `[jean-wan-mail-platform 2026-05]`
