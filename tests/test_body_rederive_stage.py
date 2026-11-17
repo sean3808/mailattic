@@ -1876,6 +1876,12 @@ ACCENTED = "café résumé naïve " * 10
             + "x</span>" * 30,
             id="inline-style-attribute-without-braces",
         ),
+        pytest.param(
+            "",
+            VISIBLE_CJK
+            + "<span style=\"font-family:'微軟正黑體','新細明體'\">x</span>" * 30,
+            id="inline-style-attribute-with-quoted-font-names",
+        ),
     ],
 )
 def test_degradation_reason_ignores_old_body_cjk_from_style_text(head, visible):
@@ -1890,6 +1896,20 @@ def test_degradation_reason_still_flags_real_mojibake_with_css_present():
     new = visible.encode("utf-8").decode("latin-1")
     assert stage_module._degradation_reason(old, new) == "mojibake"
     assert stage_module._degradation_reason(visible, new) == "mojibake"
+
+
+@pytest.mark.parametrize(
+    "style_attr",
+    [
+        pytest.param('style="font-family:Arial"', id="double-quoted-no-semicolon"),
+        pytest.param("style='mso-ansi-language:EN'", id="single-quoted-no-semicolon"),
+    ],
+)
+def test_degradation_reason_font_rule_stops_at_attribute_end(style_attr):
+    visible = "中文內容備貨出口通知單請查收附件" * 3
+    old = f"<html><body><span {style_attr}>{visible}</span></body></html>"
+    new = visible.encode("utf-8").decode("latin-1")
+    assert stage_module._degradation_reason(old, new) == "mojibake"
 
 
 def test_degradation_reason_ignores_css_text_leaked_outside_style_tags():

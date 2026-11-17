@@ -528,8 +528,13 @@ _TAG_BLOCK_CLOSE_RES = {
     name: re.compile(rf"</{name}\s*>", re.IGNORECASE) for name in ("style", "script")
 }
 _CSS_RULE_BODY_RE = re.compile(r"\{[^{}:]*:[^{}]*\}")
+# A value stops at a quote or angle bracket, so a brace-less declaration
+# inside an attribute (``style="font-family:Arial"``) never runs past the
+# attribute or tag end into visible text; a quoted font name is one unit.
 _CSS_FONT_DECL_RE = re.compile(
-    r"\b(?:font|mso)[a-z-]{0,64}\s*:[^;{}\n]{0,256};?", re.IGNORECASE
+    r"\b(?:font|mso)[a-z-]{0,64}\s*:"
+    r"(?:[^;{}\n\"'<>]|\"[^\"<>\n]{0,64}\"|'[^'<>\n]{0,64}'){0,256};?",
+    re.IGNORECASE,
 )
 
 
