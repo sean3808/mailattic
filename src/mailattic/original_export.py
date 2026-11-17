@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import imaplib
 import re
+import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -770,6 +771,31 @@ class _PstItemSearch:
         return item_none, detail
 
 
+def _open_pst_store_search(
+    namespace: Any,
+    store: Any,
+    message: Mapping[str, object],
+    tally: _ScanTally,
+    *,
+    store_label: str | None = None,
+) -> tuple[_PstItemSearch | None, Any | None, str | None]:
+    """Build a `_PstItemSearch` and open *store*'s root folder."""
+    try:
+        store_id = getattr(store, "StoreID", None)
+    except Exception:
+        store_id = None  # same fallback as a store without a StoreID
+
+    search = _PstItemSearch(namespace, store_id, message, tally)
+    suffix = f" ({store_label})" if store_label else ""
+    try:
+        root_folder = store.GetRootFolder()
+    except Exception as exc:
+        return search, None, f"PST root folder access failed{suffix}: {exc}"
+    if root_folder is None:
+        return search, None, f"PST root folder is unavailable{suffix}"
+    return search, root_folder, None
+
+
 def _find_pst_item(
     namespace: Any,
     store: Any,
@@ -785,12 +811,10 @@ def _find_pst_item(
     folder_path = str(message.get("folder_path") or "").strip()
     tally = _ScanTally()
 
-    try:
-        store_id = getattr(store, "StoreID", None)
-    except Exception:
-        store_id = None  # same fallback as a store without a StoreID
-
-    search = _PstItemSearch(namespace, store_id, message, tally)
+    search, root_folder, root_err = _open_pst_store_search(
+        namespace, store, message, tally
+    )
+    assert search is not None
 
     # 1. Try logical_locator (EntryID) directly.
     if logical_locator:
@@ -801,15 +825,10 @@ def _find_pst_item(
     if not db_msg_id:
         return _no_message_id_unresolved("Outlook location", tally.unreadable)
 
+    if root_err is not None:
+        return None, root_err
+
     expected = normalize_message_id(str(db_msg_id))
-
-    try:
-        root_folder = store.GetRootFolder()
-    except Exception as exc:
-        return None, f"PST root folder access failed: {exc}"
-
-    if root_folder is None:
-        return None, "PST root folder is unavailable"
 
     # 2. Try locating inside the recorded folder_path first.
     target_folder, recorded_result = search.search_recorded_folder(
@@ -900,6 +919,23 @@ def _store_basename(store: Any) -> str:
     return "unknown.pst"
 
 
+@dataclass(frozen=True)
+class _CrossStoreMatch:
+    item: Any | None = None
+    error: str | None = None
+    store_name: str | None = None
+
+
+def _filter_pst_sources(sources: Sequence[object]) -> list[str]:
+    """Keep non-empty source strings that classify as PST by `.pst` suffix."""
+    filtered: list[str] = []
+    for source in sources:
+        raw = str(source or "").strip()
+        if raw and classify_message_source({"pst_source": raw}) == "pst":
+            filtered.append(raw)
+    return filtered
+
+
 def _list_known_pst_sources(database_path: str | Path) -> list[str]:
     """Return distinct PST source paths recorded in the DB."""
     connection = connect_database(database_path, create=False, read_only=True)
@@ -909,12 +945,7 @@ def _list_known_pst_sources(database_path: str | Path) -> list[str]:
         ).fetchall()
     finally:
         connection.close()
-    sources: list[str] = []
-    for row in rows:
-        raw = str(row[0] or "").strip()
-        if raw and classify_message_source({"pst_source": raw}) == "pst":
-            sources.append(raw)
-    return sources
+    return _filter_pst_sources([row[0] for row in rows])
 
 
 def _resolve_other_pst_stores(
@@ -924,10 +955,7 @@ def _resolve_other_pst_stores(
 ) -> tuple[list[Any], str | None]:
     """Map DB-known PST sources to mounted stores, excluding *recorded_store*."""
     other_stores: list[Any] = []
-    for source in known_pst_sources:
-        raw = str(source or "").strip()
-        if not raw or classify_message_source({"pst_source": raw}) != "pst":
-            continue
+    for raw in _filter_pst_sources(known_pst_sources):
         candidate, store_problem = _resolve_pst_store(namespace, raw)
         if store_problem is not None:
             return [], store_problem
@@ -946,17 +974,17 @@ def _find_pst_item_in_other_stores(
     recorded_store: Any,
     message: Mapping[str, object],
     known_pst_sources: Sequence[str],
-) -> tuple[Any | None, str | None, str | None]:
+) -> _CrossStoreMatch:
     """Search other DB-known mounted PST stores by Message-ID only."""
     db_msg_id = message.get("message_id")
     if not db_msg_id:
-        return None, None, None
+        return _CrossStoreMatch()
 
     other_stores, store_problem = _resolve_other_pst_stores(
         namespace, recorded_store, known_pst_sources
     )
     if store_problem is not None:
-        return None, store_problem, None
+        return _CrossStoreMatch(error=store_problem)
 
     expected = normalize_message_id(str(db_msg_id))
     matches: list[tuple[str, Any]] = []
@@ -965,21 +993,13 @@ def _find_pst_item_in_other_stores(
     for other_store in other_stores:
         store_name = _store_basename(other_store)
         tally = _ScanTally()
-        try:
-            store_id = getattr(other_store, "StoreID", None)
-        except Exception:
-            store_id = None
-
-        try:
-            root_folder = other_store.GetRootFolder()
-        except Exception as exc:
-            errors.append(f"PST root folder access failed ({store_name}): {exc}")
-            continue
-        if root_folder is None:
-            errors.append(f"PST root folder is unavailable ({store_name})")
+        search, root_folder, root_err = _open_pst_store_search(
+            namespace, other_store, message, tally, store_label=store_name
+        )
+        if root_err is not None or search is None:
+            errors.append(root_err or f"PST root folder is unavailable ({store_name})")
             continue
 
-        search = _PstItemSearch(namespace, store_id, message, tally)
         item, err = search.search_store(root_folder, expected, skip_folder=None)
         if err is not None:
             errors.append(err)
@@ -995,17 +1015,17 @@ def _find_pst_item_in_other_stores(
             matches.append((store_name, item))
 
     if len(matches) > 1:
-        return (
-            None,
-            f"Ambiguous: the message was found in {len(matches)} mounted PSTs "
-            f"({len(matches)} matches)",
-            None,
+        return _CrossStoreMatch(
+            error=(
+                f"Ambiguous: the message was found in {len(matches)} mounted PSTs "
+                f"({len(matches)} matches)"
+            )
         )
     if errors:
-        return None, errors[0], None
+        return _CrossStoreMatch(error=errors[0])
     if len(matches) == 1:
-        return matches[0][1], None, matches[0][0]
-    return None, None, None
+        return _CrossStoreMatch(item=matches[0][1], store_name=matches[0][0])
+    return _CrossStoreMatch()
 
 
 def export_from_pst(
@@ -1055,11 +1075,13 @@ def export_from_pst(
         return replace(base, detail=err)
     if item is None:
         if known_pst_sources is not None and message.get("message_id"):
-            item, err, found_store_name = _find_pst_item_in_other_stores(
+            cross_match = _find_pst_item_in_other_stores(
                 namespace, store, message, known_pst_sources
             )
-            if err is not None:
-                return replace(base, detail=err)
+            if cross_match.error is not None:
+                return replace(base, detail=cross_match.error)
+            item = cross_match.item
+            found_store_name = cross_match.store_name
         if item is None:
             return replace(
                 base, status="not_found", detail="Original message not found in PST."
@@ -1458,7 +1480,7 @@ def export_original_message(
     if source_type == "pst":
         try:
             known_pst_sources = _list_known_pst_sources(database_path)
-        except Exception as exc:
+        except (sqlite3.Error, OSError) as exc:
             return replace(
                 _base_result(message, fmt, source_type),
                 detail=f"could not list other PST sources: {exc}",

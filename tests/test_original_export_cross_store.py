@@ -7,6 +7,7 @@ stores that the DB knows about (distinct ``pst_source`` values) by Message-ID.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
@@ -591,7 +592,7 @@ def test_export_original_message_db_failure_listing_pst_sources_fails(
 
     with patch(
         "mailattic.original_export._list_known_pst_sources",
-        side_effect=RuntimeError("db locked"),
+        side_effect=sqlite3.OperationalError("db locked"),
     ):
         result = export_original_message(
             db_path,
