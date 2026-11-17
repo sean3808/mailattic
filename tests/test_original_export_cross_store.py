@@ -109,7 +109,7 @@ def test_cross_store_found_once_in_other_known_pst_exports(tmp_path: Path) -> No
         message,
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, archive_pst],
+        known_pst_sources=lambda: [recorded_pst, archive_pst],
     )
 
     assert result.status == "exported"
@@ -172,7 +172,7 @@ def test_cross_store_found_in_multiple_other_stores_fails_ambiguous(
         _base_message(recorded_pst, message_id=target_id),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, archive_a, archive_b],
+        known_pst_sources=lambda: [recorded_pst, archive_a, archive_b],
     )
 
     assert result.status == "failed"
@@ -215,7 +215,7 @@ def test_cross_store_found_twice_in_one_other_store_fails_ambiguous(
         _base_message(recorded_pst, message_id=target_id),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, archive_pst],
+        known_pst_sources=lambda: [recorded_pst, archive_pst],
     )
 
     assert result.status == "failed"
@@ -252,7 +252,7 @@ def test_cross_store_found_nowhere_returns_not_found(tmp_path: Path) -> None:
         _base_message(recorded_pst, message_id="<missing@example.test>"),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, archive_pst],
+        known_pst_sources=lambda: [recorded_pst, archive_pst],
     )
 
     assert result.status == "not_found"
@@ -285,7 +285,7 @@ def test_found_in_recorded_store_does_not_touch_other_stores(tmp_path: Path) -> 
         _base_message(recorded_pst, message_id=target_id, logical_locator="entry-rec"),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, archive_pst],
+        known_pst_sources=lambda: [recorded_pst, archive_pst],
     )
 
     assert result.status == "exported"
@@ -319,7 +319,7 @@ def test_unlisted_mounted_store_is_never_scanned(tmp_path: Path) -> None:
         _base_message(recorded_pst, message_id=target_id),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst],
+        known_pst_sources=lambda: [recorded_pst],
     )
 
     assert result.status == "not_found"
@@ -350,7 +350,7 @@ def test_other_store_with_unreadable_folder_and_no_match_fails(
         _base_message(recorded_pst, message_id="<missing@example.test>"),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, archive_pst],
+        known_pst_sources=lambda: [recorded_pst, archive_pst],
     )
 
     assert result.status == "failed"
@@ -378,7 +378,7 @@ def test_message_without_message_id_never_searches_other_stores(
         _base_message(recorded_pst, message_id=None),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, archive_pst],
+        known_pst_sources=lambda: [recorded_pst, archive_pst],
     )
 
     assert result.status == "failed"
@@ -416,7 +416,7 @@ def test_recorded_store_error_does_not_trigger_cross_store_search(
         _base_message(recorded_pst, message_id=target_id),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, archive_pst],
+        known_pst_sources=lambda: [recorded_pst, archive_pst],
     )
 
     assert result.status == "failed"
@@ -542,7 +542,7 @@ def test_known_pst_source_not_mounted_is_skipped(tmp_path: Path) -> None:
         _base_message(recorded_pst, message_id=target_id),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, unmounted_pst, archive_pst],
+        known_pst_sources=lambda: [recorded_pst, unmounted_pst, archive_pst],
     )
 
     assert result.status == "exported"
@@ -570,7 +570,7 @@ def test_known_pst_source_ambiguous_filename_fails(tmp_path: Path) -> None:
         _base_message(recorded_pst, message_id="<id@example.test>"),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, missing_archive],
+        known_pst_sources=lambda: [recorded_pst, missing_archive],
     )
 
     assert result.status == "failed"
@@ -677,7 +677,11 @@ def test_cross_store_ignores_recorded_entry_id_and_dedups_relocated_source(
         ),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst, archive_pst_old_path, archive_pst_mounted],
+        known_pst_sources=lambda: [
+            recorded_pst,
+            archive_pst_old_path,
+            archive_pst_mounted,
+        ],
     )
 
     assert result.status == "exported"
@@ -710,7 +714,7 @@ def test_found_by_recorded_entry_id_never_calls_get_root_folder(
         ),
         dest,
         outlook_reader=FakeOutlookReader(namespace),
-        known_pst_sources=[recorded_pst],
+        known_pst_sources=lambda: [recorded_pst],
     )
 
     assert result.status == "exported"
