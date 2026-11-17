@@ -146,5 +146,7 @@ WSL `.venv` 是 May 25 設的；之後 `pyproject.toml` 加新 dependency（例�
 <!-- from lesson-lookup/wsl -->
 - **`.venv/lib64` 是 wsl 建的 NTFS reparse point，會被 Windows file lock 卡住刪不掉**：症狀：venv 半毀（剩 lib64 + pyvenv.cfg）、`uv sync` 噴 `存取被拒 (os error 5)`。修法：用 .NET API 拆 reparse point（`[System.IO.Directory]::Delete($path, $false)`，**不可** `Remove-Item -Recurse`——會嘗試遞迴進 target）再刪 .venv 重建（jean-wan 有現成 `scripts/rebuild-venv.ps1`，Claude Code Bash 可直接跑）。預防：同一 venv 別混用 wsl uv 與 Windows uv。 `[jean-wan-mail-platform 2026-05]`
 
+- **WSL 讀寫大檔（數十 GB 的 PST、`cp`、`readpst`）時，WSL 的 page cache 會吃掉 Windows 主機記憶體**：WSL 裡 `free` 看起來還有十幾 GB 可用（都是 buff/cache），Windows 端可用記憶體卻掉到 1 GB 多，Claude Code 因系統記憶體不足回收了閒置中的背景監看任務（被砍的是監看，不是 WSL 工作本身）。處置：長跑 WSL I/O 期間，在等待迴圈裡順手 `echo 1 > /proc/sys/vm/drop_caches`（只丟乾淨快取，無害），實測 Windows 可用記憶體從 1.2 GB 回到 8.4 GB；被回收的背景任務不要自己重開，先向使用者回報。WSL 沒有大檔 I/O、或 Windows 端記憶體充足時不需要。同一段期間不要在主機上同時跑快速測試（PC-267）。 `[mailattic 2026-11]`
+
 <!-- from lesson-lookup/docker -->
 - **Docker Engine on WSL2 不會把 `docker.exe` 裝到 Windows PATH**：Windows-side 程式 `subprocess.run(["docker", ...])` 直接 `FileNotFoundError`（Docker Desktop 才裝 Windows CLI + socket share）。修法依侵入性：(1) user-facing wrapper `wsl -e bash -c "docker compose ..."`；(2) source 偵測 `sys.platform=="win32" and not shutil.which("docker")` 時加 wsl prefix；(3) 裝 Windows-side docker CLI 指向 WSL daemon。寫「Windows 程式喊 docker」前先問「目標機一定有 Docker Desktop 嗎？」。 `[jean-wan-mail-platform 2026-05]`
