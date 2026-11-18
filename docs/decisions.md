@@ -51,4 +51,5 @@
 | [D-20261106-1](decisions/D-20261106-1-body-rederive-falls-back-to-message-id-match.md) | 2026-11-06 | 內文重做在原位置對不上時，改以 Message-ID 在所有 PST 找原信 | accepted |
 | [D-20261106-2](decisions/D-20261106-2-skill-ssot-deploy-only-on-release.md) | 2026-11-06 | skill→SSOT 部署只在發行時跑，拿掉 main commit 的 git hook | accepted |
 | [D-20261113-1](decisions/D-20261113-1-hosted-windows-full-is-merge-evidence.md) | 2026-11-13 | GitHub hosted Windows Full 作為合併證據 | accepted |
+| [D-20261118-1](decisions/D-20261118-1-release-accepts-head-hosted-full.md) | 2026-11-18 | 發行改認 HEAD 的 hosted-full，不再重跑本機 Full | accepted |
 <!-- END GENERATED ADR-INDEX -->

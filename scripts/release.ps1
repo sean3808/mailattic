@@ -378,18 +378,189 @@ function Write-ReleaseStage {
     Write-Host ("[release] {0}/9 {1}" -f $Number, $Message)
 }
 
+function Invoke-PytestLauncher {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LauncherPath,
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    & pwsh -NoProfile -File $LauncherPath @Arguments
+    $launcherExitCode = $LASTEXITCODE
+    if ($launcherExitCode -ne 0) {
+        $argText = $Arguments -join ' '
+        throw (
+            "scripts\invoke-pytest.ps1 $argText (canonical pytest gate) " +
+            "failed with exit code $launcherExitCode."
+        )
+    }
+}
+
+function Invoke-GhJson {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepoRoot,
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    Push-Location -LiteralPath $RepoRoot
+    try {
+        $global:LASTEXITCODE = 0
+        $output = @(& gh @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+
+    if ($exitCode -ne 0) {
+        return $null
+    }
+
+    $text = (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine).Trim()
+    if (-not $text) {
+        return $null
+    }
+
+    try {
+        return ($text | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
+function Get-HostedFullRunStatus {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepoRoot,
+        [string]$Commit
+    )
+
+    if (-not $Commit) {
+        return [pscustomobject]@{
+            State = 'not found'
+            RunUrl = $null
+        }
+    }
+
+    $repoInfo = Invoke-GhJson -RepoRoot $RepoRoot -Arguments @(
+        'repo', 'view', '--json', 'nameWithOwner'
+    )
+    if (-not $repoInfo -or -not $repoInfo.nameWithOwner) {
+        return [pscustomobject]@{
+            State = 'not found'
+            RunUrl = $null
+        }
+    }
+    $repoName = $repoInfo.nameWithOwner
+
+    $runsPages = Invoke-GhJson -RepoRoot $RepoRoot -Arguments @(
+        'api', '--paginate', '--slurp',
+        "repos/$repoName/actions/workflows/ci.yml/runs?head_sha=$Commit&per_page=100"
+    )
+    if (-not $runsPages) {
+        return [pscustomobject]@{
+            State = 'not found'
+            RunUrl = $null
+        }
+    }
+
+    $runs = @(
+        foreach ($page in @($runsPages)) {
+            if ($page.workflow_runs) {
+                $page.workflow_runs
+            }
+        }
+    ) | Sort-Object -Property id -Descending
+
+    foreach ($run in $runs) {
+        $runUrl = $run.html_url
+        $jobPages = Invoke-GhJson -RepoRoot $RepoRoot -Arguments @(
+            'api', '--paginate', '--slurp',
+            "repos/$repoName/actions/runs/$($run.id)/jobs?per_page=100&filter=all"
+        )
+
+        $hostedFullJob = $null
+        if ($jobPages) {
+            $hostedFullJob = @(
+                foreach ($jobPage in @($jobPages)) {
+                    if ($jobPage.jobs) {
+                        $jobPage.jobs | Where-Object { $_.name -eq 'hosted-full' }
+                    }
+                }
+            ) | Select-Object -First 1
+        }
+
+        if ($hostedFullJob) {
+            $jobStatus = $hostedFullJob.status
+            $jobConclusion = $hostedFullJob.conclusion
+            if ($jobStatus -eq 'completed') {
+                if ($jobConclusion -eq 'success') {
+                    return [pscustomobject]@{
+                        State = 'success'
+                        RunUrl = $runUrl
+                    }
+                }
+                if ($jobConclusion -in @('failure', 'cancelled', 'timed_out', 'action_required')) {
+                    return [pscustomobject]@{
+                        State = $jobConclusion
+                        RunUrl = $runUrl
+                    }
+                }
+                continue
+            }
+            if ($jobStatus -eq 'in_progress') {
+                return [pscustomobject]@{
+                    State = 'in progress'
+                    RunUrl = $runUrl
+                }
+            }
+            return [pscustomobject]@{
+                State = 'queued'
+                RunUrl = $runUrl
+            }
+        }
+
+        if ($run.status -eq 'in_progress') {
+            return [pscustomobject]@{
+                State = 'in progress'
+                RunUrl = $runUrl
+            }
+        }
+        if ($run.status -in @('queued', 'waiting', 'requested', 'pending')) {
+            return [pscustomobject]@{
+                State = 'queued'
+                RunUrl = $runUrl
+            }
+        }
+        if ($run.status -eq 'completed' -and $run.conclusion -in @('failure', 'cancelled', 'timed_out', 'action_required')) {
+            return [pscustomobject]@{
+                State = $run.conclusion
+                RunUrl = $runUrl
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        State = 'not found'
+        RunUrl = $null
+    }
+}
+
 function Invoke-ReleaseTests {
     <#
     .SYNOPSIS
-      Run the canonical isolated Full pytest route via scripts/invoke-pytest.ps1.
+      Verify HEAD via hosted-full (or fall back to local -Route Full) and
+      always run the local-only recipient rebuild tests via -Route Targeted.
 
     .DESCRIPTION
-      Release calls only the documented `-Route Full` interface of the
-      canonical pytest launcher. It does not reproduce the launcher's
-      underlying uv/pytest argument vector, and it does not set TEMP/TMP or
-      any other managed environment variable itself -- the launcher (via
-      scripts/project-tool-environment.ps1) owns runtime-root resolution,
-      the pytest cross-process lock, and every managed variable.
+      Release inspects GitHub Actions `ci.yml` runs for HEAD (`hosted-full`
+      job). When `hosted-full` succeeded for HEAD, local `-Route Full` is
+      skipped; when it is in progress, queued, or not found, release falls
+      back to `-Route Full` via `scripts/invoke-pytest.ps1` (canonical full pytest gate).
+      A failed or cancelled `hosted-full` stops the release immediately. In all passing cases, the two gitignored local-only
+      recipient rebuild test files run through `-Route Targeted`.
 
       Any non-zero exit code from the launcher -- an ordinary pytest
       failure, lock contention (17), or a runtime root whose volume cannot
@@ -400,7 +571,8 @@ function Invoke-ReleaseTests {
     #>
     param(
         [Parameter(Mandatory)]
-        [string]$RepoRoot
+        [string]$RepoRoot,
+        [string]$Commit
     )
 
     $launcherPath = Join-Path $RepoRoot 'scripts\invoke-pytest.ps1'
@@ -408,14 +580,25 @@ function Invoke-ReleaseTests {
         throw "Canonical pytest launcher was not found: $launcherPath"
     }
 
-    & pwsh -NoProfile -File $launcherPath -Route Full
-    $launcherExitCode = $LASTEXITCODE
-    if ($launcherExitCode -ne 0) {
-        throw (
-            "scripts\invoke-pytest.ps1 -Route Full (canonical full pytest gate) " +
-            "failed with exit code $launcherExitCode."
-        )
+    $hostedFull = Get-HostedFullRunStatus -RepoRoot $RepoRoot -Commit $Commit
+    switch ($hostedFull.State) {
+        'success' {
+            Write-Host "[release] Accepted hosted-full run: $($hostedFull.RunUrl); skipping local Full"
+        }
+        { $_ -in @('failure', 'cancelled', 'timed_out', 'action_required') } {
+            throw "hosted-full $($hostedFull.State) for commit $Commit ($($hostedFull.RunUrl)); release stopped."
+        }
+        default {
+            Write-Host "[release] hosted-full $($hostedFull.State); falling back to local Full"
+            Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments @('-Route', 'Full')
+        }
     }
+
+    Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments @(
+        '-Route', 'Targeted',
+        'tests/test_recipient_rebuild_audit.py',
+        'tests/test_recipient_rebuild_apply.py'
+    )
 }
 
 function Invoke-GlobalReinstall {
@@ -527,7 +710,7 @@ function Invoke-BesRelease {
     $releaseCommit = Assert-ReleasePreconditions @preconditionParameters
 
     Write-ReleaseStage -Number 2 -Message 'Run full test suite'
-    Invoke-ReleaseTests -RepoRoot $resolvedRoot
+    Invoke-ReleaseTests -RepoRoot $resolvedRoot -Commit $releaseCommit
 
     Write-ReleaseStage -Number 3 -Message 'Reinstall global bes'
     Invoke-GlobalReinstall -RepoRoot $resolvedRoot

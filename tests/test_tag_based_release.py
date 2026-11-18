@@ -1143,15 +1143,17 @@ def test_operator_docs_distinguish_backup_release_and_skill_archive():
     assert "publish-cli-on-archive" not in agents
 
 
-def test_release_script_invokes_launcher_full_route_only():
+def test_release_script_invokes_launcher_full_and_targeted_routes_only():
     script = RELEASE_SCRIPT.read_text(encoding="utf-8")
     tests_function_start = script.index("function Invoke-ReleaseTests")
 
     assert "scripts\\invoke-pytest.ps1" in script
     assert "-Route Full" in script
+    assert "-Route Targeted" in script
+    assert "tests/test_recipient_rebuild_audit.py" in script
+    assert "tests/test_recipient_rebuild_apply.py" in script
     assert "canonical full pytest gate" in script.lower()
     assert "uv run --locked --exact pytest" not in script[tests_function_start:]
-    assert "-Route Targeted" not in script
     assert "-Route Quick" not in script
     assert "-Route FullSequential" not in script
     tests_function_end = script.index("function Invoke-GlobalReinstall")
@@ -1160,22 +1162,39 @@ def test_release_script_invokes_launcher_full_route_only():
     assert "$env:TMP" not in tests_function_body
 
 
-def test_release_tests_invoke_the_full_route_launcher_with_exact_arguments(
+_TARGETED_REBUILD_ARGS = (
+    "-Route Targeted "
+    "tests/test_recipient_rebuild_audit.py "
+    "tests/test_recipient_rebuild_apply.py"
+)
+
+
+def _write_logging_launcher_stub(
+    scripts_dir: Path, log_path: Path, *, exit_code: int = 0
+) -> None:
+    (scripts_dir / "invoke-pytest.ps1").write_text(
+        f"[IO.File]::AppendAllText({ps_quote(log_path)}, "
+        f"(($args -join ' ') + \"`n\"))\nexit {exit_code}\n",
+        encoding="utf-8",
+    )
+
+
+def test_release_tests_invoke_the_full_and_targeted_launchers_with_exact_arguments(
     tmp_path: Path,
 ):
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
     scripts.mkdir(parents=True)
     log = tmp_path / "launcher-args.txt"
-    (scripts / "invoke-pytest.ps1").write_text(
-        f"[IO.File]::WriteAllText({ps_quote(log)}, ($args -join ' '))\nexit 0\n",
-        encoding="utf-8",
-    )
+    _write_logging_launcher_stub(scripts, log)
 
     result = _run_release_function(f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)}")
 
     assert result.returncode == 0, result.stderr
-    assert log.read_text(encoding="utf-8").strip() == "-Route Full"
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "-Route Full",
+        _TARGETED_REBUILD_ARGS,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1222,7 +1241,20 @@ def test_release_stops_before_reinstall_on_any_nonzero_launcher_exit(
     _git(repo, "commit", "-m", "stub canonical pytest launcher exit code")
     _git(repo, "push", "origin", "main")
 
-    result = _run_release_driver(tmp_path, repo, override_tests=False)
+    gh_not_found = """
+function gh {
+    if ($args[0] -eq 'repo') {
+        '{"nameWithOwner":"example/mailattic"}'
+        $global:LASTEXITCODE = 0
+        return
+    }
+    '[{"workflow_runs":[]}]'
+    $global:LASTEXITCODE = 0
+}
+"""
+    result = _run_release_driver(
+        tmp_path, repo, extra_script=gh_not_found, override_tests=False
+    )
 
     assert result.returncode != 0
     assert expected_message_fragment in result.stderr
@@ -1276,3 +1308,299 @@ def test_disposable_repos_disable_git_auto_maintenance_for_direct_and_nested_git
         remote, "config", "--local", "--get", GIT_AUTO_MAINTENANCE_SETTING
     )
     assert remote_side.stdout.strip() == "false"
+
+
+def _fake_gh_hosted_full_script(
+    *,
+    runs: list[dict[str, object]],
+    jobs_by_run: dict[int, list[dict[str, object]]],
+) -> str:
+    runs_json = json.dumps([{"workflow_runs": runs}])
+    jobs_lines = []
+    for run_id, jobs in jobs_by_run.items():
+        jobs_payload = ps_quote(json.dumps([{"jobs": jobs}]))
+        jobs_lines.append(
+            f"        {run_id} {{ {jobs_payload}; $global:LASTEXITCODE = 0; return }}"
+        )
+    jobs_cases = "\n".join(jobs_lines)
+    return f"""
+function gh {{
+    if ($args[0] -eq 'repo') {{
+        '{{"nameWithOwner":"example/mailattic"}}'
+        $global:LASTEXITCODE = 0
+        return
+    }}
+    if ($args[0] -eq 'api') {{
+        $endpoint = $args[-1]
+        if ($endpoint -like '*actions/workflows/ci.yml/runs*') {{
+            {ps_quote(runs_json)}
+            $global:LASTEXITCODE = 0
+            return
+        }}
+        if ($endpoint -match 'actions/runs/(\\d+)/jobs') {{
+            switch ([int]$Matches[1]) {{
+{jobs_cases}
+                default {{ '[{{"jobs":[]}}]'; $global:LASTEXITCODE = 0; return }}
+            }}
+        }}
+    }}
+    $global:LASTEXITCODE = 0
+}}
+"""
+
+
+def test_release_skips_local_full_when_hosted_full_succeeded(tmp_path: Path):
+    repo, remote = _make_release_repo(tmp_path)
+    tag = "bes-v2026.11.18.1"
+    run_url = "https://github.com/example/mailattic/actions/runs/1001"
+    launcher_log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(repo / "scripts", launcher_log)
+    _git(repo, "add", "scripts")
+    _git(repo, "commit", "-m", "stub launcher")
+    _git(repo, "push", "origin", "main")
+    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    gh_stub = _fake_gh_hosted_full_script(
+        runs=[
+            {
+                "id": 1001,
+                "head_sha": commit,
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": run_url,
+            }
+        ],
+        jobs_by_run={
+            1001: [
+                {
+                    "id": 2001,
+                    "name": "hosted-full",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ]
+        },
+    )
+
+    result = _run_release_driver(
+        tmp_path,
+        repo,
+        tag=tag,
+        extra_script=gh_stub,
+        override_tests=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert run_url in result.stdout
+    assert "skipping local Full" in result.stdout
+    assert launcher_log.read_text(encoding="utf-8").splitlines() == [
+        _TARGETED_REBUILD_ARGS
+    ]
+    _assert_tag_pushed(repo, remote, tag)
+
+
+@pytest.mark.parametrize(
+    ("reason", "runs", "jobs_by_run"),
+    [
+        (
+            "in progress",
+            [
+                {
+                    "id": 1002,
+                    "status": "in_progress",
+                    "conclusion": None,
+                    "html_url": "https://github.com/example/mailattic/actions/runs/1002",
+                }
+            ],
+            {
+                1002: [
+                    {
+                        "id": 2002,
+                        "name": "hosted-full",
+                        "status": "in_progress",
+                        "conclusion": None,
+                    }
+                ]
+            },
+        ),
+        (
+            "queued",
+            [
+                {
+                    "id": 1003,
+                    "status": "queued",
+                    "conclusion": None,
+                    "html_url": "https://github.com/example/mailattic/actions/runs/1003",
+                }
+            ],
+            {
+                1003: [
+                    {
+                        "id": 2003,
+                        "name": "hosted-full",
+                        "status": "queued",
+                        "conclusion": None,
+                    }
+                ]
+            },
+        ),
+        ("not found", [], {}),
+    ],
+)
+def test_release_falls_back_to_local_full_when_hosted_full_not_ready(
+    tmp_path: Path,
+    reason: str,
+    runs: list[dict[str, object]],
+    jobs_by_run: dict[int, list[dict[str, object]]],
+):
+    repo, remote = _make_release_repo(tmp_path)
+    tag = "bes-v2026.11.18.2"
+    launcher_log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(repo / "scripts", launcher_log)
+    _git(repo, "add", "scripts")
+    _git(repo, "commit", "-m", "stub launcher")
+    _git(repo, "push", "origin", "main")
+
+    gh_stub = _fake_gh_hosted_full_script(runs=runs, jobs_by_run=jobs_by_run)
+    result = _run_release_driver(
+        tmp_path,
+        repo,
+        tag=tag,
+        extra_script=gh_stub,
+        override_tests=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "falling back to local Full" in result.stdout
+    assert reason in result.stdout
+    assert launcher_log.read_text(encoding="utf-8").splitlines() == [
+        "-Route Full",
+        _TARGETED_REBUILD_ARGS,
+    ]
+    _assert_tag_pushed(repo, remote, tag)
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled"])
+def test_release_stops_when_hosted_full_failed_or_cancelled(
+    tmp_path: Path, conclusion: str
+):
+    repo, remote = _make_release_repo(tmp_path)
+    tag = "bes-v2026.11.18.3"
+    run_url = "https://github.com/example/mailattic/actions/runs/1004"
+    launcher_log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(repo / "scripts", launcher_log)
+    _git(repo, "add", "scripts")
+    _git(repo, "commit", "-m", "stub launcher")
+    _git(repo, "push", "origin", "main")
+    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    gh_stub = _fake_gh_hosted_full_script(
+        runs=[
+            {
+                "id": 1004,
+                "head_sha": commit,
+                "status": "completed",
+                "conclusion": conclusion,
+                "html_url": run_url,
+            }
+        ],
+        jobs_by_run={
+            1004: [
+                {
+                    "id": 2004,
+                    "name": "hosted-full",
+                    "status": "completed",
+                    "conclusion": conclusion,
+                }
+            ]
+        },
+    )
+
+    result = _run_release_driver(
+        tmp_path,
+        repo,
+        tag=tag,
+        extra_script=gh_stub,
+        override_tests=False,
+    )
+
+    assert result.returncode != 0
+    assert run_url in result.stderr
+    assert conclusion in result.stderr
+    assert not launcher_log.exists()
+    assert "Reinstall global bes" not in result.stdout
+    assert "Write local release evidence" not in result.stdout
+    assert "Create annotated release tag" not in result.stdout
+    assert "Atomically push main and release tag" not in result.stdout
+    assert not (repo / ".git" / "bes-release-state.json").exists()
+    assert (
+        _git(
+            repo, "show-ref", "--verify", "--quiet", f"refs/tags/{tag}", check=False
+        ).returncode
+        != 0
+    )
+    assert (
+        _git(repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}").stdout.strip()
+        == ""
+    )
+
+
+def test_release_stops_when_targeted_recipient_rebuild_tests_fail(tmp_path: Path):
+    repo, remote = _make_release_repo(tmp_path)
+    tag = "bes-v2026.11.18.4"
+    run_url = "https://github.com/example/mailattic/actions/runs/1005"
+    launcher_log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(repo / "scripts", launcher_log, exit_code=1)
+    _git(repo, "add", "scripts")
+    _git(repo, "commit", "-m", "stub failing targeted launcher")
+    _git(repo, "push", "origin", "main")
+    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    gh_stub = _fake_gh_hosted_full_script(
+        runs=[
+            {
+                "id": 1005,
+                "head_sha": commit,
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": run_url,
+            }
+        ],
+        jobs_by_run={
+            1005: [
+                {
+                    "id": 2005,
+                    "name": "hosted-full",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ]
+        },
+    )
+
+    result = _run_release_driver(
+        tmp_path,
+        repo,
+        tag=tag,
+        extra_script=gh_stub,
+        override_tests=False,
+    )
+
+    assert result.returncode != 0
+    assert "-Route Targeted" in result.stderr
+    assert launcher_log.read_text(encoding="utf-8").splitlines() == [
+        _TARGETED_REBUILD_ARGS
+    ]
+    assert "Reinstall global bes" not in result.stdout
+    assert "Write local release evidence" not in result.stdout
+    assert not (repo / ".git" / "bes-release-state.json").exists()
+    assert (
+        _git(
+            repo, "show-ref", "--verify", "--quiet", f"refs/tags/{tag}", check=False
+        ).returncode
+        != 0
+    )
+    assert (
+        _git(repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}").stdout.strip()
+        == ""
+    )
