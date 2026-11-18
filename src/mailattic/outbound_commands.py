@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .imap_runtime import load_env_file
+from .original_export import imap_original_fetcher
 from .outbound import (
     DEFAULT_SMTP_ENV_FILE,
     ENV_VAR_SMTP_ENV_FILE,
@@ -287,6 +288,10 @@ def _print_draft_summary(result: DraftReplyResult | DraftNewResult) -> int:
     else:
         print("Attachments: none")
     print(f"fingerprint: {result.fingerprint}")
+    if result.quote_source == "original":
+        print("Quote: original message as sent")
+    elif result.quote_source is not None:
+        print(f"Quote: stored text ({safe(result.quote_note or '')})")
     if result.recipient_checks:
         print("Recipient check:")
         for item in result.recipient_checks:
@@ -345,6 +350,7 @@ def _handle_draft_reply(args: argparse.Namespace) -> int:
             on_archive_anchor=warn_archive_anchor,
             subject=args.subject,
             font_style=reply_font_style(env),
+            fetch_original=imap_original_fetcher(env),
         )
     except DraftReplyError as exc:
         print(exc, file=sys.stderr)

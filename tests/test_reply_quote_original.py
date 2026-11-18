@@ -1,0 +1,522 @@
+"""#136: a reply quotes the original's own HTML, with the original .eml as oracle.
+
+The customer's message as it arrived (the RFC822 bytes on the IMAP server) is
+the acceptance standard: the quoted block must keep its images, tables and
+paragraphs, and every ``cid:`` image it references must travel in the draft.
+When the original cannot be fetched the draft falls back to the stored text
+and says so; it never falls back silently.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from email import message_from_bytes, policy
+from email.message import EmailMessage
+from pathlib import Path
+
+import pytest
+from bs4 import BeautifulSoup
+
+from mailattic.cli import build_parser
+from mailattic.original_export import imap_original_fetcher
+from mailattic.outbound import (
+    _prepare_draft_for_send,
+    assemble_draft_reply,
+    build_quoted_reply_bodies,
+)
+from mailattic.outbound_commands import _handle_draft_reply
+from mailattic.reply_quote import OriginalUnavailable, quotable_original_from_rfc822
+from tests.test_original_export import FakeImapClient, FakeImapConnection
+from tests.test_outbound_draft import PLACEHOLDER_SMTP_SETTINGS, _seed_message
+
+SEEDED_MESSAGE_ID = "<test-msg-123@mailattic.test>"
+OWN = "sean3808@mailattic.test"
+LOGO_PNG = b"\x89PNG\r\n\x1a\n" + b"logo-bytes" * 8
+
+ORIGINAL_HTML = """<html><head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style><!--
+p.MsoNormal {margin:0cm; font-size:11.0pt; font-family:"Calibri",sans-serif;}
+--></style></head>
+<body lang="EN-US" style="word-wrap:break-word">
+<div class="WordSection1">
+<p class="MsoNormal">Dear Sean</p>
+<p class="MsoNormal">Please find the revised invoice as requested.</p>
+<table border="1" cellpadding="0">
+<tr><td><p class="MsoNormal">No</p></td><td><p class="MsoNormal">Item</p></td>
+<td><p class="MsoNormal">Qty</p></td></tr>
+<tr><td><p class="MsoNormal">1</p></td><td><p class="MsoNormal">RED DYE</p></td>
+<td><p class="MsoNormal">310</p></td></tr></table>
+<p class="MsoNormal">Best regards</p>
+<p class="MsoNormal">
+<img width="120" src="cid:image001.png@01DB0000.00000000" alt="logo"></p>
+<p class="MsoNormal"><img src="https://example.com/sig/line.png" alt=""></p>
+<p class="MsoNormal">Alice Chen<br>Logistics</p>
+</div></body></html>"""
+
+
+def _original_eml(html_body: str = ORIGINAL_HTML, *, with_html: bool = True) -> bytes:
+    msg = EmailMessage()
+    msg["From"] = "Alice Chen <client@example.com>"
+    msg["To"] = OWN
+    msg["Subject"] = "Test subject"
+    msg["Message-ID"] = SEEDED_MESSAGE_ID
+    msg.set_content(
+        "Dear Sean\n\nPlease find the revised invoice as requested.\n\n"
+        "[https://example.com/sig/line.png]\nAlice Chen\n"
+    )
+    if with_html:
+        msg.add_alternative(html_body, subtype="html")
+        msg.get_body(preferencelist=("html",)).add_related(
+            LOGO_PNG,
+            "image",
+            "png",
+            cid="<image001.png@01DB0000.00000000>",
+            filename="image001.png",
+        )
+    return msg.as_bytes()
+
+
+def _fetch_returning(payload: bytes):
+    def fetch(_message: Mapping[str, object]) -> bytes:
+        return payload
+
+    return fetch
+
+
+def _fetch_raising(reason: str):
+    def fetch(_message: Mapping[str, object]) -> bytes:
+        raise OriginalUnavailable(reason)
+
+    return fetch
+
+
+def _write(path: Path, data: bytes) -> Path:
+    path.write_bytes(data)
+    return path
+
+
+def _reply(tmp_path: Path, fetch, **kwargs):
+    return assemble_draft_reply(
+        _seed_message(tmp_path),
+        SEEDED_MESSAGE_ID,
+        own_address=OWN,
+        draft_dir=tmp_path / "outbound" / "drafts",
+        body_text="Thanks, noted.",
+        fetch_original=fetch,
+        **kwargs,
+    )
+
+
+def _draft(result) -> EmailMessage:
+    return message_from_bytes(
+        Path(result.draft_path).read_bytes(), policy=policy.default
+    )
+
+
+def _quoted_soup(draft: EmailMessage) -> BeautifulSoup:
+    html_body = draft.get_body(preferencelist=("html",)).get_content()
+    return BeautifulSoup(html_body.split("<hr>", 1)[1], "html.parser")
+
+
+def _body_soup(html: str) -> BeautifulSoup:
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.body or soup
+
+
+# --- the original .eml as oracle ---------------------------------------------
+
+
+def test_reply_quotes_the_originals_html_structure(tmp_path: Path) -> None:
+    result = _reply(tmp_path, _fetch_returning(_original_eml()))
+
+    original = _body_soup(ORIGINAL_HTML)
+    quoted = _quoted_soup(_draft(result))
+    # Same visible text, same images in the same order, same table cells.
+    assert quoted.get_text(" ", strip=True).endswith(original.get_text(" ", strip=True))
+    assert [img["src"] for img in quoted.find_all("img")] == [
+        img["src"] for img in original.find_all("img")
+    ]
+    assert [td.get_text(strip=True) for td in quoted.find_all("td")] == [
+        td.get_text(strip=True) for td in original.find_all("td")
+    ]
+    assert len(quoted.find_all("p", class_="MsoNormal")) == len(
+        original.find_all("p", class_="MsoNormal")
+    )
+    # The sender's paragraph styles travel with the quote.
+    assert "p.MsoNormal" in str(quoted.find("style"))
+    # The flattened text never reaches the customer.
+    assert "[https://" not in str(quoted)
+    assert result.quote_source == "original"
+
+
+def test_every_quoted_cid_image_travels_in_the_draft(tmp_path: Path) -> None:
+    result = _reply(tmp_path, _fetch_returning(_original_eml()))
+
+    draft = _draft(result)
+    cids = {
+        img["src"][4:]
+        for img in _quoted_soup(draft).find_all("img")
+        if img["src"].startswith("cid:")
+    }
+    parts = {
+        str(part["Content-ID"]).strip("<>"): part
+        for part in draft.walk()
+        if part.get("Content-ID")
+    }
+    assert cids == {"image001.png@01DB0000.00000000"}
+    assert cids <= parts.keys()
+    image = parts["image001.png@01DB0000.00000000"]
+    assert image.get_content() == LOGO_PNG
+    assert image.get_content_disposition() == "inline"
+    # The image sits next to the HTML it belongs to, not in the attachment list.
+    assert draft.get_body(preferencelist=("related",)) is not None
+    assert list(draft.iter_attachments()) == []
+
+
+def test_plain_alternative_still_quotes_the_stored_text(tmp_path: Path) -> None:
+    result = _reply(tmp_path, _fetch_returning(_original_eml()))
+
+    plain = _draft(result).get_body(preferencelist=("plain",)).get_content()
+    assert "Thanks, noted." in plain
+    assert "<p" not in plain
+    assert result.body_text.startswith("Thanks, noted.")
+
+
+def test_draft_with_quoted_original_prepares_for_send(tmp_path: Path) -> None:
+    result = _reply(
+        tmp_path,
+        _fetch_returning(_original_eml()),
+        attachments=[_write(tmp_path / "invoice.pdf", b"%PDF-1.4 x")],
+    )
+
+    prepared = _prepare_draft_for_send(result.draft_id, tmp_path / "evidence.db")
+
+    assert prepared.fingerprint == result.fingerprint
+    assert [p.get_filename() for p in prepared.msg.iter_attachments()] == [
+        "invoice.pdf"
+    ]
+    assert prepared.msg.get_body(preferencelist=("related",)) is not None
+
+
+def test_font_style_does_not_restyle_the_quoted_original() -> None:
+    quotable = quotable_original_from_rfc822(_original_eml())
+    assert quotable is not None
+    original = {
+        "sender_name": "Alice Chen",
+        "sender_email": "client@example.com",
+        "sent_at": "2026-05-26T09:03:07",
+        "subject": "Test subject",
+        "body_text": "flattened",
+        "to": [],
+        "cc": [],
+    }
+
+    _, html_body = build_quoted_reply_bodies(
+        original,
+        "My reply",
+        font_style="font-family: 'Aptos', sans-serif",
+        quotable=quotable,
+    )
+
+    wrapper, _, after = html_body.partition("</div><!-- reply -->")
+    assert wrapper.startswith('<div style="font-family:')
+    assert "My reply" in wrapper and "<b>From:</b>" in wrapper
+    assert "Dear Sean" in after and "Dear Sean" not in wrapper
+    assert "flattened" not in html_body
+
+
+# --- extraction and sanitising -----------------------------------------------
+
+
+def test_active_content_is_removed_and_everything_else_kept() -> None:
+    html = (
+        '<html><body onload="steal()"><script>alert(1)</script>'
+        '<p onclick="x()" style="color:red">Hi <a href="javascript:x()">a</a> '
+        '<a href="https://example.com/q">b</a></p>'
+        '<iframe src="https://example.com"></iframe><object></object><embed>'
+        '<form action="https://example.com"><input></form>'
+        '<base href="https://example.com/"><!--[if gte mso 9]><x:o/><![endif]-->'
+        "</body></html>"
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None
+    fragment = quotable.html_fragment
+    for gone in (
+        "<script",
+        "alert(1)",
+        "onload",
+        "onclick",
+        "javascript:",
+        "<iframe",
+        "<object",
+        "<embed",
+        "<form",
+        "<input",
+        "<base",
+    ):
+        assert gone not in fragment
+    for kept in ('style="color:red"', 'href="https://example.com/q"', "[if gte mso 9]"):
+        assert kept in fragment
+
+
+def test_meta_refresh_is_removed_even_without_a_body() -> None:
+    html = '<meta http-equiv="refresh" content="0;url=https://example.com/x"><p>Hi</p>'
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None
+    assert "refresh" not in quotable.html_fragment
+    assert "<p>Hi</p>" in quotable.html_fragment
+
+
+def test_script_urls_are_refused_in_any_attribute() -> None:
+    html = (
+        "<html><body>"
+        '<svg><set attributeName="href" to="javascript:alert(1)"/></svg>'
+        '<a href="data:text/html,x">d</a>'
+        '<p style="width: expression(alert(1))">e</p>'
+        '<img src="data:image/png;base64,AAAA">'
+        '<p style="color: red">kept</p>'
+        "</body></html>"
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None
+    fragment = quotable.html_fragment
+    for gone in ("javascript:", "data:text/html", "expression("):
+        assert gone not in fragment
+    assert 'src="data:image/png;base64,AAAA"' in fragment
+    assert 'style="color: red"' in fragment
+
+
+def test_conditional_comment_carrying_active_content_is_removed() -> None:
+    html = (
+        "<html><body><p>Hi</p>"
+        "<!--[if mso]><script>alert(1)</script><![endif]-->"
+        '<!--[if gte mso 9]><p onclick="x()">y</p><![endif]-->'
+        "<!--[if gte vml 1]><v:shape><v:imagedata src='x.png'/></v:shape><![endif]-->"
+        "</body></html>"
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None
+    fragment = quotable.html_fragment
+    assert "alert(1)" not in fragment and "onclick" not in fragment
+    assert "<v:imagedata" in fragment  # Outlook's own VML signature stays
+
+
+def test_head_conditional_comments_travel_with_the_head_styles() -> None:
+    html = (
+        "<html><head><style>p{margin:0}</style>"
+        "<!--[if gte mso 9]><xml><o:shapedefaults v:ext='edit'/></xml><![endif]-->"
+        "</head><body><p>Hi</p></body></html>"
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None
+    assert "o:shapedefaults" in quotable.html_fragment
+    assert quotable.html_fragment.index("p{margin:0}") < quotable.html_fragment.index(
+        "o:shapedefaults"
+    )
+
+
+def test_cid_inside_a_conditional_comment_must_resolve(tmp_path: Path) -> None:
+    vml = (
+        "<p><!--[if gte vml 1]><v:imagedata src='cid:vml@x'/><![endif]-->"
+        '<img src="cid:logo@x"></p>'
+    )
+    eml = _eml_with_cid(vml, "logo@x")
+
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    assert result.quote_source == "stored_text"
+    assert result.quote_note is not None and "vml@x" in result.quote_note
+
+
+def _eml_with_cid(html_body: str, content_id: str | None) -> bytes:
+    msg = EmailMessage()
+    msg["Message-ID"] = SEEDED_MESSAGE_ID
+    msg.set_content("x")
+    msg.add_alternative(html_body, subtype="html")
+    if content_id is not None:
+        msg.get_body(preferencelist=("html",)).add_related(
+            LOGO_PNG, "image", "png", cid=f"<{content_id}>", filename="a.png"
+        )
+    return msg.as_bytes()
+
+
+def test_cid_with_an_html_special_character_still_resolves(tmp_path: Path) -> None:
+    eml = _eml_with_cid('<p><img src="cid:img&amp;1@x"></p>', "img&1@x")
+
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    draft = _draft(result)
+    assert result.quote_source == "original"
+    assert {str(p["Content-ID"]) for p in draft.walk() if p.get("Content-ID")} == {
+        "<img&1@x>"
+    }
+
+
+def test_unresolved_cid_falls_back_to_stored_text(tmp_path: Path) -> None:
+    eml = _eml_with_cid('<p><img src="cid:gone@x"></p>', None)
+
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    assert result.quote_source == "stored_text"
+    assert result.quote_note is not None and "gone@x" in result.quote_note
+    assert "cid:" not in str(_quoted_soup(_draft(result)))
+
+
+def test_plain_only_original_has_nothing_to_quote_as_html() -> None:
+    assert quotable_original_from_rfc822(_original_eml(with_html=False)) is None
+
+
+def test_mislabelled_charset_is_decoded_like_ingest() -> None:
+    msg = EmailMessage()
+    msg["Message-ID"] = SEEDED_MESSAGE_ID
+    msg.set_content("x")
+    msg.add_alternative(
+        "<html><body><p>染廠來電，仍未收到藥劑</p></body></html>".encode("big5"),
+        "text",
+        "html",
+        cte="base64",
+    )
+    html_part = msg.get_body(preferencelist=("html",))
+    html_part.set_param("charset", "big5")
+
+    quotable = quotable_original_from_rfc822(msg.as_bytes())
+
+    assert quotable is not None
+    assert "染廠來電，仍未收到藥劑" in quotable.html_fragment
+
+
+# --- fallback is never silent ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("fetch", "note"),
+    [
+        (None, "original fetch not configured"),
+        (
+            _fetch_raising("Original message not found on IMAP server."),
+            "Original message not found on IMAP server.",
+        ),
+        (_fetch_returning(_original_eml(with_html=False)), "original has no HTML body"),
+    ],
+)
+def test_unavailable_original_falls_back_to_stored_text_and_says_why(
+    tmp_path: Path, fetch, note: str
+) -> None:
+    result = _reply(tmp_path, fetch)
+
+    assert result.quote_source == "stored_text"
+    assert result.quote_note == note
+    assert "original body" in str(_quoted_soup(_draft(result)))
+
+
+def test_cli_reports_the_quote_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db_path = _seed_message(tmp_path)
+    body = _write(tmp_path / "body.txt", b"Thanks, noted.")
+    env_file = tmp_path / "placeholder.env"
+    env_file.write_text(PLACEHOLDER_SMTP_SETTINGS, encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "draft-reply",
+            SEEDED_MESSAGE_ID,
+            "--body-from",
+            str(body),
+            "--database",
+            str(db_path),
+            "--env-file",
+            str(env_file),
+        ]
+    )
+
+    assert _handle_draft_reply(args) == 0
+
+    out = capsys.readouterr().out
+    assert "Quote: stored text (" in out
+
+
+# --- the IMAP fetcher --------------------------------------------------------
+
+IMAP_ENV = {
+    "IMAP_HOST": "imap.example.com",
+    "IMAP_PORT": "993",
+    "IMAP_USER": OWN,
+    "IMAP_PASSWORD": "placeholder",
+}
+IMAP_ANCHOR = {
+    "message_id": SEEDED_MESSAGE_ID,
+    "pst_source": f"imap:{OWN}:INBOX",
+    "source_input_mode": "maildir",
+    "folder_path": "INBOX",
+    "logical_locator": "INBOX/uid-7",
+}
+
+
+def test_fetcher_returns_the_verified_original_from_imap() -> None:
+    original = _original_eml()
+    fake = FakeImapClient(FakeImapConnection({7: original}))
+    fetch = imap_original_fetcher(IMAP_ENV, client_factory=lambda _env: fake)
+
+    assert fetch(IMAP_ANCHOR) == original
+    assert fake.close_calls == 1
+
+
+def test_fetcher_finds_a_moved_original_by_message_id() -> None:
+    original = _original_eml()
+    fake = FakeImapClient(
+        FakeImapConnection({42: original}, {"test-msg-123@mailattic.test": [42]})
+    )
+    fetch = imap_original_fetcher(IMAP_ENV, client_factory=lambda _env: fake)
+
+    assert fetch(IMAP_ANCHOR) == original
+
+
+def test_fetcher_reports_an_original_gone_from_the_server() -> None:
+    fake = FakeImapClient(FakeImapConnection({}))
+    fetch = imap_original_fetcher(IMAP_ENV, client_factory=lambda _env: fake)
+
+    with pytest.raises(OriginalUnavailable, match="not found"):
+        fetch(IMAP_ANCHOR)
+    assert fake.close_calls == 1
+
+
+def test_fetcher_refuses_without_imap_settings() -> None:
+    fetch = imap_original_fetcher({"SMTP_USER": OWN})
+
+    with pytest.raises(OriginalUnavailable, match="IMAP"):
+        fetch(IMAP_ANCHOR)
+
+
+def test_fetcher_does_not_reach_outlook_for_a_pst_anchor() -> None:
+    fetch = imap_original_fetcher(
+        IMAP_ENV, client_factory=lambda _env: pytest.fail("must not connect")
+    )
+    pst_anchor = {
+        **IMAP_ANCHOR,
+        "pst_source": "C:/archive/mailbox.pst",
+        "source_input_mode": "file",
+    }
+
+    with pytest.raises(OriginalUnavailable, match="PST"):
+        fetch(pst_anchor)
+
+
+def test_fetcher_turns_connection_failure_into_unavailable() -> None:
+    def broken(_env):
+        raise OSError("connection refused")
+
+    fetch = imap_original_fetcher(IMAP_ENV, client_factory=broken)
+
+    with pytest.raises(OriginalUnavailable, match="connection refused"):
+        fetch(IMAP_ANCHOR)
