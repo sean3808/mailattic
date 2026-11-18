@@ -19,7 +19,7 @@ Sean 於 2026-11-18 在 issue #134 逐題裁定（原文）：
 
 ## Decision
 
-`scripts/release.ps1` 第 2 階段改為查詢 `HEAD` 在 `ci.yml` 的最新 `hosted-full` job 狀態，並一律執行本機限定測試：
+`scripts/release.ps1` 第 2 階段改為透過 `scripts/record_ci_green_tree.py --status-json` 查詢 `HEAD` 在 `ci.yml` 的最新 `hosted-full` job 狀態（與 closeout 綠樹紀錄共用同一份 Python 判定邏輯，依 `started_at` 含 fallback `created_at` 取最新一筆），並一律執行本機限定測試：
 
 1. **`hosted-full` 已成功（`completed` + `success`）**：跳過本機 `-Route Full`，於 release 輸出印出採用的 run URL。
 2. **還在跑（`in progress`）、排隊中（`queued`）或查不到（`not found`）**：不等待，於 release 輸出印出 `falling back to local Full` 與原因後，退回執行本機 `-Route Full`。

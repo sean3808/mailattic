@@ -494,6 +494,21 @@ def _assert_tag_pushed(repo: Path, remote: Path, tag: str) -> str:
     return local_commit
 
 
+def _assert_no_release_artifacts(repo: Path, remote: Path, tag: str) -> None:
+    """Assert no evidence, local tag, or remote tag was created."""
+    assert not (repo / ".git" / "bes-release-state.json").exists()
+    assert (
+        _git(
+            repo, "show-ref", "--verify", "--quiet", f"refs/tags/{tag}", check=False
+        ).returncode
+        != 0
+    )
+    assert (
+        _git(repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}").stdout.strip()
+        == ""
+    )
+
+
 @pytest.mark.release
 def test_release_orchestration_orders_stages_and_pushes_annotated_tag(
     tmp_path: Path,
@@ -506,7 +521,7 @@ def test_release_orchestration_orders_stages_and_pushes_annotated_tag(
     assert result.returncode == 0, result.stderr
     stage_markers = [
         "Validate release inputs",
-        "Run full test suite",
+        "Verify tests (hosted-full or local Full, plus local-only Targeted)",
         "Reinstall global bes",
         "Verify installed snapshot",
         "Sync and verify skill SSOT",
@@ -1233,38 +1248,29 @@ def test_release_tests_throw_on_any_nonzero_launcher_exit_code(
 def test_release_stops_before_reinstall_on_any_nonzero_launcher_exit(
     tmp_path: Path, launcher_exit_code: int, expected_message_fragment: str
 ):
-    repo, _ = _make_release_repo(tmp_path)
+    repo, remote = _make_release_repo(tmp_path)
     (repo / "scripts" / "invoke-pytest.ps1").write_text(
         f"exit {launcher_exit_code}\n", encoding="utf-8"
     )
+    _write_status_script_stub(repo / "scripts", state="not_found")
     _git(repo, "add", "scripts")
     _git(repo, "commit", "-m", "stub canonical pytest launcher exit code")
     _git(repo, "push", "origin", "main")
 
-    gh_not_found = _fake_gh_hosted_full_script(runs=[], jobs_by_run={})
-    result = _run_release_driver(
-        tmp_path, repo, extra_script=gh_not_found, override_tests=False
-    )
+    result = _run_release_driver(tmp_path, repo, override_tests=False)
 
     assert result.returncode != 0
     assert expected_message_fragment in result.stderr
-    assert "Run full test suite" in result.stdout
+    assert (
+        "Verify tests (hosted-full or local Full, plus local-only Targeted)"
+        in result.stdout
+    )
     assert "Reinstall global bes" not in result.stdout
     assert "Verify installed snapshot" not in result.stdout
     assert "Write local release evidence" not in result.stdout
     assert "Create annotated release tag" not in result.stdout
     assert "Atomically push main and release tag" not in result.stdout
-    assert (
-        _git(
-            repo,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            "refs/tags/bes-v2026.07.18.1",
-            check=False,
-        ).returncode
-        != 0
-    )
+    _assert_no_release_artifacts(repo, remote, "bes-v2026.07.18.1")
 
 
 def test_disposable_repos_disable_git_auto_maintenance_for_direct_and_nested_git(
@@ -1300,217 +1306,155 @@ def test_disposable_repos_disable_git_auto_maintenance_for_direct_and_nested_git
     assert remote_side.stdout.strip() == "false"
 
 
-def _fake_gh_hosted_full_script(
+def _write_status_script_stub(
+    scripts_dir: Path,
     *,
-    runs: list[dict[str, object]],
-    jobs_by_run: dict[int, list[dict[str, object]]],
-) -> str:
-    runs_json = json.dumps([{"workflow_runs": runs}])
-    jobs_lines = []
-    for run_id, jobs in jobs_by_run.items():
-        jobs_payload = ps_quote(json.dumps([{"jobs": jobs}]))
-        jobs_lines.append(
-            f"        {run_id} {{ {jobs_payload}; $global:LASTEXITCODE = 0; return }}"
-        )
-    jobs_cases = "\n".join(jobs_lines)
-    return f"""
-function gh {{
-    if ($args[0] -eq 'repo') {{
-        '{{"nameWithOwner":"example/mailattic"}}'
-        $global:LASTEXITCODE = 0
-        return
-    }}
-    if ($args[0] -eq 'api') {{
-        $endpoint = $args[-1]
-        if ($endpoint -like '*actions/workflows/ci.yml/runs*') {{
-            {ps_quote(runs_json)}
-            $global:LASTEXITCODE = 0
-            return
-        }}
-        if ($endpoint -match 'actions/runs/(\\d+)/jobs') {{
-            switch ([int]$Matches[1]) {{
-{jobs_cases}
-                default {{ '[{{"jobs":[]}}]'; $global:LASTEXITCODE = 0; return }}
-            }}
-        }}
-    }}
-    $global:LASTEXITCODE = 0
-}}
-"""
-
-
-def test_release_skips_local_full_when_hosted_full_succeeded(tmp_path: Path):
-    repo, remote = _make_release_repo(tmp_path)
-    tag = "bes-v2026.11.18.1"
-    run_url = "https://github.com/example/mailattic/actions/runs/1001"
-    launcher_log = tmp_path / "launcher-args.txt"
-    _write_logging_launcher_stub(repo / "scripts", launcher_log)
-    _git(repo, "add", "scripts")
-    _git(repo, "commit", "-m", "stub launcher")
-    _git(repo, "push", "origin", "main")
-    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
-
-    gh_stub = _fake_gh_hosted_full_script(
-        runs=[
-            {
-                "id": 1001,
-                "head_sha": commit,
-                "status": "completed",
-                "conclusion": "success",
-                "html_url": run_url,
-            }
-        ],
-        jobs_by_run={
-            1001: [
-                {
-                    "id": 2001,
-                    "name": "hosted-full",
-                    "status": "completed",
-                    "conclusion": "success",
-                }
-            ]
-        },
+    state: str,
+    conclusion: str | None = None,
+    url: str | None = None,
+    exit_code: int = 0,
+    stderr_message: str = "",
+) -> None:
+    payload = json.dumps(
+        {
+            "state": state,
+            "conclusion": conclusion,
+            "url": url,
+            "run_id": 1001 if url else None,
+            "run_attempt": 1 if url else None,
+        }
+    )
+    (scripts_dir / "record_ci_green_tree.py").write_text(
+        "import sys\n"
+        f"if {exit_code} != 0:\n"
+        f"    print({stderr_message!r}, file=sys.stderr)\n"
+        f"    sys.exit({exit_code})\n"
+        f"print({payload!r})\n",
+        encoding="utf-8",
     )
 
-    result = _run_release_driver(
-        tmp_path,
-        repo,
-        tag=tag,
-        extra_script=gh_stub,
-        override_tests=False,
+
+def test_invoke_release_tests_skips_local_full_when_hosted_full_succeeded(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    log = tmp_path / "launcher-args.txt"
+    run_url = "https://github.com/example/mailattic/actions/runs/1001"
+    _write_logging_launcher_stub(scripts, log)
+    _write_status_script_stub(
+        scripts, state="success", conclusion="success", url=run_url
+    )
+
+    result = _run_release_function(
+        f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)} -Commit 'abc123'"
     )
 
     assert result.returncode == 0, result.stderr
     assert run_url in result.stdout
     assert "skipping local Full" in result.stdout
-    assert launcher_log.read_text(encoding="utf-8").splitlines() == [
-        _TARGETED_REBUILD_ARGS
-    ]
-    _assert_tag_pushed(repo, remote, tag)
+    assert log.read_text(encoding="utf-8").splitlines() == [_TARGETED_REBUILD_ARGS]
 
 
 @pytest.mark.parametrize(
-    ("reason", "runs", "jobs_by_run"),
+    ("state", "expected_reason"),
     [
-        (
-            "in progress",
-            [
-                {
-                    "id": 1002,
-                    "status": "in_progress",
-                    "conclusion": None,
-                    "html_url": "https://github.com/example/mailattic/actions/runs/1002",
-                }
-            ],
-            {
-                1002: [
-                    {
-                        "id": 2002,
-                        "name": "hosted-full",
-                        "status": "in_progress",
-                        "conclusion": None,
-                    }
-                ]
-            },
-        ),
-        (
-            "queued",
-            [
-                {
-                    "id": 1003,
-                    "status": "queued",
-                    "conclusion": None,
-                    "html_url": "https://github.com/example/mailattic/actions/runs/1003",
-                }
-            ],
-            {
-                1003: [
-                    {
-                        "id": 2003,
-                        "name": "hosted-full",
-                        "status": "queued",
-                        "conclusion": None,
-                    }
-                ]
-            },
-        ),
-        ("not found", [], {}),
+        ("queued", "queued"),
+        ("in_progress", "in progress"),
+        ("not_found", "not found"),
     ],
 )
-def test_release_falls_back_to_local_full_when_hosted_full_not_ready(
-    tmp_path: Path,
-    reason: str,
-    runs: list[dict[str, object]],
-    jobs_by_run: dict[int, list[dict[str, object]]],
+def test_invoke_release_tests_falls_back_to_local_full_when_not_ready(
+    tmp_path: Path, state: str, expected_reason: str
 ):
-    repo, remote = _make_release_repo(tmp_path)
-    tag = "bes-v2026.11.18.2"
-    launcher_log = tmp_path / "launcher-args.txt"
-    _write_logging_launcher_stub(repo / "scripts", launcher_log)
-    _git(repo, "add", "scripts")
-    _git(repo, "commit", "-m", "stub launcher")
-    _git(repo, "push", "origin", "main")
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(scripts, log)
+    _write_status_script_stub(scripts, state=state)
 
-    gh_stub = _fake_gh_hosted_full_script(runs=runs, jobs_by_run=jobs_by_run)
-    result = _run_release_driver(
-        tmp_path,
-        repo,
-        tag=tag,
-        extra_script=gh_stub,
-        override_tests=False,
+    result = _run_release_function(
+        f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)} -Commit 'abc123'"
     )
 
     assert result.returncode == 0, result.stderr
     assert "falling back to local Full" in result.stdout
-    assert reason in result.stdout
-    assert launcher_log.read_text(encoding="utf-8").splitlines() == [
+    assert expected_reason in result.stdout
+    assert log.read_text(encoding="utf-8").splitlines() == [
         "-Route Full",
         _TARGETED_REBUILD_ARGS,
     ]
-    _assert_tag_pushed(repo, remote, tag)
+
+
+def test_invoke_release_tests_falls_back_with_warning_on_status_script_error(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(scripts, log)
+    _write_status_script_stub(
+        scripts, state="not_found", exit_code=1, stderr_message="gh api boom"
+    )
+
+    result = _run_release_function(
+        f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)} -Commit 'abc123'"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "WARNING:" in result.stderr
+    assert "gh api boom" in result.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "-Route Full",
+        _TARGETED_REBUILD_ARGS,
+    ]
+
+
+def test_invoke_release_tests_stops_on_targeted_failure_even_when_hosted_full_green(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(scripts, log, exit_code=1)
+    _write_status_script_stub(
+        scripts,
+        state="success",
+        conclusion="success",
+        url="https://github.com/example/mailattic/actions/runs/1005",
+    )
+
+    result = _run_release_function(
+        f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)} -Commit 'abc123'"
+    )
+
+    assert result.returncode != 0
+    assert "-Route Targeted" in result.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == [_TARGETED_REBUILD_ARGS]
 
 
 @pytest.mark.parametrize("conclusion", ["failure", "cancelled"])
-def test_release_stops_when_hosted_full_failed_or_cancelled(
-    tmp_path: Path, conclusion: str
-):
+def test_release_stops_when_hosted_full_failed_e2e(tmp_path: Path, conclusion: str):
     repo, remote = _make_release_repo(tmp_path)
     tag = "bes-v2026.11.18.3"
     run_url = "https://github.com/example/mailattic/actions/runs/1004"
     launcher_log = tmp_path / "launcher-args.txt"
     _write_logging_launcher_stub(repo / "scripts", launcher_log)
-    _git(repo, "add", "scripts")
-    _git(repo, "commit", "-m", "stub launcher")
-    _git(repo, "push", "origin", "main")
-    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
-
-    gh_stub = _fake_gh_hosted_full_script(
-        runs=[
-            {
-                "id": 1004,
-                "head_sha": commit,
-                "status": "completed",
-                "conclusion": conclusion,
-                "html_url": run_url,
-            }
-        ],
-        jobs_by_run={
-            1004: [
-                {
-                    "id": 2004,
-                    "name": "hosted-full",
-                    "status": "completed",
-                    "conclusion": conclusion,
-                }
-            ]
-        },
+    _write_status_script_stub(
+        repo / "scripts", state="failed", conclusion=conclusion, url=run_url
     )
+    _git(repo, "add", "scripts")
+    _git(repo, "commit", "-m", "stub failed hosted-full status")
+    _git(repo, "push", "origin", "main")
 
     result = _run_release_driver(
         tmp_path,
         repo,
         tag=tag,
-        extra_script=gh_stub,
         override_tests=False,
     )
 
@@ -1522,137 +1466,4 @@ def test_release_stops_when_hosted_full_failed_or_cancelled(
     assert "Write local release evidence" not in result.stdout
     assert "Create annotated release tag" not in result.stdout
     assert "Atomically push main and release tag" not in result.stdout
-    assert not (repo / ".git" / "bes-release-state.json").exists()
-    assert (
-        _git(
-            repo, "show-ref", "--verify", "--quiet", f"refs/tags/{tag}", check=False
-        ).returncode
-        != 0
-    )
-    assert (
-        _git(repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}").stdout.strip()
-        == ""
-    )
-
-
-def test_release_stops_when_targeted_recipient_rebuild_tests_fail(tmp_path: Path):
-    repo, remote = _make_release_repo(tmp_path)
-    tag = "bes-v2026.11.18.4"
-    run_url = "https://github.com/example/mailattic/actions/runs/1005"
-    launcher_log = tmp_path / "launcher-args.txt"
-    _write_logging_launcher_stub(repo / "scripts", launcher_log, exit_code=1)
-    _git(repo, "add", "scripts")
-    _git(repo, "commit", "-m", "stub failing targeted launcher")
-    _git(repo, "push", "origin", "main")
-    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
-
-    gh_stub = _fake_gh_hosted_full_script(
-        runs=[
-            {
-                "id": 1005,
-                "head_sha": commit,
-                "status": "completed",
-                "conclusion": "success",
-                "html_url": run_url,
-            }
-        ],
-        jobs_by_run={
-            1005: [
-                {
-                    "id": 2005,
-                    "name": "hosted-full",
-                    "status": "completed",
-                    "conclusion": "success",
-                }
-            ]
-        },
-    )
-
-    result = _run_release_driver(
-        tmp_path,
-        repo,
-        tag=tag,
-        extra_script=gh_stub,
-        override_tests=False,
-    )
-
-    assert result.returncode != 0
-    assert "-Route Targeted" in result.stderr
-    assert launcher_log.read_text(encoding="utf-8").splitlines() == [
-        _TARGETED_REBUILD_ARGS
-    ]
-    assert "Reinstall global bes" not in result.stdout
-    assert "Write local release evidence" not in result.stdout
-    assert not (repo / ".git" / "bes-release-state.json").exists()
-    assert (
-        _git(
-            repo, "show-ref", "--verify", "--quiet", f"refs/tags/{tag}", check=False
-        ).returncode
-        != 0
-    )
-    assert (
-        _git(repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}").stdout.strip()
-        == ""
-    )
-
-
-def test_get_hosted_full_run_status_picks_latest_run_and_latest_attempt(tmp_path: Path):
-    repo, _ = _make_release_repo(tmp_path)
-    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    newer_url = "https://github.com/example/mailattic/actions/runs/1002"
-    gh_stub = _fake_gh_hosted_full_script(
-        runs=[
-            {
-                "id": 1001,
-                "head_sha": commit,
-                "status": "completed",
-                "conclusion": "failure",
-                "html_url": "https://github.com/example/mailattic/actions/runs/1001",
-            },
-            {
-                "id": 1002,
-                "head_sha": commit,
-                "status": "completed",
-                "conclusion": "success",
-                "html_url": newer_url,
-            },
-        ],
-        jobs_by_run={
-            1001: [
-                {
-                    "id": 2001,
-                    "run_attempt": 1,
-                    "name": "hosted-full",
-                    "status": "completed",
-                    "conclusion": "failure",
-                }
-            ],
-            1002: [
-                {
-                    "id": 2002,
-                    "run_attempt": 1,
-                    "name": "hosted-full",
-                    "status": "completed",
-                    "conclusion": "failure",
-                },
-                {
-                    "id": 2003,
-                    "run_attempt": 2,
-                    "name": "hosted-full",
-                    "status": "completed",
-                    "conclusion": "success",
-                },
-            ],
-        },
-    )
-
-    result = _run_release_function(
-        f"{gh_stub}\n"
-        f"$s = Get-HostedFullRunStatus -RepoRoot {ps_quote(repo)} "
-        f"-Commit {ps_quote(commit)}\n"
-        'Write-Output "$($s.State)|$($s.RunUrl)"'
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == f"success|{newer_url}"
-    assert "filter=latest" in RELEASE_SCRIPT.read_text(encoding="utf-8")
+    _assert_no_release_artifacts(repo, remote, tag)

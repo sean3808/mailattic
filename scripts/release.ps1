@@ -16,6 +16,14 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# Local-only recipient rebuild tests (gitignored, not run by CI).
+# A missing file (e.g., in a fresh clone) fails closed on purpose so releases
+# cannot silently skip local-only verification.
+$LocalOnlyTargetedTestPaths = @(
+    'tests/test_recipient_rebuild_audit.py',
+    'tests/test_recipient_rebuild_apply.py'
+)
+
 function Invoke-GitCapture {
     param(
         [Parameter(Mandatory)]
@@ -397,148 +405,75 @@ function Invoke-PytestLauncher {
     }
 }
 
-function Invoke-GhJson {
-    param(
-        [Parameter(Mandatory)]
-        [string]$RepoRoot,
-        [Parameter(Mandatory)]
-        [string[]]$Arguments
-    )
-
-    Push-Location -LiteralPath $RepoRoot
-    try {
-        $global:LASTEXITCODE = 0
-        $output = @(& gh @Arguments 2>&1)
-        $exitCode = $LASTEXITCODE
-    } finally {
-        Pop-Location
-    }
-
-    $text = (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine).Trim()
-    if ($exitCode -ne 0) {
-        [Console]::Error.WriteLine(
-            "[release] WARNING: gh $($Arguments[0]) failed (exit $exitCode): $text"
-        )
-        return $null
-    }
-
-    if (-not $text) {
-        return $null
-    }
-
-    try {
-        return ($text | ConvertFrom-Json)
-    } catch {
-        [Console]::Error.WriteLine(
-            "[release] WARNING: gh $($Arguments[0]) returned invalid JSON."
-        )
-        return $null
-    }
-}
-
-function ConvertTo-HostedFullStatus {
-    param(
-        [string]$Status,
-        [string]$Conclusion,
-        [string]$RunUrl,
-        [bool]$AllowSuccess = $false
-    )
-
-    if ($Status -eq 'completed') {
-        if ($AllowSuccess -and $Conclusion -eq 'success') {
-            return [pscustomobject]@{ State = 'success'; RunUrl = $RunUrl }
-        }
-        if ($Conclusion -in @('failure', 'cancelled', 'timed_out', 'action_required')) {
-            return [pscustomobject]@{ State = $Conclusion; RunUrl = $RunUrl }
-        }
-        return $null
-    }
-    if ($Status -eq 'in_progress') {
-        return [pscustomobject]@{ State = 'in progress'; RunUrl = $RunUrl }
-    }
-    if ($Status -in @('queued', 'waiting', 'requested', 'pending')) {
-        return [pscustomobject]@{ State = 'queued'; RunUrl = $RunUrl }
-    }
-    return $null
-}
-
-function Get-HostedFullRunStatus {
+function Get-HostedFullStatus {
     param(
         [Parameter(Mandatory)]
         [string]$RepoRoot,
         [string]$Commit
     )
 
-    $notFound = [pscustomobject]@{ State = 'not found'; RunUrl = $null }
-    if (-not $Commit) {
-        return $notFound
+    $statusScript = Join-Path $RepoRoot 'scripts\record_ci_green_tree.py'
+    if (-not (Test-Path -LiteralPath $statusScript -PathType Leaf)) {
+        return [pscustomobject]@{
+            Ok = $false
+            Error = "Hosted-full status script was not found: $statusScript"
+            Payload = $null
+        }
     }
 
-    $repoInfo = Invoke-GhJson -RepoRoot $RepoRoot -Arguments @(
-        'repo', 'view', '--json', 'nameWithOwner'
-    )
-    if (-not $repoInfo -or -not $repoInfo.nameWithOwner) {
-        return $notFound
-    }
-    $repoName = $repoInfo.nameWithOwner
-
-    $runsPages = Invoke-GhJson -RepoRoot $RepoRoot -Arguments @(
-        'api', '--paginate', '--slurp',
-        "repos/$repoName/actions/workflows/ci.yml/runs?head_sha=$Commit&per_page=100"
-    )
-    if (-not $runsPages) {
-        return $notFound
+    $args = @('--locked', '--exact', 'python', $statusScript, '--status-json')
+    if ($Commit) {
+        $args += @('--commit', $Commit)
     }
 
-    $runs = @(
-        foreach ($page in @($runsPages)) {
-            if ($page.workflow_runs) {
-                $page.workflow_runs
+    $stdoutLines = [System.Collections.Generic.List[string]]::new()
+    $stderrLines = [System.Collections.Generic.List[string]]::new()
+    Push-Location -LiteralPath $RepoRoot
+    $previousEncoding = $env:PYTHONIOENCODING
+    try {
+        $env:PYTHONIOENCODING = 'utf-8'
+        $global:LASTEXITCODE = 0
+        & uv run @args 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                $stderrLines.Add($_.ToString())
+            } else {
+                $stdoutLines.Add($_.ToString())
             }
         }
-    ) | Sort-Object -Property id -Descending
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $env:PYTHONIOENCODING = $previousEncoding
+        Pop-Location
+    }
 
-    foreach ($run in $runs) {
-        $runUrl = $run.html_url
-        $jobPages = Invoke-GhJson -RepoRoot $RepoRoot -Arguments @(
-            'api', '--paginate', '--slurp',
-            "repos/$repoName/actions/runs/$($run.id)/jobs?per_page=100&filter=latest"
-        )
-
-        $hostedFullJob = $null
-        if ($jobPages) {
-            $hostedFullJob = @(
-                foreach ($jobPage in @($jobPages)) {
-                    if ($jobPage.jobs) {
-                        $jobPage.jobs | Where-Object { $_.name -eq 'hosted-full' }
-                    }
-                }
-            ) | Sort-Object -Property run_attempt, id -Descending | Select-Object -First 1
+    if ($exitCode -ne 0) {
+        $detail = ($stderrLines -join [Environment]::NewLine).Trim()
+        if (-not $detail) {
+            $detail = ($stdoutLines -join [Environment]::NewLine).Trim()
         }
-
-        if ($hostedFullJob) {
-            $mapped = ConvertTo-HostedFullStatus `
-                -Status $hostedFullJob.status `
-                -Conclusion $hostedFullJob.conclusion `
-                -RunUrl $runUrl `
-                -AllowSuccess $true
-            if ($mapped) {
-                return $mapped
-            }
-            continue
-        }
-
-        $runMapped = ConvertTo-HostedFullStatus `
-            -Status $run.status `
-            -Conclusion $run.conclusion `
-            -RunUrl $runUrl `
-            -AllowSuccess $false
-        if ($runMapped) {
-            return $runMapped
+        return [pscustomobject]@{
+            Ok = $false
+            Error = "record_ci_green_tree.py --status-json failed (exit $exitCode): $detail"
+            Payload = $null
         }
     }
 
-    return $notFound
+    $jsonText = ($stdoutLines -join [Environment]::NewLine).Trim()
+    try {
+        $payload = $jsonText | ConvertFrom-Json
+    } catch {
+        return [pscustomobject]@{
+            Ok = $false
+            Error = "record_ci_green_tree.py --status-json returned invalid JSON: $jsonText"
+            Payload = $null
+        }
+    }
+
+    return [pscustomobject]@{
+        Ok = $true
+        Error = $null
+        Payload = $payload
+    }
 }
 
 function Invoke-ReleaseTests {
@@ -548,12 +483,13 @@ function Invoke-ReleaseTests {
       always run the local-only recipient rebuild tests via -Route Targeted.
 
     .DESCRIPTION
-      Release inspects GitHub Actions `ci.yml` runs for HEAD (`hosted-full`
-      job). When `hosted-full` succeeded for HEAD, local `-Route Full` is
-      skipped; when it is in progress, queued, or not found, release falls
-      back to `-Route Full` via `scripts/invoke-pytest.ps1` (canonical full pytest gate).
-      A failed or cancelled `hosted-full` stops the release immediately. In all passing cases, the two gitignored local-only
-      recipient rebuild test files run through `-Route Targeted`.
+      Release queries `scripts/record_ci_green_tree.py --status-json` for HEAD.
+      When `hosted-full` succeeded for HEAD, local `-Route Full` is skipped;
+      when it is queued, in progress, not found, or the lookup fails, release
+      falls back to `-Route Full` via `scripts/invoke-pytest.ps1` (canonical full pytest gate).
+      A failed `hosted-full` stops the release immediately. In all passing
+      cases, the gitignored local-only recipient rebuild test files run through
+      `-Route Targeted`.
 
       Any non-zero exit code from the launcher -- an ordinary pytest
       failure, lock contention (17), or a runtime root whose volume cannot
@@ -573,24 +509,32 @@ function Invoke-ReleaseTests {
         throw "Canonical pytest launcher was not found: $launcherPath"
     }
 
-    $hostedFull = Get-HostedFullRunStatus -RepoRoot $RepoRoot -Commit $Commit
-    switch ($hostedFull.State) {
-        'success' {
-            Write-Host "[release] Accepted hosted-full run: $($hostedFull.RunUrl); skipping local Full"
-        }
-        { $_ -in @('failure', 'cancelled', 'timed_out', 'action_required') } {
-            throw "hosted-full $($hostedFull.State) for commit $Commit ($($hostedFull.RunUrl)); release stopped."
-        }
-        default {
-            Write-Host "[release] hosted-full $($hostedFull.State); falling back to local Full"
-            Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments @('-Route', 'Full')
+    $lookup = Get-HostedFullStatus -RepoRoot $RepoRoot -Commit $Commit
+    if (-not $lookup.Ok) {
+        [Console]::Error.WriteLine("[release] WARNING: $($lookup.Error); falling back to local Full")
+        Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments @('-Route', 'Full')
+    } else {
+        $payload = $lookup.Payload
+        switch ($payload.state) {
+            'success' {
+                Write-Host "[release] Accepted hosted-full run: $($payload.url); skipping local Full"
+            }
+            'failed' {
+                throw "hosted-full failed ($($payload.conclusion)) for commit $Commit ($($payload.url)); release stopped."
+            }
+            { $_ -in @('queued', 'in_progress', 'not_found') } {
+                $reason = $payload.state.Replace('_', ' ')
+                Write-Host "[release] hosted-full $reason; falling back to local Full"
+                Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments @('-Route', 'Full')
+            }
+            default {
+                throw "Unexpected hosted-full state '$($payload.state)' for commit $Commit."
+            }
         }
     }
 
-    Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments @(
-        '-Route', 'Targeted',
-        'tests/test_recipient_rebuild_audit.py',
-        'tests/test_recipient_rebuild_apply.py'
+    Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments (
+        @('-Route', 'Targeted') + $LocalOnlyTargetedTestPaths
     )
 }
 
@@ -702,7 +646,7 @@ function Invoke-BesRelease {
     }
     $releaseCommit = Assert-ReleasePreconditions @preconditionParameters
 
-    Write-ReleaseStage -Number 2 -Message 'Run full test suite'
+    Write-ReleaseStage -Number 2 -Message 'Verify tests (hosted-full or local Full, plus local-only Targeted)'
     Invoke-ReleaseTests -RepoRoot $resolvedRoot -Commit $releaseCommit
 
     Write-ReleaseStage -Number 3 -Message 'Reinstall global bes'
