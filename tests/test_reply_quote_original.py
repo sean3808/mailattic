@@ -297,6 +297,30 @@ def test_script_urls_are_refused_in_any_attribute() -> None:
     assert 'style="color: red"' in fragment
 
 
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        'href="java&#x09;script:alert(1)"',
+        'href="java&#10;script:alert(1)"',
+        'href="&#x01; javascript:alert(1)"',
+        'href="vb&#13;script:msgbox(1)"',
+        'href="da&#9;ta:text/html,x"',
+        r'style="background:url(java\9 script:alert(1))"',
+    ],
+)
+def test_script_urls_split_by_tabs_or_controls_are_refused(attribute: str) -> None:
+    # A URL parser drops tabs and newlines anywhere and controls at the edges
+    # before it reads the scheme, so these are still active links.
+    html = f"<html><body><a {attribute}>x</a></body></html>"
+
+    assert verify_quoted_html(f"<a {attribute}>x</a>", ()) is not None
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+    assert quotable is not None and quotable.rejection_reason is None
+    wrapper = BeautifulSoup(quotable.html_fragment, "html.parser").find("a")
+    assert wrapper is not None
+    assert not wrapper.attrs
+
+
 def test_conditional_comment_carrying_active_content_is_removed() -> None:
     html = (
         "<html><body><p>Hi</p>"

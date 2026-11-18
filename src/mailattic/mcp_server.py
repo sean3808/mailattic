@@ -225,11 +225,13 @@ _MAIL_DRAFT_REPLY_DESCRIPTION = (
     "review before calling mail_send. Quote fields: quote_source='original' "
     "means the HTML part quotes the customer's original as sent, with its "
     "images and tables (quote_note and quote_notice are null); body_text is the "
-    "plain-text part and does not show that HTML quote, so tell the user the "
-    "customer will see their original as sent. quote_source='stored_text' means "
-    "the quote is the stored text instead: give quote_note as the reason and "
-    "quote_notice in full as its own line (you may translate it into the user's "
-    "language, but do not shorten or reinterpret it)."
+    "plain-text part and does not show that HTML quote, so say that the HTML "
+    "part quotes the customer's original as they sent it. "
+    "quote_source='stored_text' means the quote is the stored text instead: give "
+    "quote_note as the reason and quote_notice in full as its own line (you may "
+    "translate it into the user's language, but do not shorten or reinterpret "
+    "it). When several drafts are reviewed together, give each stored_text "
+    "draft's quote_note and quote_notice on their own lines under its draft_id."
 )
 _MAIL_DRAFT_NEW_DESCRIPTION = (
     "Generate a new-thread draft email and write it to the MCP-dedicated "

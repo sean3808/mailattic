@@ -153,8 +153,12 @@ _ACTIVE_TAGS = (
     "link",
 )
 _LINK_ATTRIBUTES = ("href", "xlink:href", "action", "formaction")
-_SCRIPT_URL = re.compile(r"^\s*(?:javascript|vbscript)\s*:", re.IGNORECASE)
-_DATA_URL = re.compile(r"^\s*data\s*:", re.IGNORECASE)
+_SCRIPT_URL = re.compile(r"^(?:javascript|vbscript)\s*:", re.IGNORECASE)
+_DATA_URL = re.compile(r"^data\s*:", re.IGNORECASE)
+# What a URL parser drops before reading the scheme (WHATWG URL: leading and
+# trailing C0 controls and spaces, and every tab or newline anywhere).
+_URL_EDGE = re.compile(r"^[\x00-\x20]+|[\x00-\x20]+$")
+_URL_TAB_NEWLINE = re.compile(r"[\t\n\r]")
 _ACTIVE_STYLE = re.compile(
     r"expression\s*\(|(?:javascript|vbscript)\s*:|@import\b", re.IGNORECASE
 )
@@ -191,8 +195,18 @@ def _css_normalised(text: str) -> str:
     return _CSS_CHAR_ESCAPE.sub(lambda match: match.group(1), text)
 
 
+def _url_normalised(text: str) -> str:
+    """A URL as a browser reads its scheme: ``java&#9;script:`` is ``javascript:``."""
+    return _URL_TAB_NEWLINE.sub("", _URL_EDGE.sub("", text))
+
+
 def _css_is_active(text: str) -> bool:
-    return bool(_ACTIVE_STYLE.search(_css_normalised(text)))
+    # url() values go through the URL parser too, so tabs and newlines inside
+    # a scheme (`java\9 script:`) vanish before the browser reads it.
+    css = _css_normalised(text)
+    return bool(
+        _ACTIVE_STYLE.search(css) or _ACTIVE_STYLE.search(_URL_TAB_NEWLINE.sub("", css))
+    )
 
 
 def _css_cids(text: str) -> set[str]:
@@ -566,9 +580,10 @@ def _is_active_attribute(name: str, value: object) -> bool:
     if name.startswith("on"):
         return True
     for text in _attr_strings(value):
-        if _SCRIPT_URL.match(text):
+        url = _url_normalised(text)
+        if _SCRIPT_URL.match(url):
             return True
-        if name in _LINK_ATTRIBUTES and _DATA_URL.match(text):
+        if name in _LINK_ATTRIBUTES and _DATA_URL.match(url):
             return True
         if name == "style" and _css_is_active(text):
             return True
