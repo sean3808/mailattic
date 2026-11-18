@@ -28,6 +28,7 @@ from .export_files import (
     truncate_export_filename,
 )
 from .mutf7 import encode_mutf7
+from .outbound import SENT_FOLDER_DISPLAY_NAME
 from .outlook_pst import (
     PR_INTERNET_MESSAGE_ID,
     PR_SENDER_SMTP_ADDRESS,
@@ -74,6 +75,22 @@ class OriginalExportResult:
         }
 
 
+def _is_outbound_message(message: Mapping[str, object]) -> bool:
+    """Return True when the stored record originated from bes outbound send."""
+    pst_source = str(message.get("pst_source") or "").strip().casefold()
+    input_mode = str(message.get("source_input_mode") or "").strip().casefold()
+    return input_mode == "outbound" or pst_source.startswith("outbound-")
+
+
+def _imap_first_folder(message: Mapping[str, object]) -> str:
+    """Folder to search first: the Sent folder for bes-sent mail (the post-send
+    APPEND target; its stored folder_path is a literal label, not a server
+    folder), otherwise the recorded folder."""
+    if _is_outbound_message(message):
+        return SENT_FOLDER_DISPLAY_NAME
+    return str(message.get("folder_path") or "INBOX").strip()
+
+
 def classify_message_source(
     message: Mapping[str, object],
 ) -> Literal["pst", "imap", "unsupported"]:
@@ -81,10 +98,10 @@ def classify_message_source(
     pst_source = str(message.get("pst_source") or "").strip()
     input_mode = str(message.get("source_input_mode") or "").strip().casefold()
 
-    if input_mode in ("outbound", "archive") or pst_source.casefold().startswith(
-        ("outbound-", "archive:")
-    ):
+    if input_mode == "archive" or pst_source.casefold().startswith("archive:"):
         return "unsupported"
+    if _is_outbound_message(message):
+        return "imap"
     if pst_source.casefold().endswith(".pst") or input_mode in ("directory", "file"):
         return "pst"
     if (
@@ -1276,7 +1293,7 @@ def _find_imap_rfc822(
     message: Mapping[str, object],
 ) -> tuple[bytes | None, str | None]:
     """Retrieve verified RFC822 bytes from IMAP server."""
-    folder_path = str(message.get("folder_path") or "INBOX").strip()
+    folder_path = _imap_first_folder(message)
     try:
         wire_name = encode_mutf7(folder_path)
         client.select_folder(wire_name)
@@ -1286,7 +1303,8 @@ def _find_imap_rfc822(
     unreadable_count = 0
     db_msg_id = message.get("message_id")
 
-    # 1. Try UID from logical_locator
+    # 1. Try UID from logical_locator (an outbound record's locator is
+    # `outbound:<uuid>`, which never matches, so this step is a no-op for it)
     locator = str(message.get("logical_locator") or "")
     match = re.search(r"(?:^|[\W_])(?:uid-|U=)(\d+)", locator, re.IGNORECASE)
     if match:
@@ -1443,17 +1461,6 @@ def export_original_message(
         src_label = str(
             message.get("pst_source") or message.get("source_input_mode") or "unknown"
         )
-        input_mode = str(message.get("source_input_mode") or "").strip().casefold()
-        # #53 ruling 2: mail sent through bes reports not_found for now (its
-        # server location is not recorded; tracked separately). Every other
-        # unsupported source has no retrievable original, which is not the
-        # same as "really not there" (ruling 6), so it is failed with the reason.
-        if input_mode == "outbound" or src_label.casefold().startswith("outbound-"):
-            return replace(
-                _base_result(message, "msg", "pst"),
-                status="not_found",
-                detail=f"Source {src_label!r} does not support original export.",
-            )
         return replace(
             _base_result(message, "msg", "pst"),
             detail=(

@@ -283,12 +283,12 @@ class SentAtEpochAndOffsetCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "test.db"
             _seed_raw_messages(db_path)
-            # Mark id=1 as outbound so export-original returns not_found without
-            # needing Outlook COM, while still emitting OriginalExportResult JSON.
+            # Mark id=1 as archive so export-original returns failed without
+            # needing Outlook COM or IMAP, while still emitting JSON.
             conn = connect_database(db_path)
             try:
                 conn.execute(
-                    "UPDATE messages SET source_input_mode = 'outbound' WHERE id = 1"
+                    "UPDATE messages SET source_input_mode = 'archive' WHERE id = 1"
                 )
                 conn.commit()
             finally:
@@ -308,7 +308,7 @@ class SentAtEpochAndOffsetCliTests(unittest.TestCase):
                     ]
                 )
             payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["status"], "not_found")
+            self.assertEqual(payload["status"], "failed")
             self.assertEqual(payload["sent_at"], "2025-03-26T06:42:33+00:00")
             self.assertEqual(payload["sent_at_epoch"], 1742971353)
 
