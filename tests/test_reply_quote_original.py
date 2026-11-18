@@ -556,6 +556,29 @@ def test_escaped_cid_in_css_must_resolve(tmp_path: Path) -> None:
     assert result.quote_note is not None and "bg@example.com" in result.quote_note
 
 
+def test_every_safe_body_attribute_travels_so_its_styles_still_apply() -> None:
+    html = (
+        "<html><head><style>#customer{font-weight:bold}</style></head>"
+        '<body id="customer" dir="rtl" title="t" data-x="1" onload="steal()"'
+        ' topmargin="0"><p>Hello</p></body></html>'
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None and quotable.rejection_reason is None
+    soup = BeautifulSoup(quotable.html_fragment, "html.parser")
+    wrapper = soup.find("div")
+    assert wrapper is not None
+    assert wrapper.attrs == {
+        "id": "customer",
+        "dir": "rtl",
+        "title": "t",
+        "data-x": "1",
+        "topmargin": "0",
+    }
+    assert "#customer{font-weight:bold}" in quotable.html_fragment
+
+
 def test_body_presentation_travels_with_the_quote() -> None:
     html = (
         '<html><body class="blue" lang="ZH-TW" bgcolor="#FFEECC" text="navy"'

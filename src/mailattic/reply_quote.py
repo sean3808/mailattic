@@ -27,9 +27,9 @@ exists it is still attached, otherwise the link ships as written); every other
 ``cid:`` (images, VML, ``background``, ``style``, ``<style>``) must resolve.
 CSS (``style`` attributes and ``<style>`` text) is checked as a renderer reads
 it: comments removed and escapes decoded, so ``@\\69mport`` counts as
-``@import``. The ``<body>`` becomes a ``<div>`` that keeps its presentation
-(``style``, ``class``, ``lang``, ``dir``, ``bgcolor`` / ``text`` /
-``background`` as CSS, ``link`` / ``vlink`` / ``alink`` as scoped rules).
+``@import``. The ``<body>`` becomes a ``<div>`` that keeps every attribute the
+sanitiser left on it (``bgcolor`` / ``text`` / ``background`` as CSS,
+``link`` / ``vlink`` / ``alink`` as scoped rules); see :func:`_body_wrapper`.
 After sanitising and attaching ``cid:`` parts, :func:`verify_quoted_html`
 re-parses the final HTML string written into the draft, rebuilds the render
 view, and fails closed to stored text if any active content, unattached
@@ -171,7 +171,10 @@ _CSS_CHAR_ESCAPE = re.compile(r"\\(.)", re.DOTALL)
 _BODY_COLOR = re.compile(r"^#?[0-9A-Za-z]{1,32}$")
 _BODY_COLOR_STYLE = {"bgcolor": "background-color", "text": "color"}
 _BODY_LINK_RULE = {"link": "a:link", "vlink": "a:visited", "alink": "a:active"}
-_BODY_KEPT_ATTRIBUTES = ("lang", "dir")
+# Handled by _body_wrapper itself (class/style merged, the rest translated).
+_BODY_TRANSLATED_ATTRIBUTES = frozenset(
+    {"class", "style", "background", *_BODY_COLOR_STYLE, *_BODY_LINK_RULE}
+)
 _QUOTE_BODY_CLASS = "mailattic-quoted-body"
 # URL characters left as-is inside url("..."); quotes, parentheses, backslash
 # and whitespace are percent-encoded so the value cannot end the CSS string.
@@ -478,11 +481,15 @@ def _sanitised_fragment(source_html: str) -> tuple[str, set[str], set[str]]:
 def _body_wrapper(body: Tag) -> tuple[str, str]:
     """The ``<body>``'s presentation, carried onto the quote's ``<div>`` (#136).
 
-    ``style``, ``class``, ``lang`` and ``dir`` are copied; ``bgcolor`` / ``text``
-    / ``background`` become the equivalent CSS; ``link`` / ``vlink`` /
-    ``alink`` become link-colour rules scoped to the quote. Values that are not
-    plain colours are dropped rather than written into CSS. Other body
-    attributes (margins) are not carried.
+    Every attribute the sanitiser left on ``<body>`` (``id``, ``class``,
+    ``lang``, ``style``, ...) is copied as written, so the original's styles
+    that target it still apply. The presentational body-only attributes have
+    no meaning on a ``<div>`` and are translated instead: ``bgcolor`` /
+    ``text`` / ``background`` become the equivalent CSS, ``link`` / ``vlink``
+    / ``alink`` become link-colour rules scoped to the quote; values that are
+    not plain colours are dropped rather than written into CSS. A stylesheet
+    rule that targets the ``body`` element by name no longer matches the quote
+    (it is a ``<div>`` inside the reply's own body); that is accepted.
     """
 
     def text_of(name: str) -> str:
@@ -512,10 +519,11 @@ def _body_wrapper(body: Tag) -> tuple[str, str]:
     attrs: list[str] = []
     if classes:
         attrs.append(f' class="{html.escape(" ".join(classes), quote=True)}"')
-    for name in _BODY_KEPT_ATTRIBUTES:
-        value = body.get(name)
-        if isinstance(value, str):
-            attrs.append(f' {name}="{html.escape(value, quote=True)}"')
+    for name, value in body.attrs.items():
+        if name.casefold() in _BODY_TRANSLATED_ATTRIBUTES:
+            continue
+        text = " ".join(_attr_strings(value))
+        attrs.append(f' {name}="{html.escape(text, quote=True)}"')
     if declarations:
         style = ";".join(declarations)
         attrs.append(f' style="{html.escape(style, quote=True)}"')
