@@ -519,6 +519,99 @@ def test_downlevel_revealed_conditional_is_sanitised_and_scanned() -> None:
     assert "<p>Hi</p>" in quotable.html_fragment
 
 
+def test_unresolved_cid_in_link_href_still_quotes_original(tmp_path: Path) -> None:
+    html = (
+        '<html><body><p><a href="cid:missing@example.com">link</a>'
+        '<map><area href="cid:area@example.com" alt="a"></map></p></body></html>'
+    )
+    eml = _eml_with_cid(html, None)
+
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    assert result.quote_source == "original"
+    assert result.quote_notice is None
+    draft_html = _draft(result).get_body(preferencelist=("html",)).get_content()
+    assert 'href="cid:missing@example.com"' in draft_html
+    assert 'href="cid:area@example.com"' in draft_html
+
+
+def test_matching_cid_in_link_href_still_attaches_part(tmp_path: Path) -> None:
+    html = '<html><body><p><a href="cid:doc@example.com">open</a></p></body></html>'
+    eml = _eml_with_cid(html, "doc@example.com")
+
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    assert result.quote_source == "original"
+    assert result.quote_notice is None
+    draft = _draft(result)
+    assert {str(p["Content-ID"]) for p in draft.walk() if p.get("Content-ID")} == {
+        "<doc@example.com>"
+    }
+
+
+def test_unresolved_cid_in_non_href_attribute_still_falls_back(tmp_path: Path) -> None:
+    html = '<html><body><p><a o:href="cid:missing@example.com">x</a></p></body></html>'
+    eml = _eml_with_cid(html, None)
+
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    assert result.quote_source == "stored_text"
+    assert result.quote_note is not None and "missing@example.com" in result.quote_note
+
+
+@pytest.mark.parametrize(
+    ("opener", "closer"),
+    [
+        ("<!--[if !mso]><!-->", "<!--<![endif]-->"),
+        ("<!--[if !mso]><!-- -->", "<!--<![endif]-->"),
+        ("<!--[if gte mso 9]><!-->", "<!--<![endif]-->"),
+    ],
+)
+def test_hybrid_conditional_comments_quote_original_byte_identical(
+    tmp_path: Path, opener: str, closer: str
+) -> None:
+    html = f"<html><body>{opener}<p>Non-Outlook</p>{closer}</body></html>"
+    eml = _eml_with_cid(html, None)
+
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    assert result.quote_source == "original"
+    assert result.quote_notice is None
+    draft_html = _draft(result).get_body(preferencelist=("html",)).get_content()
+    assert f"{opener}<p>Non-Outlook</p>{closer}" in draft_html
+
+
+def test_active_content_between_hybrid_markers_is_removed() -> None:
+    html = (
+        "<html><body>"
+        "<!--[if !mso]><!--><p onclick='x()'>Hi</p>"
+        "<script>alert(1)</script><!--<![endif]-->"
+        "</body></html>"
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None
+    assert quotable.rejection_reason is None
+    assert "onclick" not in quotable.html_fragment
+    assert "<script" not in quotable.html_fragment
+    assert "<!--[if !mso]><!--><p>Hi</p><!--<![endif]-->" in quotable.html_fragment
+
+
+@pytest.mark.parametrize(
+    "bad_html",
+    [
+        "<!--[if !mso]><!--><p>unclosed</p>",
+        "<!--[if !mso]><!-- --><p>unclosed</p>",
+        "<p>unmatched</p><!--<![endif]-->",
+        "<![if !mso]><!--[if !mso]><!--><p>nested</p><!--<![endif]--><![endif]>",
+        "<!--[if !mso]><!--><![if !mso]><p>nested</p><![endif]><!--<![endif]-->",
+    ],
+)
+def test_gate_rejects_malformed_or_nested_hybrid_conditionals(bad_html: str) -> None:
+    assert verify_quoted_html(bad_html, ()) is not None
+
+
 def test_cli_reports_the_quote_source(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

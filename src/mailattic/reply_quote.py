@@ -13,18 +13,23 @@ share one explicit **render view** (:func:`_build_render_view`):
 - The inner HTML of every downlevel-hidden conditional comment
   (``<!--[if ...]>...<![endif]-->``, whatever the condition), parsed recursively
   as a sub-document.
-- Downlevel-revealed conditional sections (``<![if ...]>...<![endif]>``), whose
-  body is already live markup.
+- Downlevel-revealed conditional sections (``<![if ...]>...<![endif]>``) and
+  hybrid conditional comments (``<!--[if ...]><!-->...<!--<![endif]-->`` and the
+  ``<!-- -->`` variant), whose body is already live markup and whose markers
+  stay byte-identical.
 - Ordinary HTML comments (not starting with ``[if``) are outside the render
   view: they are neither sanitised nor scanned for ``cid:``.
 
 Conditional comments whose inner HTML carries no active content are kept
-byte-for-byte so Word VML details are not rewritten. After sanitising and
-attaching ``cid:`` image parts, :func:`verify_quoted_html` re-parses the final
-HTML string written into the draft, rebuilds the render view, and fails closed
-to stored text if any active content, unattached ``cid:``, or unclassifiable
-structure (unclosed/nested conditional comments, unknown ``<!`` declarations)
-remains.
+byte-for-byte so Word VML details are not rewritten. ``cid:`` references in
+``<a href>`` / ``<area href>`` are not required to resolve (if a matching part
+exists it is still attached, otherwise the link ships as written); every other
+``cid:`` (images, VML, ``background``, ``style``, ``<style>``) must resolve.
+After sanitising and attaching ``cid:`` parts, :func:`verify_quoted_html`
+re-parses the final HTML string written into the draft, rebuilds the render
+view, and fails closed to stored text if any active content, unattached
+required ``cid:``, or unclassifiable structure (unclosed/nested conditional
+comments, unknown ``<!`` declarations) remains.
 """
 
 from __future__ import annotations
@@ -155,6 +160,8 @@ _HIDDEN_COND_RE = re.compile(
 )
 _REVEALED_OPEN_RE = re.compile(r"^\s*\[if\b[^\]]*\]\s*$", re.IGNORECASE)
 _REVEALED_CLOSE_RE = re.compile(r"^\s*\[endif\]\s*$", re.IGNORECASE)
+_HYBRID_OPEN_RE = re.compile(r"^\s*\[if\b[^\]]*\]>\s*<!(?:--\s*)?$", re.IGNORECASE)
+_HYBRID_CLOSE_RE = re.compile(r"^\s*<!\[endif\]\s*$", re.IGNORECASE)
 _COND_MARKER_RE = re.compile(r"^\s*\[if\b|<!\[endif\]|\[endif\]", re.IGNORECASE)
 _NESTED_COND_RE = re.compile(r"\[if\b|<!\[endif\]|\[endif\]", re.IGNORECASE)
 _REVEALED_DECL_PREFIX_RE = re.compile(r"<!\[(?:if\b|endif\])", re.IGNORECASE)
@@ -193,6 +200,8 @@ def _is_conditional_comment_node(node: Comment) -> bool:
         _HIDDEN_COND_RE.match(text)
         or _REVEALED_OPEN_RE.match(text)
         or _REVEALED_CLOSE_RE.match(text)
+        or _HYBRID_OPEN_RE.match(text)
+        or _HYBRID_CLOSE_RE.match(text)
     )
 
 
@@ -242,12 +251,12 @@ def _build_render_view(html_text: str) -> _RenderView:
                 )
             )
             continue
-        if _REVEALED_OPEN_RE.match(text):
+        if _REVEALED_OPEN_RE.match(text) or _HYBRID_OPEN_RE.match(text):
             revealed_depth += 1
             if revealed_depth > 1:
                 raise _UnclassifiableHtml("nested conditional comment")
             continue
-        if _REVEALED_CLOSE_RE.match(text):
+        if _REVEALED_CLOSE_RE.match(text) or _HYBRID_CLOSE_RE.match(text):
             revealed_depth -= 1
             if revealed_depth < 0:
                 raise _UnclassifiableHtml("unmatched conditional comment endif")
@@ -278,14 +287,14 @@ def quotable_original_from_rfc822(rfc822: bytes) -> QuotableOriginal | None:
     source_html = _without_lone_surrogates(
         _detect_and_decode(raw, html_part.get_content_charset())
     )
-    fragment, referenced = _sanitised_fragment(source_html)
-    inline_parts = _referenced_inline_parts(message, referenced)
+    fragment, required_cids, optional_cids = _sanitised_fragment(source_html)
+    inline_parts = _referenced_inline_parts(message, required_cids | optional_cids)
     attached_images = {
         part.content_id.casefold() for part in inline_parts if part.maintype == "image"
     }
     rejection = verify_quoted_html(fragment, attached_images)
     unresolved = tuple(
-        sorted(cid for cid in referenced if cid.casefold() not in attached_images)
+        sorted(cid for cid in required_cids if cid.casefold() not in attached_images)
     )
     return QuotableOriginal(
         html_fragment=fragment,
@@ -295,64 +304,81 @@ def quotable_original_from_rfc822(rfc822: bytes) -> QuotableOriginal | None:
     )
 
 
+def _is_link_href(tag_name: str, attr_name: str) -> bool:
+    return attr_name == "href" and tag_name in ("a", "area")
+
+
 def _inspect_soup(
     soup: BeautifulSoup, *, remove_active: bool
-) -> tuple[bool, set[str], str | None]:
+) -> tuple[bool, set[str], set[str], str | None]:
     """Scan ``soup`` for active content and ``cid:`` references.
 
-    When ``remove_active`` is true, active tags/attributes/styles are stripped
-    in place; otherwise the first active-content violation is returned.
+    Returns ``(changed, required_cids, optional_cids, violation)``. ``cid:``
+    values on ``<a href>`` / ``<area href>`` are optional (attached when present,
+    never required to resolve); every other ``cid:`` is required. When
+    ``remove_active`` is true, active tags/attributes/styles are stripped in
+    place; otherwise the first active-content violation is returned.
     """
     changed = False
     if remove_active:
         for tag in soup.find_all(_ACTIVE_TAGS):
             tag.decompose()
             changed = True
-    referenced: set[str] = set()
+    required_cids: set[str] = set()
+    optional_cids: set[str] = set()
     for tag in soup.find_all(True):
-        if not remove_active and tag.name.casefold() in _ACTIVE_TAGS:
+        tag_name = tag.name.casefold()
+        if not remove_active and tag_name in _ACTIVE_TAGS:
             return (
                 changed,
-                referenced,
+                required_cids,
+                optional_cids,
                 f"original HTML retained active tag <{tag.name}>",
             )
         for name in list(tag.attrs):
+            attr_name = name.casefold()
             value = tag.attrs[name]
-            if _is_active_attribute(name.casefold(), value):
+            if _is_active_attribute(attr_name, value):
                 if not remove_active:
                     return (
                         changed,
-                        referenced,
+                        required_cids,
+                        optional_cids,
                         f"original HTML retained active attribute {name}",
                     )
                 del tag.attrs[name]
                 changed = True
             else:
-                referenced.update(_extract_cids_from_attr(value))
-        if tag.name == "style":
+                cids = _extract_cids_from_attr(value)
+                if _is_link_href(tag_name, attr_name):
+                    optional_cids.update(cids)
+                else:
+                    required_cids.update(cids)
+        if tag_name == "style":
             style_text = tag.get_text()
             if _ACTIVE_STYLE.search(style_text):
                 if not remove_active:
                     return (
                         changed,
-                        referenced,
+                        required_cids,
+                        optional_cids,
                         "original HTML retained active style rule",
                     )
                 tag.decompose()
                 changed = True
             elif style_text:
-                referenced.update(_CID_REFERENCE.findall(style_text))
-    return changed, referenced, None
+                required_cids.update(_CID_REFERENCE.findall(style_text))
+    return changed, required_cids, optional_cids, None
 
 
-def _sanitise_soup(soup: BeautifulSoup) -> tuple[bool, set[str]]:
+def _sanitise_soup(soup: BeautifulSoup) -> tuple[bool, set[str], set[str]]:
     """Remove active content from ``soup`` and collect ``cid:`` references."""
-    changed, referenced, _ = _inspect_soup(soup, remove_active=True)
-    return changed, referenced
+    changed, required_cids, optional_cids, _ = _inspect_soup(soup, remove_active=True)
+    return changed, required_cids, optional_cids
 
 
-def _sanitised_fragment(source_html: str) -> tuple[str, set[str]]:
-    """The quotable HTML and the ``cid:`` ids it references.
+def _sanitised_fragment(source_html: str) -> tuple[str, set[str], set[str]]:
+    """The quotable HTML and the required/optional ``cid:`` ids it references.
 
     Uses :func:`_build_render_view` so sanitising and ``cid:`` collection share
     the exact same view of live markup and conditional comments.
@@ -360,12 +386,13 @@ def _sanitised_fragment(source_html: str) -> tuple[str, set[str]]:
     try:
         view = _build_render_view(source_html)
     except _UnclassifiableHtml:
-        return source_html, set()
+        return source_html, set(), set()
 
-    _, referenced = _sanitise_soup(view.root)
+    _, required_cids, optional_cids = _sanitise_soup(view.root)
     for subdoc in view.conditional_subdocs:
-        sub_changed, sub_cids = _sanitise_soup(subdoc.soup)
-        referenced.update(sub_cids)
+        sub_changed, sub_required, sub_optional = _sanitise_soup(subdoc.soup)
+        required_cids.update(sub_required)
+        optional_cids.update(sub_optional)
         if sub_changed:
             subdoc.comment.replace_with(
                 Comment(f"{subdoc.prefix}{subdoc.soup}{subdoc.suffix}")
@@ -373,7 +400,7 @@ def _sanitised_fragment(source_html: str) -> tuple[str, set[str]]:
 
     body = view.root.body
     if body is None:
-        return str(view.root), referenced
+        return str(view.root), required_cids, optional_cids
     # Styles and Outlook conditional comments usually live in <head>; they
     # belong to the quote, so they move with the body content, in order.
     styles = "".join(
@@ -392,7 +419,11 @@ def _sanitised_fragment(source_html: str) -> tuple[str, set[str]]:
         if isinstance(body_style, str)
         else ""
     )
-    return f"{styles}<div{style_attr}>{body.decode_contents()}</div>", referenced
+    return (
+        f"{styles}<div{style_attr}>{body.decode_contents()}</div>",
+        required_cids,
+        optional_cids,
+    )
 
 
 def verify_quoted_html(html_text: str, attached_cids: Iterable[str]) -> str | None:
@@ -400,8 +431,8 @@ def verify_quoted_html(html_text: str, attached_cids: Iterable[str]) -> str | No
 
     Re-parses ``html_text``, builds the render view, and returns ``None`` only
     when (a) no active content appears anywhere in the render view and (b)
-    every ``cid:`` in the render view maps to an attached image part. Otherwise
-    returns a user-facing rejection reason.
+    every required ``cid:`` in the render view maps to an attached image part.
+    Otherwise returns a user-facing rejection reason.
     """
     try:
         view = _build_render_view(html_text)
@@ -410,10 +441,10 @@ def verify_quoted_html(html_text: str, attached_cids: Iterable[str]) -> str | No
 
     cids_in_view: set[str] = set()
     for doc in view.documents():
-        _, doc_cids, violation = _inspect_soup(doc, remove_active=False)
+        _, doc_required_cids, _, violation = _inspect_soup(doc, remove_active=False)
         if violation is not None:
             return violation
-        cids_in_view.update(doc_cids)
+        cids_in_view.update(doc_required_cids)
 
     attached_folded = {cid.casefold() for cid in attached_cids}
     missing = sorted(
