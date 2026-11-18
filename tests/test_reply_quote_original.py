@@ -28,7 +28,6 @@ from mailattic.outbound_commands import _handle_draft_reply
 from mailattic.reply_quote import (
     OriginalUnavailable,
     quotable_original_from_rfc822,
-    quote_notice_for_category,
     verify_quoted_html,
 )
 from tests.test_original_export import FakeImapClient, FakeImapConnection
@@ -410,29 +409,30 @@ def test_mislabelled_charset_is_decoded_like_ingest() -> None:
 
 
 @pytest.mark.parametrize(
-    ("fetch", "note", "expected_category"),
+    ("fetch", "note", "expected_notice_phrase"),
     [
-        (None, "original fetch not configured", "settings"),
+        (None, "original fetch not configured", "fix the send settings"),
         (
             _fetch_raising("Original message not found on IMAP server."),
             "Original message not found on IMAP server.",
-            "temporary",
+            "regenerate the draft later, or reply from Outlook",
         ),
         (
             _fetch_returning(_original_eml(with_html=False)),
             "original has no HTML body",
-            "no_html",
+            "the original was plain text",
         ),
     ],
 )
 def test_unavailable_original_falls_back_to_stored_text_and_says_why(
-    tmp_path: Path, fetch, note: str, expected_category: str
+    tmp_path: Path, fetch, note: str, expected_notice_phrase: str
 ) -> None:
     result = _reply(tmp_path, fetch)
 
     assert result.quote_source == "stored_text"
     assert result.quote_note == note
-    assert result.quote_notice == quote_notice_for_category(expected_category)
+    assert result.quote_notice is not None
+    assert expected_notice_phrase in result.quote_notice
     assert "original body" in str(_quoted_soup(_draft(result)))
 
 
@@ -504,7 +504,8 @@ def test_gate_rejects_unclosed_nested_and_unknown_declarations(
 
     assert result.quote_source == "stored_text"
     assert result.quote_note is not None and "unclosed" in result.quote_note
-    assert result.quote_notice == quote_notice_for_category("unquotable")
+    assert result.quote_notice is not None
+    assert "could not be quoted safely" in result.quote_notice
 
 
 def test_downlevel_revealed_conditional_is_sanitised_and_scanned() -> None:
@@ -542,7 +543,8 @@ def test_cli_reports_the_quote_source(
 
     out = capsys.readouterr().out
     assert "Quote: stored text (" in out
-    assert f"Quote notice: {quote_notice_for_category('permanent')}" in out
+    assert "Quote notice:" in out
+    assert "regenerating will not change this" in out
 
 
 # --- the IMAP fetcher --------------------------------------------------------
@@ -644,4 +646,5 @@ def test_mcp_draft_reply_returns_quote_notice(
     data = res.structured_content
     assert data is not None
     assert data["quote_source"] == "stored_text"
-    assert data["quote_notice"] == quote_notice_for_category("permanent")
+    assert data["quote_notice"] is not None
+    assert "regenerating will not change this" in data["quote_notice"]

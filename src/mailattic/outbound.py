@@ -1056,12 +1056,19 @@ OriginalFetcher = Callable[[Mapping[str, object]], bytes]
 """Return the original's RFC822 bytes, or raise :class:`OriginalUnavailable`."""
 
 
+@dataclass(frozen=True, slots=True)
+class _QuoteResolution:
+    quotable: QuotableOriginal | None
+    quote_note: str | None = None
+    quote_notice: str | None = None
+
+
 def _resolve_quotable_original(
     original: Mapping[str, object], fetch_original: OriginalFetcher | None
-) -> tuple[QuotableOriginal | None, str | None, str | None]:
+) -> _QuoteResolution:
     """The original to quote as HTML, or ``None`` with reason and notice."""
     if fetch_original is None:
-        return (
+        return _QuoteResolution(
             None,
             "original fetch not configured",
             quote_notice_for_category("settings"),
@@ -1069,29 +1076,29 @@ def _resolve_quotable_original(
     try:
         rfc822 = fetch_original(original)
     except OriginalUnavailable as exc:
-        return None, str(exc), quote_notice_for_category(exc.category)
+        return _QuoteResolution(None, str(exc), quote_notice_for_category(exc.category))
     quotable = quotable_original_from_rfc822(rfc822)
     if quotable is None:
-        return (
+        return _QuoteResolution(
             None,
             "original has no HTML body",
             quote_notice_for_category("no_html"),
         )
     if quotable.rejection_reason is not None:
-        return (
+        return _QuoteResolution(
             None,
             quotable.rejection_reason,
             quote_notice_for_category("unquotable"),
         )
     if quotable.unresolved_cids:
         # A broken image in the customer's own message is the look #136 removes.
-        return (
+        return _QuoteResolution(
             None,
             "original references inline images missing from the message: "
             + ", ".join(quotable.unresolved_cids),
             quote_notice_for_category("unquotable"),
         )
-    return quotable, None, None
+    return _QuoteResolution(quotable)
 
 
 def _add_inline_parts(msg: EmailMessage, quotable: QuotableOriginal | None) -> None:
@@ -1336,9 +1343,10 @@ def assemble_draft_reply(
     msg["References"] = thread_headers["references"]
     msg["Subject"] = thread_headers["subject"] if subject is None else subject
     msg["Date"] = formatdate(localtime=True)
-    quotable, quote_note, quote_notice = _resolve_quotable_original(
-        original, fetch_original
-    )
+    resolution = _resolve_quotable_original(original, fetch_original)
+    quotable = resolution.quotable
+    quote_note = resolution.quote_note
+    quote_notice = resolution.quote_notice
     plain_body, html_body = build_quoted_reply_bodies(
         original, body_text, font_style=font_style, quotable=quotable
     )

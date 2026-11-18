@@ -36,12 +36,15 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from email.parser import BytesParser
 from html.parser import HTMLParser
+from typing import Literal
 
 from bs4 import BeautifulSoup, CData, Comment, Declaration, ProcessingInstruction
 
 from .parser import _MAIL_POLICY, _detect_and_decode, _without_lone_surrogates
 
-QUOTE_NOTICE_BY_CATEGORY: dict[str, str] = {
+QuoteCategory = Literal["no_html", "temporary", "settings", "permanent", "unquotable"]
+
+QUOTE_NOTICE_BY_CATEGORY: dict[QuoteCategory, str] = {
     "no_html": (
         "the original was plain text, so the quote reads the same as what they sent"
     ),
@@ -66,17 +69,17 @@ QUOTE_NOTICE_BY_CATEGORY: dict[str, str] = {
 }
 
 
-def quote_notice_for_category(category: str) -> str:
+def quote_notice_for_category(category: QuoteCategory) -> str:
     """Return the user-facing fallback notice sentence for a reason category."""
-    return QUOTE_NOTICE_BY_CATEGORY.get(category, QUOTE_NOTICE_BY_CATEGORY["temporary"])
+    return QUOTE_NOTICE_BY_CATEGORY[category]
 
 
 class OriginalUnavailable(Exception):
     """The original could not be fetched; the message is the user-facing reason."""
 
-    def __init__(self, reason: str, *, category: str = "temporary") -> None:
+    def __init__(self, reason: str, *, category: QuoteCategory = "temporary") -> None:
         super().__init__(reason)
-        self.category = category
+        self.category: QuoteCategory = category
 
 
 class _UnclassifiableHtml(Exception):
@@ -193,10 +196,14 @@ def _is_conditional_comment_node(node: Comment) -> bool:
     )
 
 
+def _reject_unsupported_node(node: object) -> None:
+    if isinstance(node, (CData, Declaration, ProcessingInstruction)):
+        raise _UnclassifiableHtml(f"unsupported {type(node).__name__.lower()}")
+
+
 def _check_subdoc_nodes(soup: BeautifulSoup) -> None:
     for node in soup.descendants:
-        if isinstance(node, (CData, Declaration, ProcessingInstruction)):
-            raise _UnclassifiableHtml(f"unsupported {type(node).__name__.lower()}")
+        _reject_unsupported_node(node)
         if isinstance(node, Comment) and _COND_MARKER_RE.search(str(node)):
             raise _UnclassifiableHtml("nested conditional comment")
 
@@ -213,8 +220,7 @@ def _build_render_view(html_text: str) -> _RenderView:
     subdocs: list[_ConditionalSubdoc] = []
     revealed_depth = 0
     for node in soup.descendants:
-        if isinstance(node, (CData, Declaration, ProcessingInstruction)):
-            raise _UnclassifiableHtml(f"unsupported {type(node).__name__.lower()}")
+        _reject_unsupported_node(node)
         if not isinstance(node, Comment):
             continue
         text = str(node)
@@ -289,17 +295,36 @@ def quotable_original_from_rfc822(rfc822: bytes) -> QuotableOriginal | None:
     )
 
 
-def _sanitise_soup(soup: BeautifulSoup) -> tuple[bool, set[str]]:
-    """Remove active content from ``soup`` and collect ``cid:`` references."""
+def _inspect_soup(
+    soup: BeautifulSoup, *, remove_active: bool
+) -> tuple[bool, set[str], str | None]:
+    """Scan ``soup`` for active content and ``cid:`` references.
+
+    When ``remove_active`` is true, active tags/attributes/styles are stripped
+    in place; otherwise the first active-content violation is returned.
+    """
     changed = False
-    for tag in soup.find_all(_ACTIVE_TAGS):
-        tag.decompose()
-        changed = True
+    if remove_active:
+        for tag in soup.find_all(_ACTIVE_TAGS):
+            tag.decompose()
+            changed = True
     referenced: set[str] = set()
     for tag in soup.find_all(True):
+        if not remove_active and tag.name.casefold() in _ACTIVE_TAGS:
+            return (
+                changed,
+                referenced,
+                f"original HTML retained active tag <{tag.name}>",
+            )
         for name in list(tag.attrs):
             value = tag.attrs[name]
             if _is_active_attribute(name.casefold(), value):
+                if not remove_active:
+                    return (
+                        changed,
+                        referenced,
+                        f"original HTML retained active attribute {name}",
+                    )
                 del tag.attrs[name]
                 changed = True
             else:
@@ -307,10 +332,22 @@ def _sanitise_soup(soup: BeautifulSoup) -> tuple[bool, set[str]]:
         if tag.name == "style":
             style_text = tag.get_text()
             if _ACTIVE_STYLE.search(style_text):
+                if not remove_active:
+                    return (
+                        changed,
+                        referenced,
+                        "original HTML retained active style rule",
+                    )
                 tag.decompose()
                 changed = True
             elif style_text:
                 referenced.update(_CID_REFERENCE.findall(style_text))
+    return changed, referenced, None
+
+
+def _sanitise_soup(soup: BeautifulSoup) -> tuple[bool, set[str]]:
+    """Remove active content from ``soup`` and collect ``cid:`` references."""
+    changed, referenced, _ = _inspect_soup(soup, remove_active=True)
     return changed, referenced
 
 
@@ -373,19 +410,10 @@ def verify_quoted_html(html_text: str, attached_cids: Iterable[str]) -> str | No
 
     cids_in_view: set[str] = set()
     for doc in view.documents():
-        for tag in doc.find_all(True):
-            if tag.name.casefold() in _ACTIVE_TAGS:
-                return f"original HTML retained active tag <{tag.name}>"
-            for name, value in tag.attrs.items():
-                if _is_active_attribute(name.casefold(), value):
-                    return f"original HTML retained active attribute {name}"
-                cids_in_view.update(_extract_cids_from_attr(value))
-            if tag.name == "style":
-                style_text = tag.get_text()
-                if _ACTIVE_STYLE.search(style_text):
-                    return "original HTML retained active style rule"
-                if style_text:
-                    cids_in_view.update(_CID_REFERENCE.findall(style_text))
+        _, doc_cids, violation = _inspect_soup(doc, remove_active=False)
+        if violation is not None:
+            return violation
+        cids_in_view.update(doc_cids)
 
     attached_folded = {cid.casefold() for cid in attached_cids}
     missing = sorted(
