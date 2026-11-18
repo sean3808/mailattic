@@ -27,9 +27,11 @@ exists it is still attached, otherwise the link ships as written); every other
 ``cid:`` (images, VML, ``background``, ``style``, ``<style>``) must resolve.
 CSS (``style`` attributes and ``<style>`` text) is checked as a renderer reads
 it: comments removed and escapes decoded, so ``@\\69mport`` counts as
-``@import``. The ``<body>`` becomes a ``<div>`` that keeps every attribute the
-sanitiser left on it (``bgcolor`` / ``text`` / ``background`` as CSS,
-``link`` / ``vlink`` / ``alink`` as scoped rules); see :func:`_body_wrapper`.
+``@import``. The sanitised document becomes the fragment **in place**
+(:func:`_to_fragment_in_place`): ``<body>`` turns into a ``<div>`` keeping its
+attributes, ``<html>`` / ``<head>`` lose only their wrappers, and only the
+DOCTYPE and ``<title>`` are dropped, so content outside ``<body>`` is never
+left behind.
 After sanitising and attaching ``cid:`` parts, :func:`verify_quoted_html`
 re-parses the final HTML string written into the draft, rebuilds the render
 view, and fails closed to stored text if any active content, unattached
@@ -39,7 +41,6 @@ comments, unknown ``<!`` declarations) remains.
 
 from __future__ import annotations
 
-import html
 import re
 import urllib.parse
 from collections.abc import Iterable
@@ -49,7 +50,15 @@ from email.parser import BytesParser
 from html.parser import HTMLParser
 from typing import Literal
 
-from bs4 import BeautifulSoup, CData, Comment, Declaration, ProcessingInstruction, Tag
+from bs4 import (
+    BeautifulSoup,
+    CData,
+    Comment,
+    Declaration,
+    Doctype,
+    ProcessingInstruction,
+    Tag,
+)
 
 from .parser import _MAIL_POLICY, _detect_and_decode, _without_lone_surrogates
 
@@ -256,17 +265,6 @@ def _scan_unknown_declarations(html_text: str) -> None:
         raise _UnclassifiableHtml(f"unknown declaration {scanner.found!r}")
 
 
-def _is_conditional_comment_node(node: Comment) -> bool:
-    text = str(node)
-    return bool(
-        _HIDDEN_COND_RE.match(text)
-        or _REVEALED_OPEN_RE.match(text)
-        or _REVEALED_CLOSE_RE.match(text)
-        or _HYBRID_OPEN_RE.match(text)
-        or _HYBRID_CLOSE_RE.match(text)
-    )
-
-
 def _reject_unsupported_node(node: object) -> None:
     # Outlook's quoted history carries `<?xml:namespace prefix="o" ns="..." />`:
     # an inert namespace declaration, kept as written. Any other PI is unknown.
@@ -455,38 +453,52 @@ def _sanitised_fragment(source_html: str) -> tuple[str, set[str], set[str]]:
                 Comment(f"{subdoc.prefix}{subdoc.soup}{subdoc.suffix}")
             )
 
-    body = view.root.body
-    if body is None:
-        return str(view.root), required_cids, optional_cids
-    # Styles and Outlook conditional comments usually live in <head>; they
-    # belong to the quote, so they move with the body content, in order.
-    styles = "".join(
-        node.output_ready() if isinstance(node, Comment) else str(node)
-        for node in view.root.descendants
-        if (
-            getattr(node, "name", None) == "style"
-            or (isinstance(node, Comment) and _is_conditional_comment_node(node))
-        )
-        and node.find_parent("body") is None
-        and node.find_parent("style") is None
-    )
-    link_rules, wrapper_attrs = _body_wrapper(body)
-    return (
-        f"{styles}{link_rules}<div{wrapper_attrs}>{body.decode_contents()}</div>",
-        required_cids,
-        optional_cids,
-    )
+    _to_fragment_in_place(view.root)
+    return str(view.root), required_cids, optional_cids
 
 
-def _body_wrapper(body: Tag) -> tuple[str, str]:
-    """The ``<body>``'s presentation, carried onto the quote's ``<div>`` (#136).
+def _to_fragment_in_place(root: BeautifulSoup) -> None:
+    """Turn the sanitised document into an embeddable fragment, in place (#136).
+
+    Nothing is picked out of the document, so nothing is left behind: content
+    before ``<body>``, after ``</body>`` or after ``</html>`` stays where it
+    was, in order. Only a closed list is dropped: the DOCTYPE and the
+    document ``<title>`` (plus what the sanitiser already removed). ``<head>``
+    loses its wrapper and keeps its ``<style>`` and conditional comments in
+    place. ``<body>`` becomes a ``<div>`` (:func:`_rewrite_body_as_div`), and
+    ``<html>`` passes its attributes (``lang``, ``xmlns:v`` ...) to it, or
+    becomes a ``<div>`` itself when there is no body.
+    """
+    for node in list(root.descendants):
+        if isinstance(node, Doctype):
+            node.extract()
+    for title in root.find_all("title"):
+        if title.find_parent("svg") is None:
+            title.decompose()
+    for head in root.find_all("head"):
+        head.unwrap()
+    bodies = root.find_all("body")
+    for html_tag in root.find_all("html"):
+        if bodies:
+            for body in bodies:
+                for name, value in html_tag.attrs.items():
+                    body.attrs.setdefault(name, value)
+            html_tag.unwrap()
+        else:
+            html_tag.name = "div"
+    for body in bodies:
+        _rewrite_body_as_div(root, body)
+
+
+def _rewrite_body_as_div(root: BeautifulSoup, body: Tag) -> None:
+    """The ``<body>`` becomes the quote's ``<div>``, keeping its presentation.
 
     Every attribute the sanitiser left on ``<body>`` (``id``, ``class``,
-    ``lang``, ``style``, ...) is copied as written, so the original's styles
-    that target it still apply. The presentational body-only attributes have
-    no meaning on a ``<div>`` and are translated instead: ``bgcolor`` /
-    ``text`` / ``background`` become the equivalent CSS, ``link`` / ``vlink``
-    / ``alink`` become link-colour rules scoped to the quote; values that are
+    ``lang``, ``style``, ...) stays as written, so the original's styles that
+    target it still apply. The presentational body-only attributes have no
+    meaning on a ``<div>`` and are translated instead: ``bgcolor`` / ``text``
+    / ``background`` become the equivalent CSS, ``link`` / ``vlink`` /
+    ``alink`` become link-colour rules scoped to the quote; values that are
     not plain colours are dropped rather than written into CSS. A stylesheet
     rule that targets the ``body`` element by name no longer matches the quote
     (it is a ``<div>`` inside the reply's own body); that is accepted.
@@ -516,19 +528,20 @@ def _body_wrapper(body: Tag) -> tuple[str, str]:
         if (color := color_of(name))
     ]
     classes = _attr_strings(body.get("class")) + ([_QUOTE_BODY_CLASS] if rules else [])
-    attrs: list[str] = []
+    attrs: dict[str, str | list[str]] = {}
     if classes:
-        attrs.append(f' class="{html.escape(" ".join(classes), quote=True)}"')
+        attrs["class"] = classes
     for name, value in body.attrs.items():
-        if name.casefold() in _BODY_TRANSLATED_ATTRIBUTES:
-            continue
-        text = " ".join(_attr_strings(value))
-        attrs.append(f' {name}="{html.escape(text, quote=True)}"')
+        if name.casefold() not in _BODY_TRANSLATED_ATTRIBUTES:
+            attrs[name] = value
     if declarations:
-        style = ";".join(declarations)
-        attrs.append(f' style="{html.escape(style, quote=True)}"')
-    link_rules = f"<style>{' '.join(rules)}</style>" if rules else ""
-    return link_rules, "".join(attrs)
+        attrs["style"] = ";".join(declarations)
+    body.name = "div"
+    body.attrs = attrs
+    if rules:
+        link_rules = root.new_tag("style")
+        link_rules.string = " ".join(rules)
+        body.insert_before(link_rules)
 
 
 def verify_quoted_html(html_text: str, attached_cids: Iterable[str]) -> str | None:

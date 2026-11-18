@@ -556,6 +556,70 @@ def test_escaped_cid_in_css_must_resolve(tmp_path: Path) -> None:
     assert result.quote_note is not None and "bg@example.com" in result.quote_note
 
 
+@pytest.mark.parametrize(
+    ("html", "kept"),
+    [
+        # A gateway disclaimer after </body> or after </html>.
+        (
+            "<html><body><p>First</p></body><p>Second</p></html>",
+            ["First", "Second"],
+        ),
+        (
+            "<html><body><p>First</p></body></html><p>Disclaimer</p>",
+            ["First", "Disclaimer"],
+        ),
+        # Content between </head> and <body>, and before <html>.
+        (
+            "Lead<html><head><style>p{}</style></head><p>Pre</p><body><p>B</p></body>"
+            "</html>",
+            ["Lead", "Pre", "B"],
+        ),
+    ],
+)
+def test_visible_content_outside_body_stays_in_the_quote(
+    html: str, kept: list[str]
+) -> None:
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None and quotable.rejection_reason is None
+    text = BeautifulSoup(quotable.html_fragment, "html.parser").get_text()
+    positions = [text.index(word) for word in kept]
+    assert positions == sorted(positions)
+    for wrapper in ("<html", "<head", "<body", "</body>", "</html>"):
+        assert wrapper not in quotable.html_fragment
+
+
+def test_document_wrappers_become_divs_and_only_doctype_and_title_drop() -> None:
+    html = (
+        '<!DOCTYPE html><html lang="ZH-TW" xmlns:v="urn:schemas-microsoft-com:vml">'
+        "<head><title>Subject line</title><style>p{color:red}</style>"
+        "<!--[if gte mso 9]><xml><o:x/></xml><![endif]--></head>"
+        '<body lang="EN-US"><p>Hi</p></body></html>'
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None and quotable.rejection_reason is None
+    fragment = quotable.html_fragment
+    assert "DOCTYPE" not in fragment and "Subject line" not in fragment
+    assert fragment.index("p{color:red}") < fragment.index("<div")
+    assert "<!--[if gte mso 9]><xml><o:x/></xml><![endif]-->" in fragment
+    wrapper = BeautifulSoup(fragment, "html.parser").find("div")
+    assert wrapper is not None
+    # The body's own lang wins; the html's other attributes move onto the div.
+    assert wrapper["lang"] == "EN-US"
+    assert wrapper["xmlns:v"] == "urn:schemas-microsoft-com:vml"
+
+
+def test_document_without_body_has_its_html_wrapper_turned_into_a_div() -> None:
+    html = '<html lang="en"><head><title>t</title></head><p>Only</p></html>'
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None and quotable.rejection_reason is None
+    assert quotable.html_fragment.strip() == '<div lang="en"><p>Only</p></div>'
+
+
 def test_every_safe_body_attribute_travels_so_its_styles_still_apply() -> None:
     html = (
         "<html><head><style>#customer{font-weight:bold}</style></head>"
