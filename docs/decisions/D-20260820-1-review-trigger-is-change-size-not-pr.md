@@ -5,6 +5,8 @@ status: accepted
 title: 語意 review 的觸發條件是變更 size，不是走不走 PR
 ---
 
+> **2026-11-18 註記**：「S 直接進 main」與「PR 降為選用」兩條已失效。公開 repo 的 `main` 有伺服器端保護並要求 `hosted-full`（[D-20261113-1](D-20261113-1-hosted-windows-full-is-merge-evidence.md)），直推會被拒（2026-11-18 實測）；Sean 裁定配合保護設定，所有 size 都經 squash 合併的 PR 進 main。「語意 review 由 size 觸發、S 免語意 review」不變。Consequences 的「沒有伺服器端的第二道網」也不再成立。
+>
 > **2026-10-03 註記**：`/session-merge-queue` 與 `/session-dispatch` 已退役（`#207`）。「語意 review 由 size 觸發」的決定不變；文中關於兩份 SKILL.md 與 PR 佇列 writer 的段落只剩歷史意義。
 
 ## Context
