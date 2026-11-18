@@ -16,6 +16,14 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# Local-only recipient rebuild tests (gitignored, not run by CI).
+# A missing file (e.g., in a fresh clone) fails closed on purpose so releases
+# cannot silently skip local-only verification.
+$LocalOnlyTargetedTestPaths = @(
+    'tests/test_recipient_rebuild_audit.py',
+    'tests/test_recipient_rebuild_apply.py'
+)
+
 function Invoke-GitCapture {
     param(
         [Parameter(Mandatory)]
@@ -378,18 +386,110 @@ function Write-ReleaseStage {
     Write-Host ("[release] {0}/9 {1}" -f $Number, $Message)
 }
 
+function Invoke-PytestLauncher {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LauncherPath,
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    & pwsh -NoProfile -File $LauncherPath @Arguments
+    $launcherExitCode = $LASTEXITCODE
+    if ($launcherExitCode -ne 0) {
+        $argText = $Arguments -join ' '
+        throw (
+            "scripts\invoke-pytest.ps1 $argText (canonical pytest gate) " +
+            "failed with exit code $launcherExitCode."
+        )
+    }
+}
+
+function Get-HostedFullStatus {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepoRoot,
+        [string]$Commit
+    )
+
+    $statusScript = Join-Path $RepoRoot 'scripts\record_ci_green_tree.py'
+    if (-not (Test-Path -LiteralPath $statusScript -PathType Leaf)) {
+        return [pscustomobject]@{
+            Ok = $false
+            Error = "Hosted-full status script was not found: $statusScript"
+            Payload = $null
+        }
+    }
+
+    $args = @('--locked', '--exact', 'python', $statusScript, '--status-json')
+    if ($Commit) {
+        $args += @('--commit', $Commit)
+    }
+
+    $stdoutLines = [System.Collections.Generic.List[string]]::new()
+    $stderrLines = [System.Collections.Generic.List[string]]::new()
+    Push-Location -LiteralPath $RepoRoot
+    $previousEncoding = $env:PYTHONIOENCODING
+    try {
+        $env:PYTHONIOENCODING = 'utf-8'
+        $global:LASTEXITCODE = 0
+        & uv run @args 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                $stderrLines.Add($_.ToString())
+            } else {
+                $stdoutLines.Add($_.ToString())
+            }
+        }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $env:PYTHONIOENCODING = $previousEncoding
+        Pop-Location
+    }
+
+    if ($exitCode -ne 0) {
+        $detail = ($stderrLines -join [Environment]::NewLine).Trim()
+        if (-not $detail) {
+            $detail = ($stdoutLines -join [Environment]::NewLine).Trim()
+        }
+        return [pscustomobject]@{
+            Ok = $false
+            Error = "record_ci_green_tree.py --status-json failed (exit $exitCode): $detail"
+            Payload = $null
+        }
+    }
+
+    $jsonText = ($stdoutLines -join [Environment]::NewLine).Trim()
+    try {
+        $payload = $jsonText | ConvertFrom-Json
+    } catch {
+        return [pscustomobject]@{
+            Ok = $false
+            Error = "record_ci_green_tree.py --status-json returned invalid JSON: $jsonText"
+            Payload = $null
+        }
+    }
+
+    return [pscustomobject]@{
+        Ok = $true
+        Error = $null
+        Payload = $payload
+    }
+}
+
 function Invoke-ReleaseTests {
     <#
     .SYNOPSIS
-      Run the canonical isolated Full pytest route via scripts/invoke-pytest.ps1.
+      Verify HEAD via hosted-full (or fall back to local -Route Full) and
+      always run the local-only recipient rebuild tests via -Route Targeted.
 
     .DESCRIPTION
-      Release calls only the documented `-Route Full` interface of the
-      canonical pytest launcher. It does not reproduce the launcher's
-      underlying uv/pytest argument vector, and it does not set TEMP/TMP or
-      any other managed environment variable itself -- the launcher (via
-      scripts/project-tool-environment.ps1) owns runtime-root resolution,
-      the pytest cross-process lock, and every managed variable.
+      Release queries `scripts/record_ci_green_tree.py --status-json` for HEAD.
+      When `hosted-full` succeeded for HEAD, local `-Route Full` is skipped;
+      when it is queued, in progress, not found, or the lookup fails, release
+      falls back to `-Route Full` via `scripts/invoke-pytest.ps1` (canonical full pytest gate).
+      A failed `hosted-full` stops the release immediately. In all passing
+      cases, the gitignored local-only recipient rebuild test files run through
+      `-Route Targeted`.
 
       Any non-zero exit code from the launcher -- an ordinary pytest
       failure, lock contention (17), or a runtime root whose volume cannot
@@ -400,7 +500,8 @@ function Invoke-ReleaseTests {
     #>
     param(
         [Parameter(Mandatory)]
-        [string]$RepoRoot
+        [string]$RepoRoot,
+        [string]$Commit
     )
 
     $launcherPath = Join-Path $RepoRoot 'scripts\invoke-pytest.ps1'
@@ -408,14 +509,33 @@ function Invoke-ReleaseTests {
         throw "Canonical pytest launcher was not found: $launcherPath"
     }
 
-    & pwsh -NoProfile -File $launcherPath -Route Full
-    $launcherExitCode = $LASTEXITCODE
-    if ($launcherExitCode -ne 0) {
-        throw (
-            "scripts\invoke-pytest.ps1 -Route Full (canonical full pytest gate) " +
-            "failed with exit code $launcherExitCode."
-        )
+    $lookup = Get-HostedFullStatus -RepoRoot $RepoRoot -Commit $Commit
+    if (-not $lookup.Ok) {
+        [Console]::Error.WriteLine("[release] WARNING: $($lookup.Error); falling back to local Full")
+        Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments @('-Route', 'Full')
+    } else {
+        $payload = $lookup.Payload
+        switch ($payload.state) {
+            'success' {
+                Write-Host "[release] Accepted hosted-full run: $($payload.url); skipping local Full"
+            }
+            'failed' {
+                throw "hosted-full failed ($($payload.conclusion)) for commit $Commit ($($payload.url)); release stopped."
+            }
+            { $_ -in @('queued', 'in_progress', 'not_found') } {
+                $reason = $payload.state.Replace('_', ' ')
+                Write-Host "[release] hosted-full $reason; falling back to local Full"
+                Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments @('-Route', 'Full')
+            }
+            default {
+                throw "Unexpected hosted-full state '$($payload.state)' for commit $Commit."
+            }
+        }
     }
+
+    Invoke-PytestLauncher -LauncherPath $launcherPath -Arguments (
+        @('-Route', 'Targeted') + $LocalOnlyTargetedTestPaths
+    )
 }
 
 function Invoke-GlobalReinstall {
@@ -526,8 +646,8 @@ function Invoke-BesRelease {
     }
     $releaseCommit = Assert-ReleasePreconditions @preconditionParameters
 
-    Write-ReleaseStage -Number 2 -Message 'Run full test suite'
-    Invoke-ReleaseTests -RepoRoot $resolvedRoot
+    Write-ReleaseStage -Number 2 -Message 'Verify tests (hosted-full or local Full, plus local-only Targeted)'
+    Invoke-ReleaseTests -RepoRoot $resolvedRoot -Commit $releaseCommit
 
     Write-ReleaseStage -Number 3 -Message 'Reinstall global bes'
     Invoke-GlobalReinstall -RepoRoot $resolvedRoot

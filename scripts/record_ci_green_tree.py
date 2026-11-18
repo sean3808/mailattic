@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+_QUEUED_STATUSES = {"queued", "waiting", "pending", "requested"}
 
 
 def command(*args: str) -> str:
@@ -20,39 +23,119 @@ def api(path: str) -> list:
     return pages
 
 
-def main() -> int:
+def _job_sort_key(job: dict[str, object]) -> tuple[datetime, int]:
+    timestamp = (
+        job.get("started_at") or job.get("created_at") or job.get("completed_at")
+    )
+    parsed = (
+        datetime.fromisoformat(str(timestamp))
+        if timestamp
+        else datetime.min.replace(tzinfo=UTC)
+    )
+    raw_id = job.get("id", 0)
+    return (parsed, int(raw_id) if isinstance(raw_id, int) else 0)
+
+
+def inspect_hosted_full(
+    repo: str, sha: str
+) -> tuple[dict[str, object], dict[str, object] | None]:
+    """Return (status_payload, newest_job) for the newest hosted-full job on sha."""
+    runs = api(
+        f"repos/{repo}/actions/workflows/ci.yml/runs?head_sha={sha}&per_page=100"
+    )
+    candidates: list[tuple[dict[str, object], dict[str, object]]] = []
+    for page in runs:
+        for run in page["workflow_runs"]:
+            for job_page in api(
+                f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100&filter=all"
+            ):
+                for job in job_page["jobs"]:
+                    if job.get("name") == "hosted-full":
+                        candidates.append((job, run))
+
+    if not candidates:
+        return (
+            {
+                "state": "not_found",
+                "conclusion": None,
+                "url": None,
+                "run_id": None,
+                "run_attempt": None,
+            },
+            None,
+        )
+
+    newest_job, newest_run = max(candidates, key=lambda item: _job_sort_key(item[0]))
+    status = newest_job.get("status")
+    conclusion = newest_job.get("conclusion")
+    if status in _QUEUED_STATUSES:
+        state = "queued"
+    elif status == "in_progress":
+        state = "in_progress"
+    elif status == "completed" and conclusion == "success":
+        state = "success"
+    elif status == "completed":
+        state = "failed"
+    else:
+        state = "queued"
+
+    payload = {
+        "state": state,
+        "conclusion": conclusion,
+        "url": newest_run.get("html_url") or newest_job.get("html_url"),
+        "run_id": newest_job.get("run_id") or newest_run.get("id"),
+        "run_attempt": newest_job.get("run_attempt"),
+    }
+    return payload, newest_job
+
+
+def _repo_name_with_owner() -> str:
+    return json.loads(command("gh", "repo", "view", "--json", "nameWithOwner"))[
+        "nameWithOwner"
+    ]
+
+
+def _parse_args(argv: list[str] | tuple[str, ...] = ()) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--status-json",
+        action="store_true",
+        help="Print the newest hosted-full status as JSON and exit without writing.",
+    )
+    parser.add_argument(
+        "--commit",
+        help="Commit SHA to inspect (used with --status-json; defaults to HEAD).",
+    )
+    return parser.parse_args(list(argv))
+
+
+def main(argv: list[str] | tuple[str, ...] = ()) -> int:
     try:
+        args = _parse_args(argv)
+        if args.status_json:
+            sha = args.commit or command("git", "rev-parse", "HEAD")
+            repo = _repo_name_with_owner()
+            payload, _ = inspect_hosted_full(repo, sha)
+            print(json.dumps(payload, separators=(",", ":")))
+            return 0
+
         if command("git", "status", "--porcelain", "--untracked-files=normal"):
             raise ValueError("working tree has tracked changes or untracked files")
         sha = command("git", "rev-parse", "HEAD")
         tree = command("git", "rev-parse", "HEAD^{tree}")
-        repo = json.loads(command("gh", "repo", "view", "--json", "nameWithOwner"))[
-            "nameWithOwner"
-        ]
+        repo = _repo_name_with_owner()
         command("gh", "api", f"repos/{repo}/commits/{sha}")
-        runs = api(
-            f"repos/{repo}/actions/workflows/ci.yml/runs?head_sha={sha}&per_page=100"
-        )
-        jobs = []
-        for page in runs:
-            for run in page["workflow_runs"]:
-                for job_page in api(
-                    f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100&filter=all"
-                ):
-                    for job in job_page["jobs"]:
-                        if (
-                            job["name"] == "hosted-full"
-                            and job["status"] == "completed"
-                            and job.get("completed_at")
-                        ):
-                            jobs.append(
-                                (datetime.fromisoformat(job["completed_at"]), job)
-                            )
-        if not jobs:
-            raise ValueError("no completed hosted-full job found")
-        completed_at, job = max(jobs, key=lambda item: item[0])
-        if job["conclusion"] != "success":
-            raise ValueError("most recently completed hosted-full job did not succeed")
+        payload, job = inspect_hosted_full(repo, sha)
+        if payload["state"] == "not_found" or job is None:
+            raise ValueError("no hosted-full job found")
+        if payload["state"] in {"queued", "in_progress"}:
+            raise ValueError(f"newest hosted-full job is {payload['state']}")
+        if payload["state"] != "success":
+            raise ValueError("newest hosted-full job did not succeed")
+        completed_raw = job.get("completed_at")
+        if not isinstance(completed_raw, str) or not completed_raw:
+            raise ValueError("newest hosted-full job is missing completed_at")
+        completed_at = datetime.fromisoformat(completed_raw)
         # The closeout reader ignores records older than 30 days; refuse instead of
         # appending a line it would silently skip.
         if datetime.now(UTC) - completed_at > timedelta(days=30):
@@ -111,4 +194,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

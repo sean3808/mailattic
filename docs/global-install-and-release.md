@@ -59,7 +59,7 @@ guard（`scripts/guard-release-tag.py`，掛 pre-push）是**唯讀 fail-closed 
 | 未定案的本機更新（只重建全域 bes，不寫 evidence / 不建 tag / 不 push） | `pwsh -ExecutionPolicy Bypass -File scripts\reinstall-global.ps1` |
 | 新 checkout 裝 guard（一次） | `pwsh -ExecutionPolicy Bypass -File scripts\install-release-pre-push.ps1` |
 
-- tag 格式固定：日期 + 當日序號。`release.ps1` 一支包辦：完整測試 → non-editable reinstall → `bes --help` + package manifest 驗證 → skill SSOT 同步與逐檔核對 → Git-local evidence → annotated tag → atomic push → GitHub Release。
+- tag 格式固定：日期 + 當日序號。`release.ps1` 一支包辦：測試驗證（查詢 `HEAD` 在 `ci.yml` 的 `hosted-full` job：成功則跳過本機 `-Route Full` 並印出採用的 run URL；還在跑、排隊中或查不到則不等候、印出原因並退回本機 `-Route Full`；失敗或被取消則直接報錯停下；不論走哪條路皆固定以 `-Route Targeted` 跑 `tests/test_recipient_rebuild_audit.py` 與 `tests/test_recipient_rebuild_apply.py`）→ non-editable reinstall → `bes --help` + package manifest 驗證 → skill SSOT 同步與逐檔核對 → Git-local evidence → annotated tag → atomic push → GitHub Release。
 - **GitHub Release 與 PR 分類標籤**：`atomic push` 成功後，本機接著執行 `gh release create <tag> --verify-tag --generate-notes` 建立 GitHub Release，發行說明由 `.github/release.yml` 依 PR 標籤自動分組；若這一步失敗只回報重試指令並以非零結束碼停止，不撤回已推送的 tag。開 PR 時請貼上對應的分類標籤（`breaking-change`、`enhancement`、`bug`、`documentation`、`dependencies`；不需列入發行說明的改動貼 `skip-changelog`）。
 - **發行完成包含 skill**：同一個乾淨 main commit 的 BES、`skills/mailattic/` 操作說明與附帶工具一起交付。release 呼叫 `deploy-skill-to-ssot.py --verify-required`，只部署 Git tracked 檔案，再核對內容；目標沿用 `MAILATTIC_SKILL_SSOT` 或部署腳本內建 SSOT 路徑。ignored/untracked 產物不複製，SSOT 清單外檔案不動，也不 commit/push SSOT repo。
 - **SSOT 階段失敗即停止**：複製失敗、來源檢查而跳過、同步後內容仍不同，都不得新增成功 evidence/tag/push。此時 BES 已安裝，不會自動回復；修正錯誤後以原 `-Tag` 和 `-Remote` 重跑 release。已一致的 skill 可安全重驗。

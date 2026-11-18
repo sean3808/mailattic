@@ -494,6 +494,21 @@ def _assert_tag_pushed(repo: Path, remote: Path, tag: str) -> str:
     return local_commit
 
 
+def _assert_no_release_artifacts(repo: Path, remote: Path, tag: str) -> None:
+    """Assert no evidence, local tag, or remote tag was created."""
+    assert not (repo / ".git" / "bes-release-state.json").exists()
+    assert (
+        _git(
+            repo, "show-ref", "--verify", "--quiet", f"refs/tags/{tag}", check=False
+        ).returncode
+        != 0
+    )
+    assert (
+        _git(repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}").stdout.strip()
+        == ""
+    )
+
+
 @pytest.mark.release
 def test_release_orchestration_orders_stages_and_pushes_annotated_tag(
     tmp_path: Path,
@@ -506,7 +521,7 @@ def test_release_orchestration_orders_stages_and_pushes_annotated_tag(
     assert result.returncode == 0, result.stderr
     stage_markers = [
         "Validate release inputs",
-        "Run full test suite",
+        "Verify tests (hosted-full or local Full, plus local-only Targeted)",
         "Reinstall global bes",
         "Verify installed snapshot",
         "Sync and verify skill SSOT",
@@ -1143,15 +1158,17 @@ def test_operator_docs_distinguish_backup_release_and_skill_archive():
     assert "publish-cli-on-archive" not in agents
 
 
-def test_release_script_invokes_launcher_full_route_only():
+def test_release_script_invokes_launcher_full_and_targeted_routes_only():
     script = RELEASE_SCRIPT.read_text(encoding="utf-8")
     tests_function_start = script.index("function Invoke-ReleaseTests")
 
     assert "scripts\\invoke-pytest.ps1" in script
     assert "-Route Full" in script
+    assert "-Route Targeted" in script
+    assert "tests/test_recipient_rebuild_audit.py" in script
+    assert "tests/test_recipient_rebuild_apply.py" in script
     assert "canonical full pytest gate" in script.lower()
     assert "uv run --locked --exact pytest" not in script[tests_function_start:]
-    assert "-Route Targeted" not in script
     assert "-Route Quick" not in script
     assert "-Route FullSequential" not in script
     tests_function_end = script.index("function Invoke-GlobalReinstall")
@@ -1160,22 +1177,39 @@ def test_release_script_invokes_launcher_full_route_only():
     assert "$env:TMP" not in tests_function_body
 
 
-def test_release_tests_invoke_the_full_route_launcher_with_exact_arguments(
+_TARGETED_REBUILD_ARGS = (
+    "-Route Targeted "
+    "tests/test_recipient_rebuild_audit.py "
+    "tests/test_recipient_rebuild_apply.py"
+)
+
+
+def _write_logging_launcher_stub(
+    scripts_dir: Path, log_path: Path, *, exit_code: int = 0
+) -> None:
+    (scripts_dir / "invoke-pytest.ps1").write_text(
+        f"[IO.File]::AppendAllText({ps_quote(log_path)}, "
+        f"(($args -join ' ') + \"`n\"))\nexit {exit_code}\n",
+        encoding="utf-8",
+    )
+
+
+def test_release_tests_invoke_the_full_and_targeted_launchers_with_exact_arguments(
     tmp_path: Path,
 ):
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
     scripts.mkdir(parents=True)
     log = tmp_path / "launcher-args.txt"
-    (scripts / "invoke-pytest.ps1").write_text(
-        f"[IO.File]::WriteAllText({ps_quote(log)}, ($args -join ' '))\nexit 0\n",
-        encoding="utf-8",
-    )
+    _write_logging_launcher_stub(scripts, log)
 
     result = _run_release_function(f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)}")
 
     assert result.returncode == 0, result.stderr
-    assert log.read_text(encoding="utf-8").strip() == "-Route Full"
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "-Route Full",
+        _TARGETED_REBUILD_ARGS,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1214,10 +1248,11 @@ def test_release_tests_throw_on_any_nonzero_launcher_exit_code(
 def test_release_stops_before_reinstall_on_any_nonzero_launcher_exit(
     tmp_path: Path, launcher_exit_code: int, expected_message_fragment: str
 ):
-    repo, _ = _make_release_repo(tmp_path)
+    repo, remote = _make_release_repo(tmp_path)
     (repo / "scripts" / "invoke-pytest.ps1").write_text(
         f"exit {launcher_exit_code}\n", encoding="utf-8"
     )
+    _write_status_script_stub(repo / "scripts", state="not_found")
     _git(repo, "add", "scripts")
     _git(repo, "commit", "-m", "stub canonical pytest launcher exit code")
     _git(repo, "push", "origin", "main")
@@ -1226,23 +1261,16 @@ def test_release_stops_before_reinstall_on_any_nonzero_launcher_exit(
 
     assert result.returncode != 0
     assert expected_message_fragment in result.stderr
-    assert "Run full test suite" in result.stdout
+    assert (
+        "Verify tests (hosted-full or local Full, plus local-only Targeted)"
+        in result.stdout
+    )
     assert "Reinstall global bes" not in result.stdout
     assert "Verify installed snapshot" not in result.stdout
     assert "Write local release evidence" not in result.stdout
     assert "Create annotated release tag" not in result.stdout
     assert "Atomically push main and release tag" not in result.stdout
-    assert (
-        _git(
-            repo,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            "refs/tags/bes-v2026.07.18.1",
-            check=False,
-        ).returncode
-        != 0
-    )
+    _assert_no_release_artifacts(repo, remote, "bes-v2026.07.18.1")
 
 
 def test_disposable_repos_disable_git_auto_maintenance_for_direct_and_nested_git(
@@ -1276,3 +1304,166 @@ def test_disposable_repos_disable_git_auto_maintenance_for_direct_and_nested_git
         remote, "config", "--local", "--get", GIT_AUTO_MAINTENANCE_SETTING
     )
     assert remote_side.stdout.strip() == "false"
+
+
+def _write_status_script_stub(
+    scripts_dir: Path,
+    *,
+    state: str,
+    conclusion: str | None = None,
+    url: str | None = None,
+    exit_code: int = 0,
+    stderr_message: str = "",
+) -> None:
+    payload = json.dumps(
+        {
+            "state": state,
+            "conclusion": conclusion,
+            "url": url,
+            "run_id": 1001 if url else None,
+            "run_attempt": 1 if url else None,
+        }
+    )
+    (scripts_dir / "record_ci_green_tree.py").write_text(
+        "import sys\n"
+        f"if {exit_code} != 0:\n"
+        f"    print({stderr_message!r}, file=sys.stderr)\n"
+        f"    sys.exit({exit_code})\n"
+        f"print({payload!r})\n",
+        encoding="utf-8",
+    )
+
+
+def test_invoke_release_tests_skips_local_full_when_hosted_full_succeeded(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    log = tmp_path / "launcher-args.txt"
+    run_url = "https://github.com/example/mailattic/actions/runs/1001"
+    _write_logging_launcher_stub(scripts, log)
+    _write_status_script_stub(
+        scripts, state="success", conclusion="success", url=run_url
+    )
+
+    result = _run_release_function(
+        f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)} -Commit 'abc123'"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert run_url in result.stdout
+    assert "skipping local Full" in result.stdout
+    assert log.read_text(encoding="utf-8").splitlines() == [_TARGETED_REBUILD_ARGS]
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_reason"),
+    [
+        ("queued", "queued"),
+        ("in_progress", "in progress"),
+        ("not_found", "not found"),
+    ],
+)
+def test_invoke_release_tests_falls_back_to_local_full_when_not_ready(
+    tmp_path: Path, state: str, expected_reason: str
+):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(scripts, log)
+    _write_status_script_stub(scripts, state=state)
+
+    result = _run_release_function(
+        f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)} -Commit 'abc123'"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "falling back to local Full" in result.stdout
+    assert expected_reason in result.stdout
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "-Route Full",
+        _TARGETED_REBUILD_ARGS,
+    ]
+
+
+def test_invoke_release_tests_falls_back_with_warning_on_status_script_error(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(scripts, log)
+    _write_status_script_stub(
+        scripts, state="not_found", exit_code=1, stderr_message="gh api boom"
+    )
+
+    result = _run_release_function(
+        f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)} -Commit 'abc123'"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "WARNING:" in result.stderr
+    assert "gh api boom" in result.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "-Route Full",
+        _TARGETED_REBUILD_ARGS,
+    ]
+
+
+def test_invoke_release_tests_stops_on_targeted_failure_even_when_hosted_full_green(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(scripts, log, exit_code=1)
+    _write_status_script_stub(
+        scripts,
+        state="success",
+        conclusion="success",
+        url="https://github.com/example/mailattic/actions/runs/1005",
+    )
+
+    result = _run_release_function(
+        f"Invoke-ReleaseTests -RepoRoot {ps_quote(repo)} -Commit 'abc123'"
+    )
+
+    assert result.returncode != 0
+    assert "-Route Targeted" in result.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == [_TARGETED_REBUILD_ARGS]
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled"])
+def test_release_stops_when_hosted_full_failed_e2e(tmp_path: Path, conclusion: str):
+    repo, remote = _make_release_repo(tmp_path)
+    tag = "bes-v2026.11.18.3"
+    run_url = "https://github.com/example/mailattic/actions/runs/1004"
+    launcher_log = tmp_path / "launcher-args.txt"
+    _write_logging_launcher_stub(repo / "scripts", launcher_log)
+    _write_status_script_stub(
+        repo / "scripts", state="failed", conclusion=conclusion, url=run_url
+    )
+    _git(repo, "add", "scripts")
+    _git(repo, "commit", "-m", "stub failed hosted-full status")
+    _git(repo, "push", "origin", "main")
+
+    result = _run_release_driver(
+        tmp_path,
+        repo,
+        tag=tag,
+        override_tests=False,
+    )
+
+    assert result.returncode != 0
+    assert run_url in result.stderr
+    assert conclusion in result.stderr
+    assert not launcher_log.exists()
+    assert "Reinstall global bes" not in result.stdout
+    assert "Write local release evidence" not in result.stdout
+    assert "Create annotated release tag" not in result.stdout
+    assert "Atomically push main and release tag" not in result.stdout
+    _assert_no_release_artifacts(repo, remote, tag)

@@ -5,6 +5,8 @@ status: accepted
 title: GitHub hosted Windows Full 作為合併證據
 ---
 
+> **2026-11-18 更新**：本文中「release 證據不變」一句已由 [D-20261118-1](D-20261118-1-release-accepts-head-hosted-full.md) 取代（發行改認 `HEAD` 的 `hosted-full`，僅在未完成或查無紀錄時退回本機 `-Route Full`）。
+
 ## Context
 
 Sean 要把測試負載移出開發用筆電。[D-20260820-2](D-20260820-2-excluded-ci-infrastructure-options.md) 排除 hosted Full 與必要檢查時，repo 還是私有的（Sean 於 2026-11-13 確認）。[D-20261010-1](D-20261010-1-showcase-ships-ahead-of-remoteization-in-a-fresh-repo.md) 決定以公開 repo 為主場；前提改變，並非當初判斷錯誤。

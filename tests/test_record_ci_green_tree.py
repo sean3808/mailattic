@@ -176,3 +176,220 @@ def test_refusal_never_writes(setup, case, capsys):
         assert "does not match" in capsys.readouterr().err
     if case == "stale":
         assert "more than 30 days" in capsys.readouterr().err
+
+
+def _make_multi_run_fake_api(monkeypatch, runs_with_jobs):
+    def fake_api(path):
+        if "/workflows/" in path:
+            return [{"workflow_runs": [run for run, _ in runs_with_jobs]}]
+        for run, jobs in runs_with_jobs:
+            if f"/runs/{run['id']}/jobs" in path:
+                assert "filter=all" in path
+                return [{"jobs": jobs}]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(writer, "api", fake_api)
+
+
+def test_inspect_hosted_full_newest_run_wins_over_older_run(monkeypatch):
+    _make_multi_run_fake_api(
+        monkeypatch,
+        [
+            (
+                {"id": 10, "html_url": "https://example.invalid/runs/10"},
+                [
+                    {
+                        "id": 100,
+                        "name": "hosted-full",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "started_at": "2026-11-18T01:00:00Z",
+                        "run_id": 10,
+                        "run_attempt": 1,
+                    }
+                ],
+            ),
+            (
+                {"id": 11, "html_url": "https://example.invalid/runs/11"},
+                [
+                    {
+                        "id": 101,
+                        "name": "hosted-full",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-11-18T02:00:00Z",
+                        "run_id": 11,
+                        "run_attempt": 1,
+                    }
+                ],
+            ),
+        ],
+    )
+
+    payload, _ = writer.inspect_hosted_full("owner/repo", "a" * 40)
+
+    assert payload == {
+        "state": "success",
+        "conclusion": "success",
+        "url": "https://example.invalid/runs/11",
+        "run_id": 11,
+        "run_attempt": 1,
+    }
+
+
+def test_inspect_hosted_full_failed_attempt_1_then_success_attempt_2(monkeypatch):
+    _make_multi_run_fake_api(
+        monkeypatch,
+        [
+            (
+                {"id": 20, "html_url": "https://example.invalid/runs/20"},
+                [
+                    {
+                        "id": 201,
+                        "name": "hosted-full",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "started_at": "2026-11-18T01:00:00Z",
+                        "run_id": 20,
+                        "run_attempt": 1,
+                    },
+                    {
+                        "id": 202,
+                        "name": "hosted-full",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-11-18T02:00:00Z",
+                        "run_id": 20,
+                        "run_attempt": 2,
+                    },
+                ],
+            )
+        ],
+    )
+
+    payload, _ = writer.inspect_hosted_full("owner/repo", "a" * 40)
+
+    assert payload["state"] == "success"
+    assert payload["run_attempt"] == 2
+    assert payload["url"] == "https://example.invalid/runs/20"
+
+
+def test_inspect_hosted_full_success_attempt_1_then_in_progress_attempt_2(
+    setup, monkeypatch
+):
+    repo, _, _ = setup
+    _make_multi_run_fake_api(
+        monkeypatch,
+        [
+            (
+                {"id": 30, "html_url": "https://example.invalid/runs/30"},
+                [
+                    {
+                        "id": 301,
+                        "name": "hosted-full",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-11-18T01:00:00Z",
+                        "completed_at": "2026-11-18T01:05:00Z",
+                        "run_id": 30,
+                        "run_attempt": 1,
+                    },
+                    {
+                        "id": 302,
+                        "name": "hosted-full",
+                        "status": "in_progress",
+                        "conclusion": None,
+                        "started_at": "2026-11-18T02:00:00Z",
+                        "run_id": 30,
+                        "run_attempt": 2,
+                    },
+                ],
+            )
+        ],
+    )
+
+    payload, _ = writer.inspect_hosted_full("owner/repo", "a" * 40)
+    assert payload["state"] == "in_progress"
+    assert payload["run_attempt"] == 2
+
+    # Record mode also refuses when the newest attempt is still in_progress.
+    assert writer.main() != 0
+    assert not (repo / ".git" / "closeout-green-trees.jsonl").exists()
+
+
+def test_inspect_hosted_full_ignores_failing_other_jobs(monkeypatch):
+    _make_multi_run_fake_api(
+        monkeypatch,
+        [
+            (
+                {"id": 40, "html_url": "https://example.invalid/runs/40"},
+                [
+                    {
+                        "id": 401,
+                        "name": "static",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "started_at": "2026-11-18T03:00:00Z",
+                        "run_id": 40,
+                        "run_attempt": 1,
+                    },
+                    {
+                        "id": 402,
+                        "name": "hosted-full",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-11-18T02:00:00Z",
+                        "run_id": 40,
+                        "run_attempt": 1,
+                    },
+                ],
+            )
+        ],
+    )
+
+    payload, _ = writer.inspect_hosted_full("owner/repo", "a" * 40)
+
+    assert payload["state"] == "success"
+
+
+def test_inspect_hosted_full_no_runs_returns_not_found(monkeypatch):
+    _make_multi_run_fake_api(monkeypatch, [])
+
+    payload, job = writer.inspect_hosted_full("owner/repo", "a" * 40)
+
+    assert job is None
+    assert payload == {
+        "state": "not_found",
+        "conclusion": None,
+        "url": None,
+        "run_id": None,
+        "run_attempt": None,
+    }
+
+
+def test_status_json_cli_works_on_dirty_tree_and_fails_loud_on_gh_error(
+    setup, monkeypatch, capsys
+):
+    repo, _, state = setup
+    (repo / "tracked").write_text("dirty", encoding="utf-8")
+    state["jobs"][0]["started_at"] = "2026-11-18T02:00:00Z"
+    state["jobs"][0]["run_id"] = 1
+    state["jobs"][0]["run_attempt"] = 1
+    state["runs"][0]["html_url"] = "https://example.invalid/runs/1"
+
+    assert writer.main(["--status-json", "--commit", "b" * 40]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {
+        "state": "success",
+        "conclusion": "success",
+        "url": "https://example.invalid/runs/1",
+        "run_id": 1,
+        "run_attempt": 1,
+    }
+
+    def fail_api(_path):
+        raise subprocess.CalledProcessError(1, ["gh", "api"])
+
+    monkeypatch.setattr(writer, "api", fail_api)
+    assert writer.main(["--status-json", "--commit", "b" * 40]) != 0
+    assert "Cannot record green tree" in capsys.readouterr().err
