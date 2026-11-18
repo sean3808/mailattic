@@ -487,6 +487,112 @@ def test_style_tag_import_and_expression_are_caught() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "css",
+    [
+        r"@\69mport url(https://example.com/a.css);",
+        r"@\000069 mport url(https://example.com/a.css);",
+        r"@i\mport url(https://example.com/a.css);",
+        "@imp/**/ort url(https://example.com/a.css);",
+        r"p{width:e\78pression(alert(1))}",
+        "p{width:expr/* x */ession(alert(1))}",
+        r"p{background:url(java\73 cript:alert(1))}",
+    ],
+)
+def test_css_escapes_and_comments_do_not_hide_active_style(css: str) -> None:
+    # A renderer decodes CSS escapes and drops comments before reading the rule.
+    assert verify_quoted_html(f"<style>{css}</style><p>Hi</p>", ()) is not None
+    assert verify_quoted_html(f'<p style="{css}">Hi</p>', ()) is not None
+    html = f"<html><head><style>{css}</style></head><body><p>Hi</p></body></html>"
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+    assert quotable is not None and quotable.rejection_reason is None
+    assert css not in quotable.html_fragment
+
+
+def test_word_vml_behavior_rule_and_escaped_selector_are_kept() -> None:
+    # Every Word-generated mail carries this; it must not count as active.
+    css = r"v\:* {behavior:url(#default#VML);} o\:* {behavior:url(#default#VML);}"
+    html = f"<html><head><style>{css}</style></head><body><p>Hi</p></body></html>"
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None and quotable.rejection_reason is None
+    assert css in quotable.html_fragment
+
+
+def test_escaped_cid_in_css_must_resolve(tmp_path: Path) -> None:
+    html = (
+        r'<html><body><p style="background:url(c\69 d:bg@example.com)">'
+        "x</p></body></html>"
+    )
+
+    result = _reply(tmp_path, _fetch_returning(_eml_with_cid(html, None)))
+
+    assert result.quote_source == "stored_text"
+    assert result.quote_note is not None and "bg@example.com" in result.quote_note
+
+
+def test_body_presentation_travels_with_the_quote() -> None:
+    html = (
+        '<html><body class="blue" lang="ZH-TW" bgcolor="#FFEECC" text="navy"'
+        ' link="#0563C1" vlink="#954F72" background="https://example.com/bg.png"'
+        ' style="word-wrap:break-word"><p>Hi</p></body></html>'
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None and quotable.rejection_reason is None
+    soup = BeautifulSoup(quotable.html_fragment, "html.parser")
+    wrapper = soup.find("div")
+    assert wrapper is not None
+    assert "blue" in wrapper["class"]
+    assert wrapper["lang"] == "ZH-TW"
+    style = str(wrapper["style"])
+    for kept in (
+        "background-color:#FFEECC",
+        "color:navy",
+        'background-image:url("https://example.com/bg.png")',
+        "word-wrap:break-word",
+    ):
+        assert kept in style
+    rules = soup.find("style")
+    assert rules is not None
+    assert "a:link{color:#0563C1}" in rules.get_text()
+    assert "a:visited{color:#954F72}" in rules.get_text()
+
+
+def test_body_attribute_values_cannot_break_out_of_css() -> None:
+    html = (
+        '<html><body bgcolor="red;background:url(https://example.com/x)"'
+        ' link="red}*{color:red"'
+        ' background="https://example.com/a.png&quot;);color:red;x:(&quot;"'
+        "><p>Hi</p></body></html>"
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None and quotable.rejection_reason is None
+    wrapper = BeautifulSoup(quotable.html_fragment, "html.parser").find("div")
+    assert wrapper is not None
+    style = str(wrapper["style"])
+    assert "background-color" not in style
+    assert style.count('url("') == 1 and '");color:red' not in style
+    assert "<style>" not in quotable.html_fragment
+
+
+def test_outlook_xml_namespace_declaration_is_kept() -> None:
+    pi = (
+        '<?xml:namespace prefix = "o" ns = "urn:schemas-microsoft-com:office:office" />'
+    )
+    html = f"<html><body><p>Hi{pi}<o:p></o:p></p></body></html>"
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None and quotable.rejection_reason is None
+    assert "<?xml:namespace prefix" in quotable.html_fragment
+    assert verify_quoted_html("<?php echo 1 ?><p>Hi</p>", ()) is not None
+
+
 def test_gate_rejects_unclosed_nested_and_unknown_declarations(
     tmp_path: Path,
 ) -> None:

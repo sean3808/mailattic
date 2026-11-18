@@ -25,6 +25,11 @@ byte-for-byte so Word VML details are not rewritten. ``cid:`` references in
 ``<a href>`` / ``<area href>`` are not required to resolve (if a matching part
 exists it is still attached, otherwise the link ships as written); every other
 ``cid:`` (images, VML, ``background``, ``style``, ``<style>``) must resolve.
+CSS (``style`` attributes and ``<style>`` text) is checked as a renderer reads
+it: comments removed and escapes decoded, so ``@\\69mport`` counts as
+``@import``. The ``<body>`` becomes a ``<div>`` that keeps its presentation
+(``style``, ``class``, ``lang``, ``dir``, ``bgcolor`` / ``text`` /
+``background`` as CSS, ``link`` / ``vlink`` / ``alink`` as scoped rules).
 After sanitising and attaching ``cid:`` parts, :func:`verify_quoted_html`
 re-parses the final HTML string written into the draft, rebuilds the render
 view, and fails closed to stored text if any active content, unattached
@@ -36,6 +41,7 @@ from __future__ import annotations
 
 import html
 import re
+import urllib.parse
 from collections.abc import Iterable
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -43,7 +49,7 @@ from email.parser import BytesParser
 from html.parser import HTMLParser
 from typing import Literal
 
-from bs4 import BeautifulSoup, CData, Comment, Declaration, ProcessingInstruction
+from bs4 import BeautifulSoup, CData, Comment, Declaration, ProcessingInstruction, Tag
 
 from .parser import _MAIL_POLICY, _detect_and_decode, _without_lone_surrogates
 
@@ -154,6 +160,45 @@ _ACTIVE_STYLE = re.compile(
     r"expression\s*\(|(?:javascript|vbscript)\s*:|@import\b", re.IGNORECASE
 )
 _CID_REFERENCE = re.compile(r"cid:([^\"'\s)>]+)", re.IGNORECASE)
+_CSS_COMMENT = re.compile(r"/\*.*?(?:\*/|$)", re.DOTALL)
+_CSS_HEX_ESCAPE = re.compile(r"\\([0-9a-fA-F]{1,6})[ \t\r\n\f]?")
+_CSS_LINE_CONTINUATION = re.compile(r"\\(?:\r\n|[\n\r\f])")
+_CSS_CHAR_ESCAPE = re.compile(r"\\(.)", re.DOTALL)
+# Body attributes that are presentational: carried onto the quote's wrapper.
+_BODY_COLOR = re.compile(r"^#?[0-9A-Za-z]{1,32}$")
+_BODY_COLOR_STYLE = {"bgcolor": "background-color", "text": "color"}
+_BODY_LINK_RULE = {"link": "a:link", "vlink": "a:visited", "alink": "a:active"}
+_BODY_KEPT_ATTRIBUTES = ("class", "lang", "dir")
+_QUOTE_BODY_CLASS = "mailattic-quoted-body"
+# URL characters left as-is inside url("..."); quotes, parentheses, backslash
+# and whitespace are percent-encoded so the value cannot end the CSS string.
+_URL_SAFE = ":/?#[]@!$&*+,;=%~-._"
+
+
+def _css_normalised(text: str) -> str:
+    """CSS text as a CSS parser reads it: comments removed, escapes decoded.
+
+    ``@\\69mport`` and ``e\\78pression(`` are ``@import`` and ``expression(`` to
+    a renderer, so active-content and ``cid:`` checks run on this form.
+    """
+
+    def hex_char(match: re.Match[str]) -> str:
+        code = int(match.group(1), 16)
+        return chr(code) if 0 < code <= 0x10FFFF else "\ufffd"
+
+    text = _CSS_COMMENT.sub("", text)
+    text = _CSS_LINE_CONTINUATION.sub("", text)
+    text = _CSS_HEX_ESCAPE.sub(hex_char, text)
+    return _CSS_CHAR_ESCAPE.sub(lambda match: match.group(1), text)
+
+
+def _css_is_active(text: str) -> bool:
+    return bool(_ACTIVE_STYLE.search(_css_normalised(text)))
+
+
+def _css_cids(text: str) -> set[str]:
+    return set(_CID_REFERENCE.findall(_css_normalised(text)))
+
 
 _HIDDEN_COND_RE = re.compile(
     r"^(\[if\b[^\]]*\]>)(.*)(<!\[endif\])$", re.DOTALL | re.IGNORECASE
@@ -164,6 +209,7 @@ _HYBRID_OPEN_RE = re.compile(r"^\s*\[if\b[^\]]*\]>\s*<!(?:--\s*)?$", re.IGNORECA
 _HYBRID_CLOSE_RE = re.compile(r"^\s*<!\[endif\]\s*$", re.IGNORECASE)
 _COND_MARKER_RE = re.compile(r"^\s*\[if\b|<!\[endif\]|\[endif\]", re.IGNORECASE)
 _NESTED_COND_RE = re.compile(r"\[if\b|<!\[endif\]|\[endif\]", re.IGNORECASE)
+_XML_NAMESPACE_PI = re.compile(r"xml:namespace\s[^<>]*\Z", re.IGNORECASE)
 _REVEALED_DECL_PREFIX_RE = re.compile(r"<!\[(?:if\b|endif\])", re.IGNORECASE)
 
 
@@ -206,6 +252,10 @@ def _is_conditional_comment_node(node: Comment) -> bool:
 
 
 def _reject_unsupported_node(node: object) -> None:
+    # Outlook's quoted history carries `<?xml:namespace prefix="o" ns="..." />`:
+    # an inert namespace declaration, kept as written. Any other PI is unknown.
+    if isinstance(node, ProcessingInstruction) and _XML_NAMESPACE_PI.match(node):
+        return
     if isinstance(node, (CData, Declaration, ProcessingInstruction)):
         raise _UnclassifiableHtml(f"unsupported {type(node).__name__.lower()}")
 
@@ -350,13 +400,16 @@ def _inspect_soup(
                 changed = True
             else:
                 cids = _extract_cids_from_attr(value)
+                if attr_name == "style":
+                    for text in _attr_strings(value):
+                        cids |= _css_cids(text)
                 if _is_link_href(tag_name, attr_name):
                     optional_cids.update(cids)
                 else:
                     required_cids.update(cids)
         if tag_name == "style":
             style_text = tag.get_text()
-            if _ACTIVE_STYLE.search(style_text):
+            if _css_is_active(style_text):
                 if not remove_active:
                     return (
                         changed,
@@ -367,7 +420,7 @@ def _inspect_soup(
                 tag.decompose()
                 changed = True
             elif style_text:
-                required_cids.update(_CID_REFERENCE.findall(style_text))
+                required_cids.update(_css_cids(style_text))
     return changed, required_cids, optional_cids, None
 
 
@@ -413,17 +466,56 @@ def _sanitised_fragment(source_html: str) -> tuple[str, set[str], set[str]]:
         and node.find_parent("body") is None
         and node.find_parent("style") is None
     )
-    body_style = body.get("style")
-    style_attr = (
-        f' style="{html.escape(body_style, quote=True)}"'
-        if isinstance(body_style, str)
-        else ""
-    )
+    link_rules, wrapper_attrs = _body_wrapper(body)
     return (
-        f"{styles}<div{style_attr}>{body.decode_contents()}</div>",
+        f"{styles}{link_rules}<div{wrapper_attrs}>{body.decode_contents()}</div>",
         required_cids,
         optional_cids,
     )
+
+
+def _body_wrapper(body: Tag) -> tuple[str, str]:
+    """The ``<body>``'s presentation, carried onto the quote's ``<div>`` (#136).
+
+    ``style``, ``class``, ``lang`` and ``dir`` are copied; ``bgcolor`` / ``text``
+    / ``background`` become the equivalent CSS; ``link`` / ``vlink`` /
+    ``alink`` become link-colour rules scoped to the quote. Values that are not
+    plain colours are dropped rather than written into CSS. Other body
+    attributes (margins) are not carried.
+    """
+    declarations: list[str] = []
+    for name, prop in _BODY_COLOR_STYLE.items():
+        value = body.get(name)
+        if isinstance(value, str) and _BODY_COLOR.match(value.strip()):
+            declarations.append(f"{prop}:{value.strip()}")
+    background = body.get("background")
+    if isinstance(background, str) and background.strip():
+        url = urllib.parse.quote(background.strip(), safe=_URL_SAFE)
+        declarations.append(f'background-image:url("{url}")')
+    body_style = body.get("style")
+    if isinstance(body_style, str) and body_style.strip():
+        declarations.append(body_style.strip())
+    rules = [
+        f".{_QUOTE_BODY_CLASS} {selector}{{color:{value.strip()}}}"
+        for name, selector in _BODY_LINK_RULE.items()
+        if isinstance(value := body.get(name), str) and _BODY_COLOR.match(value.strip())
+    ]
+    classes = [_QUOTE_BODY_CLASS] if rules else []
+    attrs: list[str] = []
+    for name in _BODY_KEPT_ATTRIBUTES:
+        value = body.get(name)
+        if name == "class":
+            classes = [*_attr_strings(value), *classes]
+            continue
+        if isinstance(value, str):
+            attrs.append(f' {name}="{html.escape(value, quote=True)}"')
+    if classes:
+        attrs.insert(0, f' class="{html.escape(" ".join(classes), quote=True)}"')
+    if declarations:
+        style = ";".join(declarations)
+        attrs.append(f' style="{html.escape(style, quote=True)}"')
+    link_rules = f"<style>{' '.join(rules)}</style>" if rules else ""
+    return link_rules, "".join(attrs)
 
 
 def verify_quoted_html(html_text: str, attached_cids: Iterable[str]) -> str | None:
@@ -487,7 +579,7 @@ def _is_active_attribute(name: str, value: object) -> bool:
             return True
         if name in _LINK_ATTRIBUTES and _DATA_URL.match(text):
             return True
-        if name == "style" and _ACTIVE_STYLE.search(text):
+        if name == "style" and _css_is_active(text):
             return True
     return False
 

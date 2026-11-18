@@ -18,7 +18,7 @@ title: 回信引用改用即時取回的原信 HTML，信庫仍不存 HTML
 回信的 HTML 引用**原信本身的 HTML**，原信在擬稿當下取回，不存進信庫：
 
 1. 用寄件設定裡的 IMAP 帳號（與寄出後 APPEND 到寄件備份同一個帳號與連線方式），以匯出原信同一套查找與 Message-ID 驗證取回原信 RFC822。唯讀 SELECT、`BODY.PEEK[]`，不改信件旗標。
-2. 取原信 HTML 本文（解碼沿用入庫的字元集救援），只去掉主動內容：script、frame、embed／object、表單與其控制項、`<meta>`（含 refresh 轉址）、`<base>`、`<link>`、`on*` 事件屬性、任何屬性值裡的 `javascript:`／`vbscript:` 網址、連結開 `data:` 文件、style 屬性與 `<style>` 內文的 `expression(`／script URL／`@import`。樣式、遠端圖片、連結、Outlook 條件註解照原樣保留。`<head>` 的 `<style>` 與條件註解依原順序跟著引用走。
+2. 取原信 HTML 本文（解碼沿用入庫的字元集救援），只去掉主動內容：script、frame、embed／object、表單與其控制項、`<meta>`（含 refresh 轉址）、`<base>`、`<link>`、`on*` 事件屬性、任何屬性值裡的 `javascript:`／`vbscript:` 網址、連結開 `data:` 文件、style 屬性與 `<style>` 內文的 `expression(`／script URL／`@import`（CSS 先照渲染器的讀法去掉註解、解開跳脫字元再判斷，`@\69mport` 一樣算 `@import`）。樣式、遠端圖片、連結、Outlook 條件註解照原樣保留。`<head>` 的 `<style>` 與條件註解依原順序跟著引用走。`<body>` 換成 `<div>` 時保留它的呈現：`style`、`class`、`lang`、`dir` 照搬，`bgcolor`／`text`／`background` 轉成對應的 CSS，`link`／`vlink`／`alink` 轉成只作用在引用區塊的連結顏色規則；不是單純顏色值的就不帶。
    - **渲染視圖與遞迴清理**：清理器、屬性／`<style>` `cid:` 收集器、以及後置檢查共用同一份「渲染視圖」定義：live markup，加上每個 downlevel-hidden 條件註解（`<!--[if …]>…<![endif]-->`）內文遞迴當成子文件處理後包回原定界符，加上 downlevel-revealed `<![if …]>…<![endif]>` 區段與混合式條件註解（`<!--[if …]><!-->…<!--<![endif]-->` 及 `<!-- -->` 變體，視為配對的 revealed-section 標記，標記本身原樣保留）。普通註解（非 `[if` 開頭）不屬於渲染視圖，不清理也不收 `cid:`。條件註解內文若無主動內容則原樣保留不重新序列化，避免改寫 Word 的 VML 細節。
    - **Fail-closed 後置檢查**：寫入草稿的最終 HTML 字串會重新 parse、建立渲染視圖並斷言：(a) 無任何主動內容，(b) 渲染視圖中每個必填 `cid:` 都對到草稿實際附上的 image part（`<a href>`／`<area href>` 裡的 `cid:` 屬連結而非圖片，不強制解析，原信有附該 part 時照樣附上、沒有時保留原連結；其餘 `src`／`background`／VML／`style`／`<style>` 的 `cid:` 仍須全部解析）；任何違規或無法分類的結構（未閉合或巢狀條件註解、未知 `<!` 宣告）整段退回信庫純文字並給出原因。
 3. 被引用的 `cid:` 內嵌圖以 `multipart/related` 跟 HTML 放在一起，不進附件清單。
