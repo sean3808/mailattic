@@ -1241,17 +1241,7 @@ def test_release_stops_before_reinstall_on_any_nonzero_launcher_exit(
     _git(repo, "commit", "-m", "stub canonical pytest launcher exit code")
     _git(repo, "push", "origin", "main")
 
-    gh_not_found = """
-function gh {
-    if ($args[0] -eq 'repo') {
-        '{"nameWithOwner":"example/mailattic"}'
-        $global:LASTEXITCODE = 0
-        return
-    }
-    '[{"workflow_runs":[]}]'
-    $global:LASTEXITCODE = 0
-}
-"""
+    gh_not_found = _fake_gh_hosted_full_script(runs=[], jobs_by_run={})
     result = _run_release_driver(
         tmp_path, repo, extra_script=gh_not_found, override_tests=False
     )
@@ -1604,3 +1594,65 @@ def test_release_stops_when_targeted_recipient_rebuild_tests_fail(tmp_path: Path
         _git(repo, "ls-remote", remote.as_posix(), f"refs/tags/{tag}").stdout.strip()
         == ""
     )
+
+
+def test_get_hosted_full_run_status_picks_latest_run_and_latest_attempt(tmp_path: Path):
+    repo, _ = _make_release_repo(tmp_path)
+    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    newer_url = "https://github.com/example/mailattic/actions/runs/1002"
+    gh_stub = _fake_gh_hosted_full_script(
+        runs=[
+            {
+                "id": 1001,
+                "head_sha": commit,
+                "status": "completed",
+                "conclusion": "failure",
+                "html_url": "https://github.com/example/mailattic/actions/runs/1001",
+            },
+            {
+                "id": 1002,
+                "head_sha": commit,
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": newer_url,
+            },
+        ],
+        jobs_by_run={
+            1001: [
+                {
+                    "id": 2001,
+                    "run_attempt": 1,
+                    "name": "hosted-full",
+                    "status": "completed",
+                    "conclusion": "failure",
+                }
+            ],
+            1002: [
+                {
+                    "id": 2002,
+                    "run_attempt": 1,
+                    "name": "hosted-full",
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+                {
+                    "id": 2003,
+                    "run_attempt": 2,
+                    "name": "hosted-full",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+            ],
+        },
+    )
+
+    result = _run_release_function(
+        f"{gh_stub}\n"
+        f"$s = Get-HostedFullRunStatus -RepoRoot {ps_quote(repo)} "
+        f"-Commit {ps_quote(commit)}\n"
+        'Write-Output "$($s.State)|$($s.RunUrl)"'
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"success|{newer_url}"
+    assert "filter=latest" in RELEASE_SCRIPT.read_text(encoding="utf-8")

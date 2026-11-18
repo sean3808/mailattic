@@ -414,11 +414,14 @@ function Invoke-GhJson {
         Pop-Location
     }
 
+    $text = (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine).Trim()
     if ($exitCode -ne 0) {
+        [Console]::Error.WriteLine(
+            "[release] WARNING: gh $($Arguments[0]) failed (exit $exitCode): $text"
+        )
         return $null
     }
 
-    $text = (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine).Trim()
     if (-not $text) {
         return $null
     }
@@ -426,8 +429,37 @@ function Invoke-GhJson {
     try {
         return ($text | ConvertFrom-Json)
     } catch {
+        [Console]::Error.WriteLine(
+            "[release] WARNING: gh $($Arguments[0]) returned invalid JSON."
+        )
         return $null
     }
+}
+
+function ConvertTo-HostedFullStatus {
+    param(
+        [string]$Status,
+        [string]$Conclusion,
+        [string]$RunUrl,
+        [bool]$AllowSuccess = $false
+    )
+
+    if ($Status -eq 'completed') {
+        if ($AllowSuccess -and $Conclusion -eq 'success') {
+            return [pscustomobject]@{ State = 'success'; RunUrl = $RunUrl }
+        }
+        if ($Conclusion -in @('failure', 'cancelled', 'timed_out', 'action_required')) {
+            return [pscustomobject]@{ State = $Conclusion; RunUrl = $RunUrl }
+        }
+        return $null
+    }
+    if ($Status -eq 'in_progress') {
+        return [pscustomobject]@{ State = 'in progress'; RunUrl = $RunUrl }
+    }
+    if ($Status -in @('queued', 'waiting', 'requested', 'pending')) {
+        return [pscustomobject]@{ State = 'queued'; RunUrl = $RunUrl }
+    }
+    return $null
 }
 
 function Get-HostedFullRunStatus {
@@ -437,21 +469,16 @@ function Get-HostedFullRunStatus {
         [string]$Commit
     )
 
+    $notFound = [pscustomobject]@{ State = 'not found'; RunUrl = $null }
     if (-not $Commit) {
-        return [pscustomobject]@{
-            State = 'not found'
-            RunUrl = $null
-        }
+        return $notFound
     }
 
     $repoInfo = Invoke-GhJson -RepoRoot $RepoRoot -Arguments @(
         'repo', 'view', '--json', 'nameWithOwner'
     )
     if (-not $repoInfo -or -not $repoInfo.nameWithOwner) {
-        return [pscustomobject]@{
-            State = 'not found'
-            RunUrl = $null
-        }
+        return $notFound
     }
     $repoName = $repoInfo.nameWithOwner
 
@@ -460,10 +487,7 @@ function Get-HostedFullRunStatus {
         "repos/$repoName/actions/workflows/ci.yml/runs?head_sha=$Commit&per_page=100"
     )
     if (-not $runsPages) {
-        return [pscustomobject]@{
-            State = 'not found'
-            RunUrl = $null
-        }
+        return $notFound
     }
 
     $runs = @(
@@ -478,7 +502,7 @@ function Get-HostedFullRunStatus {
         $runUrl = $run.html_url
         $jobPages = Invoke-GhJson -RepoRoot $RepoRoot -Arguments @(
             'api', '--paginate', '--slurp',
-            "repos/$repoName/actions/runs/$($run.id)/jobs?per_page=100&filter=all"
+            "repos/$repoName/actions/runs/$($run.id)/jobs?per_page=100&filter=latest"
         )
 
         $hostedFullJob = $null
@@ -489,63 +513,32 @@ function Get-HostedFullRunStatus {
                         $jobPage.jobs | Where-Object { $_.name -eq 'hosted-full' }
                     }
                 }
-            ) | Select-Object -First 1
+            ) | Sort-Object -Property run_attempt, id -Descending | Select-Object -First 1
         }
 
         if ($hostedFullJob) {
-            $jobStatus = $hostedFullJob.status
-            $jobConclusion = $hostedFullJob.conclusion
-            if ($jobStatus -eq 'completed') {
-                if ($jobConclusion -eq 'success') {
-                    return [pscustomobject]@{
-                        State = 'success'
-                        RunUrl = $runUrl
-                    }
-                }
-                if ($jobConclusion -in @('failure', 'cancelled', 'timed_out', 'action_required')) {
-                    return [pscustomobject]@{
-                        State = $jobConclusion
-                        RunUrl = $runUrl
-                    }
-                }
-                continue
+            $mapped = ConvertTo-HostedFullStatus `
+                -Status $hostedFullJob.status `
+                -Conclusion $hostedFullJob.conclusion `
+                -RunUrl $runUrl `
+                -AllowSuccess $true
+            if ($mapped) {
+                return $mapped
             }
-            if ($jobStatus -eq 'in_progress') {
-                return [pscustomobject]@{
-                    State = 'in progress'
-                    RunUrl = $runUrl
-                }
-            }
-            return [pscustomobject]@{
-                State = 'queued'
-                RunUrl = $runUrl
-            }
+            continue
         }
 
-        if ($run.status -eq 'in_progress') {
-            return [pscustomobject]@{
-                State = 'in progress'
-                RunUrl = $runUrl
-            }
-        }
-        if ($run.status -in @('queued', 'waiting', 'requested', 'pending')) {
-            return [pscustomobject]@{
-                State = 'queued'
-                RunUrl = $runUrl
-            }
-        }
-        if ($run.status -eq 'completed' -and $run.conclusion -in @('failure', 'cancelled', 'timed_out', 'action_required')) {
-            return [pscustomobject]@{
-                State = $run.conclusion
-                RunUrl = $runUrl
-            }
+        $runMapped = ConvertTo-HostedFullStatus `
+            -Status $run.status `
+            -Conclusion $run.conclusion `
+            -RunUrl $runUrl `
+            -AllowSuccess $false
+        if ($runMapped) {
+            return $runMapped
         }
     }
 
-    return [pscustomobject]@{
-        State = 'not found'
-        RunUrl = $null
-    }
+    return $notFound
 }
 
 function Invoke-ReleaseTests {
