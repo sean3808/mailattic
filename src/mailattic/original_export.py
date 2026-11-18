@@ -10,6 +10,7 @@ Issue #53, D-20261105-1, GLOSSARY.md:
 
 from __future__ import annotations
 
+import contextlib
 import imaplib
 import re
 import sqlite3
@@ -28,7 +29,11 @@ from .export_files import (
     truncate_export_filename,
 )
 from .mutf7 import encode_mutf7
-from .outbound import SENT_FOLDER_DISPLAY_NAME
+from .outbound import (
+    SENT_FOLDER_DISPLAY_NAME,
+    missing_imap_send_keys,
+    send_settings_imap_client,
+)
 from .outlook_pst import (
     PR_INTERNET_MESSAGE_ID,
     PR_SENDER_SMTP_ADDRESS,
@@ -45,6 +50,7 @@ from .query import (
     normalize_message_id,
     select_rows_by_message_id,
 )
+from .reply_quote import OriginalUnavailable
 
 
 @dataclass(frozen=True)
@@ -1434,6 +1440,67 @@ def _load_stored_message(
             ),
         )
     return get_message(database_path, int(rows[0]["id"]), read_only=True)
+
+
+def imap_original_fetcher(
+    env: Mapping[str, str],
+    *,
+    client_factory: Callable[[Mapping[str, str]], Any] | None = None,
+) -> Callable[[Mapping[str, object]], bytes]:
+    """A reply draft's way to fetch the original it quotes (#136).
+
+    Uses the IMAP account in the send settings and the same verified lookup as
+    original export. Every reason the original is not available is raised as
+    :class:`OriginalUnavailable`, so the draft falls back to the stored text and
+    reports why. PST anchors are not fetched: Outlook does not yield RFC822.
+    """
+    factory = client_factory or send_settings_imap_client
+
+    def fetch(message: Mapping[str, object]) -> bytes:
+        source = classify_message_source(message)
+        if source == "pst":
+            raise OriginalUnavailable(
+                "the original came from a PST; quoting the stored text",
+                category="permanent",
+            )
+        if source != "imap":
+            raise OriginalUnavailable(
+                "the original's source cannot be fetched; quoting the stored text",
+                category="permanent",
+            )
+        missing = missing_imap_send_keys(env)
+        if missing:
+            raise OriginalUnavailable(
+                f"send settings have no IMAP account ({', '.join(missing)} missing)",
+                category="settings",
+            )
+        try:
+            client = factory(env)
+        except Exception as exc:  # noqa: BLE001 -- any connect failure falls back
+            raise OriginalUnavailable(
+                f"IMAP server connection failed: {exc}",
+                category="temporary",
+            ) from exc
+        try:
+            rfc822, err = _find_imap_rfc822(client, message)
+        except Exception as exc:  # noqa: BLE001 -- any lookup failure falls back
+            raise OriginalUnavailable(
+                f"IMAP lookup failed: {exc}",
+                category="temporary",
+            ) from exc
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+        if err is not None:
+            raise OriginalUnavailable(err, category="temporary")
+        if rfc822 is None:
+            raise OriginalUnavailable(
+                "Original message not found on IMAP server.",
+                category="permanent",
+            )
+        return rfc822
+
+    return fetch
 
 
 def export_original_message(

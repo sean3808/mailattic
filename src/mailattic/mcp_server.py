@@ -220,8 +220,20 @@ _MAIL_DRAFT_REPLY_DESCRIPTION = (
     "(e.g. '<abc@example.com>') from mail_show, not the numeric id from "
     "mail_search. Returns its draft_id, content fingerprint "
     "(SHA-256), and full draft text for review. The draft is NOT sent. Present "
-    "the complete draft (Subject, To, Cc, Bcc, body, attachments, draft_id, and "
-    "fingerprint) to the user for conversational review before calling mail_send."
+    "the complete draft (Subject, To, Cc, Bcc, body, attachments, draft_id, "
+    "fingerprint, and the quote fields below) to the user for conversational "
+    "review before calling mail_send. Quote fields: quote_source='original' "
+    "means the HTML part quotes the customer's original as sent, with its "
+    "images and tables (quote_note and quote_notice are null). The plain-text "
+    "part (body_text) always quotes the original's stored text, without its "
+    "images or table layout; so say that the HTML part quotes the customer's "
+    "original as they sent it. quote_source='stored_text' means the HTML quote "
+    "is the stored text too: give quote_note as the reason and quote_notice in "
+    "full as its own line (you may translate it into the user's language, but "
+    "do not shorten or reinterpret it). quote_notice is addressed to the user; "
+    "whether to regenerate the draft is the user's decision. When several "
+    "drafts are reviewed together, give each stored_text "
+    "draft's quote_note and quote_notice on their own lines under its draft_id."
 )
 _MAIL_DRAFT_NEW_DESCRIPTION = (
     "Generate a new-thread draft email and write it to the MCP-dedicated "
@@ -2596,6 +2608,12 @@ def create_server(
                 "bcc": result.bcc,
                 "body_text": body,
                 "attachments": attachments_payload,
+                # #136: whether the HTML quotes the original as sent, and if
+                # not, why and what it means for the customer; body_text is
+                # always the plain-text alternative.
+                "quote_source": result.quote_source,
+                "quote_note": result.quote_note,
+                "quote_notice": result.quote_notice,
             }
 
         states = _draft_ladder_states(result.body_text, _make_payload)

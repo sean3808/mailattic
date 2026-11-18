@@ -40,6 +40,7 @@ from .imap_runtime import load_env_file
 from .original_export import (
     OriginalExportResult,
     export_original_message,
+    imap_original_fetcher,
 )
 from .outbound import (
     ENV_VAR_SMTP_ENV_FILE,
@@ -330,6 +331,7 @@ class MailWriter:
             attachments=attachments,
             read_only=True,
             font_style=reply_font_style(env),
+            fetch_original=imap_original_fetcher(env),
         )
 
     def draft_new(

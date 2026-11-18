@@ -74,6 +74,13 @@ from .query import (
     render_text,
     select_rows_by_message_id,
 )
+from .reply_quote import (
+    OriginalUnavailable,
+    QuotableOriginal,
+    quotable_original_from_rfc822,
+    quote_notice_for_category,
+    verify_quoted_html,
+)
 from .storage import connect_database, persist_message, record_ingest_failure
 
 __all__ = [
@@ -639,6 +646,7 @@ def build_quoted_reply_bodies(
     reply_text: str,
     *,
     font_style: str = "",
+    quotable: QuotableOriginal | None = None,
 ) -> tuple[str, str]:
     """Build plain-text and HTML quoted-reply bodies from an original message dict.
 
@@ -649,6 +657,9 @@ def build_quoted_reply_bodies(
     is omitted entirely when the original has no CC recipients.
     A non-empty ``font_style`` (from :func:`reply_font_style`) wraps the whole
     HTML body, reply and quoted block alike, in one styled ``div``.
+    With ``quotable`` (the fetched original, #136) the HTML quotes the
+    original's own HTML instead of the stored text, and the font wraps only the
+    reply and the header block. The plain-text body always quotes stored text.
     """
     sender_name = original.get("sender_name")
     sender_email = str(original.get("sender_email") or "")
@@ -704,7 +715,7 @@ def build_quoted_reply_bodies(
 
     # HTML body: escaped reply + quoted block div with <hr> separator and <b> labels
     cc_row = f"<b>Cc:</b> {_esc(cc_val)}<br>\n" if cc_val else ""
-    html_body = (
+    header_html = (
         _authored_text_to_html(reply_text)
         + "\n<div>\n<hr>\n"
         + f"<b>From:</b> {_esc(from_val)}<br>\n"
@@ -713,9 +724,19 @@ def build_quoted_reply_bodies(
         + cc_row
         + f"<b>Subject:</b> {_esc(subject_val)}<br>\n"
         + "<br>\n"
-        + _esc(body_text_val)
-        + "\n</div>"
     )
+    if quotable is not None:
+        # #136: the original's own HTML, as the customer sent it. The font
+        # applies to the reply and header only: restyling the quote would make
+        # the customer's message look unlike what they wrote.
+        reply_and_header = header_html + "</div>"
+        if font_style:
+            reply_and_header = (
+                f'<div style="{font_style}">\n{reply_and_header}\n</div><!-- reply -->'
+            )
+        return plain_body, reply_and_header + "\n" + quotable.html_fragment
+
+    html_body = header_html + _esc(body_text_val) + "\n</div>"
     if font_style:
         html_body = f'<div style="{font_style}">\n{html_body}\n</div>'
 
@@ -1021,9 +1042,81 @@ class DraftReplyResult:
     body_text: str = ""
     attachment_sources: tuple[tuple[str, str, int], ...] = ()
     recipient_checks: tuple[RecipientFamiliarity, ...] = ()
+    # Reply drafts only (#136): "original" when the HTML quotes the fetched
+    # original, "stored_text" otherwise, with ``quote_note`` saying why and
+    # ``quote_notice`` stating the user-facing impact.
+    quote_source: str | None = None
+    quote_note: str | None = None
+    quote_notice: str | None = None
 
 
 DraftNewResult = DraftReplyResult
+
+OriginalFetcher = Callable[[Mapping[str, object]], bytes]
+"""Return the original's RFC822 bytes, or raise :class:`OriginalUnavailable`."""
+
+
+@dataclass(frozen=True, slots=True)
+class _QuoteResolution:
+    quotable: QuotableOriginal | None
+    quote_note: str | None = None
+    quote_notice: str | None = None
+
+
+def _resolve_quotable_original(
+    original: Mapping[str, object], fetch_original: OriginalFetcher | None
+) -> _QuoteResolution:
+    """The original to quote as HTML, or ``None`` with reason and notice."""
+    if fetch_original is None:
+        return _QuoteResolution(
+            None,
+            "original fetch not configured",
+            quote_notice_for_category("settings"),
+        )
+    try:
+        rfc822 = fetch_original(original)
+    except OriginalUnavailable as exc:
+        return _QuoteResolution(None, str(exc), quote_notice_for_category(exc.category))
+    quotable = quotable_original_from_rfc822(rfc822)
+    if quotable is None:
+        return _QuoteResolution(
+            None,
+            "original has no HTML body",
+            quote_notice_for_category("no_html"),
+        )
+    if quotable.rejection_reason is not None:
+        return _QuoteResolution(
+            None,
+            quotable.rejection_reason,
+            quote_notice_for_category("unquotable"),
+        )
+    if quotable.unresolved_cids:
+        # A broken image in the customer's own message is the look #136 removes.
+        return _QuoteResolution(
+            None,
+            "original references inline images missing from the message: "
+            + ", ".join(quotable.unresolved_cids),
+            quote_notice_for_category("unquotable"),
+        )
+    return _QuoteResolution(quotable)
+
+
+def _add_inline_parts(msg: EmailMessage, quotable: QuotableOriginal | None) -> None:
+    """Carry the quoted original's ``cid:`` images next to the HTML (#136)."""
+    if quotable is None or not quotable.inline_parts:
+        return
+    html_part = msg.get_body(preferencelist=("html",))
+    if not isinstance(html_part, EmailMessage):
+        raise RuntimeError("draft has no HTML part to relate inline images to")
+    for part in quotable.inline_parts:
+        html_part.add_related(
+            part.payload,
+            part.maintype,
+            part.subtype,
+            cid=f"<{part.content_id}>",
+            disposition="inline",
+            filename=part.filename,
+        )
 
 
 def _validate_custom_subject(subject: str) -> None:
@@ -1148,6 +1241,7 @@ def assemble_draft_reply(
     read_only: bool = False,
     subject: str | None = None,
     font_style: str = "",
+    fetch_original: OriginalFetcher | None = None,
 ) -> DraftReplyResult:
     """Build a reply draft to ``message_id`` and write ``<draft_dir>/<draft_id>.eml``.
 
@@ -1159,6 +1253,9 @@ def assemble_draft_reply(
     ``subject`` replaces the default "Re: <original subject>" verbatim (no
     prefix added); threading headers still come from the anchor.
     ``font_style`` styles the HTML body (see :func:`build_quoted_reply_bodies`).
+    ``fetch_original`` retrieves the original so the HTML quotes it as sent
+    (#136); without it, or when it is unavailable, the quote is the stored text
+    and ``quote_note`` on the result says why.
     Expected refusals (bad recipients, unknown or archive-scraped anchor,
     unreadable body or attachment) raise ``DraftReplyError``; anything else,
     such as a failed draft write, propagates unwrapped.
@@ -1246,11 +1343,30 @@ def assemble_draft_reply(
     msg["References"] = thread_headers["references"]
     msg["Subject"] = thread_headers["subject"] if subject is None else subject
     msg["Date"] = formatdate(localtime=True)
+    resolution = _resolve_quotable_original(original, fetch_original)
+    quotable = resolution.quotable
+    quote_note = resolution.quote_note
+    quote_notice = resolution.quote_notice
     plain_body, html_body = build_quoted_reply_bodies(
-        original, body_text, font_style=font_style
+        original, body_text, font_style=font_style, quotable=quotable
     )
+    if quotable is not None:
+        attached_cids = {
+            part.content_id
+            for part in quotable.inline_parts
+            if part.maintype == "image"
+        }
+        gate_error = verify_quoted_html(html_body, attached_cids)
+        if gate_error is not None:
+            quotable = None
+            quote_note = gate_error
+            quote_notice = quote_notice_for_category("unquotable")
+            plain_body, html_body = build_quoted_reply_bodies(
+                original, body_text, font_style=font_style, quotable=None
+            )
     msg.set_content(plain_body, charset="utf-8")
     msg.add_alternative(html_body, subtype="html", charset="utf-8")
+    _add_inline_parts(msg, quotable)
 
     attachment_payloads = _attach_files(msg, attachments, error_cls=DraftReplyError)
     draft_path, draft_bytes = _write_draft_eml(
@@ -1282,6 +1398,9 @@ def assemble_draft_reply(
             for path, data in attachment_payloads
         ),
         recipient_checks=recipient_checks,
+        quote_source="original" if quotable is not None else "stored_text",
+        quote_note=quote_note,
+        quote_notice=quote_notice,
     )
 
 
@@ -1646,6 +1765,25 @@ def _refusal_list(refused: object) -> list[dict[str, Any]]:
     ]
 
 
+def missing_imap_send_keys(env: Mapping[str, str]) -> list[str]:
+    """IMAP keys the send settings lack for reaching the sending mailbox."""
+    return [key for key in _REQUIRED_IMAP_APPEND_KEYS if not env.get(key, "").strip()]
+
+
+def send_settings_imap_client(env: Mapping[str, str]) -> NativeImapClient:
+    """Connect to the sending mailbox with the IMAP account in the send settings.
+
+    Used by the Sent-folder APPEND and by reply drafts fetching the original
+    they quote (#136). IMAP_SECURITY is a sync-only exception: the send side
+    keeps implicit TLS unless a future outbound contract says otherwise. The
+    timeout bounds a server that accepts the connection but never responds.
+    """
+    return NativeImapClient(
+        {**env, "IMAP_SECURITY": "tls"},
+        timeout=_APPEND_IMAP_TIMEOUT_SECONDS,
+    )
+
+
 def _append_sent_copy(
     *,
     env: Mapping[str, str],
@@ -1677,9 +1815,7 @@ def _append_sent_copy(
     try:
         rfc822 = msg.as_bytes()
 
-        missing = [
-            key for key in _REQUIRED_IMAP_APPEND_KEYS if not env.get(key, "").strip()
-        ]
+        missing = missing_imap_send_keys(env)
         if missing:
             raise ValueError(
                 f"missing required IMAP configuration key(s): {', '.join(missing)}"
@@ -1693,14 +1829,7 @@ def _append_sent_copy(
                 "mail into a mailbox other than the one it was sent from"
             )
 
-        # IMAP_SECURITY is a sync-only exception. Sent-folder APPEND retains
-        # its existing implicit-TLS behavior unless separately specified by
-        # a future outbound contract.
-        append_env = {**env, "IMAP_SECURITY": "tls"}
-        client = NativeImapClient(
-            append_env,
-            timeout=_APPEND_IMAP_TIMEOUT_SECONDS,
-        )
+        client = send_settings_imap_client(env)
         try:
             client.append_message(_SENT_FOLDER_WIRE_NAME, rfc822)
         finally:
