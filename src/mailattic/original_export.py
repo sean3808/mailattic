@@ -82,6 +82,15 @@ def _is_outbound_message(message: Mapping[str, object]) -> bool:
     return input_mode == "outbound" or pst_source.startswith("outbound-")
 
 
+def _imap_first_folder(message: Mapping[str, object]) -> str:
+    """Folder to search first: the Sent folder for bes-sent mail (the post-send
+    APPEND target; its stored folder_path is a literal label, not a server
+    folder), otherwise the recorded folder."""
+    if _is_outbound_message(message):
+        return SENT_FOLDER_DISPLAY_NAME
+    return str(message.get("folder_path") or "INBOX").strip()
+
+
 def classify_message_source(
     message: Mapping[str, object],
 ) -> Literal["pst", "imap", "unsupported"]:
@@ -1284,12 +1293,7 @@ def _find_imap_rfc822(
     message: Mapping[str, object],
 ) -> tuple[bytes | None, str | None]:
     """Retrieve verified RFC822 bytes from IMAP server."""
-    is_outbound = _is_outbound_message(message)
-    folder_path = (
-        SENT_FOLDER_DISPLAY_NAME
-        if is_outbound
-        else str(message.get("folder_path") or "INBOX").strip()
-    )
+    folder_path = _imap_first_folder(message)
     try:
         wire_name = encode_mutf7(folder_path)
         client.select_folder(wire_name)
@@ -1299,31 +1303,30 @@ def _find_imap_rfc822(
     unreadable_count = 0
     db_msg_id = message.get("message_id")
 
-    # 1. Try UID from logical_locator (not applicable to outbound records,
-    # whose logical_locator is a draft/outbound id rather than an IMAP UID)
-    if not is_outbound:
-        locator = str(message.get("logical_locator") or "")
-        match = re.search(r"(?:^|[\W_])(?:uid-|U=)(\d+)", locator, re.IGNORECASE)
-        if match:
-            uid = int(match.group(1))
-            rfc822: bytes | None = None
+    # 1. Try UID from logical_locator (an outbound record's locator is
+    # `outbound:<uuid>`, which never matches, so this step is a no-op for it)
+    locator = str(message.get("logical_locator") or "")
+    match = re.search(r"(?:^|[\W_])(?:uid-|U=)(\d+)", locator, re.IGNORECASE)
+    if match:
+        uid = int(match.group(1))
+        rfc822: bytes | None = None
+        try:
+            rfc822 = client.fetch_rfc822(uid)
+        except (*_IMAP_CONNECTION_ERRORS, imaplib.IMAP4.error) as exc:
+            return None, f"IMAP error fetching UID {uid}: {exc}"
+        except Exception:
+            # A stale UID (moved/deleted) is resolved by Message-ID search below;
+            # only count it unreadable when there is no Message-ID fallback.
+            if not db_msg_id:
+                unreadable_count += 1
+        if rfc822:
             try:
-                rfc822 = client.fetch_rfc822(uid)
-            except (*_IMAP_CONNECTION_ERRORS, imaplib.IMAP4.error) as exc:
-                return None, f"IMAP error fetching UID {uid}: {exc}"
+                if _verify_imap_rfc822(rfc822, message):
+                    return rfc822, None
             except Exception:
-                # A stale UID (moved/deleted) is resolved by Message-ID search below;
-                # only count it unreadable when there is no Message-ID fallback.
-                if not db_msg_id:
-                    unreadable_count += 1
-            if rfc822:
-                try:
-                    if _verify_imap_rfc822(rfc822, message):
-                        return rfc822, None
-                except Exception:
-                    unreadable_count += 1
-            # An empty recorded-UID body is left to the Message-ID search below,
-            # as before #67; it is not counted unreadable here.
+                unreadable_count += 1
+        # An empty recorded-UID body is left to the Message-ID search below,
+        # as before #67; it is not counted unreadable here.
 
     # 2. Try Message-ID search in the recorded folder
     if not db_msg_id:

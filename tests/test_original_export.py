@@ -22,7 +22,13 @@ import pytest
 
 from mailattic import original_export
 from mailattic.imap_native import ImapFolder
-from mailattic.models import MaildirSource, PstSource, build_normalized_message
+from mailattic.models import (
+    MailboxParticipant,
+    MaildirSource,
+    NormalizedMessage,
+    PstSource,
+    build_normalized_message,
+)
 from mailattic.mutf7 import encode_mutf7
 from mailattic.original_export import (
     export_original_message,
@@ -985,45 +991,69 @@ def _seed_outbound_message(
     sender_name: str = "Sean",
     sender_email: str = "sean@mailattic.test",
     sent_at: str = "2026-05-01T10:00:00+08:00",
-    logical_locator: str = "outbound:draft-1",
 ) -> tuple[Path, int]:
+    # Same shape as outbound._normalized_from_draft writes after a send: the
+    # locator is `outbound:<uuid>` (never an IMAP UID) and folder_path is the
+    # literal label "Sent", not a server folder name.
+    msg = NormalizedMessage(
+        subject=subject,
+        sender=MailboxParticipant(display_name=sender_name, email=sender_email),
+        to_recipients=(
+            MailboxParticipant(display_name=None, email="client@example.com"),
+        ),
+        cc_recipients=(),
+        bcc_recipients=(),
+        sent_at=datetime.fromisoformat(sent_at),
+        received_at=datetime.fromisoformat(sent_at),
+        body_text="Outbound body",
+        attachments=(),
+        message_id=message_id,
+        in_reply_to=None,
+        references=None,
+        pst_source="outbound-bes",
+        folder_path="Sent",
+        logical_locator="outbound:3f2b8c1e-9d4a-4e7b-8a6f-1c2d3e4f5a6b",
+        source_input_mode="outbound",
+        source_requested_from="bes:send-draft",
+    )
     db_path = initialize_database(tmp_path / "test.db")
     conn = connect_database(db_path)
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO messages (
-                message_id, subject, sender_name, sender_email, sent_at,
-                pst_source, folder_path, logical_locator, dedup_key, source_input_mode
-            ) VALUES (
-                ?, ?, ?, ?, ?,
-                'outbound-bes', 'Sent',
-                ?, 'dedup-outbound-1', 'outbound'
-            )
-            """,
-            (message_id, subject, sender_name, sender_email, sent_at, logical_locator),
-        )
-        db_id = int(cur.lastrowid or 0)
+        db_id = persist_message(conn, msg).stored_message_id
         conn.commit()
     finally:
         conn.close()
     return db_path, db_id
 
 
+def _sent_folder_client(
+    rfc822_by_uid: dict[int, bytes],
+    uids_by_header: dict[str, list[int]],
+    *,
+    extra_folders: tuple[str, ...] = (),
+) -> FakeImapClient:
+    sent_wire = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
+    folders = [ImapFolder(sent_wire, SENT_FOLDER_DISPLAY_NAME, "/")]
+    folders += [ImapFolder(name, name, "/") for name in extra_folders]
+    return FakeImapClient(
+        FakeImapConnection(
+            rfc822_by_uid={},
+            folders=folders,
+            folder_rfc822_by_uid={
+                sent_wire: rfc822_by_uid,
+                **{name: {} for name in extra_folders},
+            },
+            folder_uids_by_header={
+                sent_wire: uids_by_header,
+                **{name: {} for name in extra_folders},
+            },
+        )
+    )
+
+
 def test_outbound_source_missing_from_imap_returns_not_found(tmp_path: Path) -> None:
     db_path, db_id = _seed_outbound_message(tmp_path)
-    sent_wire = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
-    fake_conn = FakeImapConnection(
-        rfc822_by_uid={},
-        folders=[
-            ImapFolder(sent_wire, SENT_FOLDER_DISPLAY_NAME, "/"),
-            ImapFolder("INBOX", "INBOX", "/"),
-        ],
-        folder_rfc822_by_uid={sent_wire: {}, "INBOX": {}},
-        folder_uids_by_header={sent_wire: {}, "INBOX": {}},
-    )
-    imap_client = FakeImapClient(fake_conn)
+    imap_client = _sent_folder_client({}, {}, extra_folders=("INBOX",))
 
     dest_dir = tmp_path / "exports"
     result = export_original_message(
@@ -1064,20 +1094,10 @@ def test_outbound_source_exports_from_sent_folder(tmp_path: Path) -> None:
         b"Different message.\r\n"
     )
 
-    sent_wire = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
-    fake_conn = FakeImapConnection(
-        rfc822_by_uid={},
-        folders=[
-            ImapFolder(sent_wire, SENT_FOLDER_DISPLAY_NAME, "/"),
-        ],
-        folder_rfc822_by_uid={
-            sent_wire: {101: expected_eml, 102: other_eml},
-        },
-        folder_uids_by_header={
-            sent_wire: {"outbound-sent-1@example.com": [101]},
-        },
+    imap_client = _sent_folder_client(
+        {101: expected_eml, 102: other_eml},
+        {"outbound-sent-1@example.com": [101]},
     )
-    imap_client = FakeImapClient(fake_conn)
 
     dest_dir = tmp_path / "exports"
     result = export_original_message(
@@ -1140,20 +1160,10 @@ def test_outbound_source_ambiguous_match_returns_failed(tmp_path: Path) -> None:
         "Copy 2.\r\n"
     ).encode()
 
-    sent_wire = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
-    fake_conn = FakeImapConnection(
-        rfc822_by_uid={},
-        folders=[
-            ImapFolder(sent_wire, SENT_FOLDER_DISPLAY_NAME, "/"),
-        ],
-        folder_rfc822_by_uid={
-            sent_wire: {201: dup_eml_1, 202: dup_eml_2},
-        },
-        folder_uids_by_header={
-            sent_wire: {"outbound-dup@example.com": [201, 202]},
-        },
+    imap_client = _sent_folder_client(
+        {201: dup_eml_1, 202: dup_eml_2},
+        {"outbound-dup@example.com": [201, 202]},
     )
-    imap_client = FakeImapClient(fake_conn)
 
     dest_dir = tmp_path / "exports"
     result = export_original_message(
