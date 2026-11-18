@@ -9,6 +9,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
 
+from .datetime_bounds import TAIPEI
+
 _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
@@ -162,17 +164,46 @@ class NormalizedMessage:
     def attachment_search_text(self) -> str:
         return " ".join(name for name in self.attachment_names if name)
 
+    def _fallback_sent_at_text(self) -> str:
+        """Canonical (#85): aware instants render in UTC; naive/None as before."""
+        sent_at = self.sent_at
+        if sent_at is None:
+            return ""
+        if sent_at.utcoffset() is None:
+            return sent_at.isoformat()
+        return sent_at.astimezone(UTC).isoformat()
+
+    def _fallback_key(self, sent_text: str) -> str:
+        fields = self._fallback_dedup_key_fields(sent_text)
+        fingerprint = sha256(
+            json.dumps(fields, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return f"fallback:{fingerprint}"
+
     @property
     def dedup_key(self) -> str:
         if self.message_id:
             return f"message-id:{self.message_id}"
+        return self._fallback_key(self._fallback_sent_at_text())
 
-        fingerprint = sha256(
-            json.dumps(self._fallback_dedup_key_fields(), sort_keys=True).encode(
-                "utf-8"
+    @property
+    def dedup_key_candidates(self) -> tuple[str, ...]:
+        """Keys a stored copy of this mail may carry: canonical first, then legacy.
+
+        Keys stored before #85 rendered ``sent_at`` with whatever offset the
+        import path gave it -- the mail's own offset, or Taipei for the PST
+        path. They are never rewritten, so duplicate lookups try them too.
+        """
+        sent_at = self.sent_at
+        if self.message_id or sent_at is None or sent_at.utcoffset() is None:
+            return (self.dedup_key,)
+        legacy = (
+            self._fallback_key(text)
+            for text in dict.fromkeys(
+                (sent_at.isoformat(), sent_at.astimezone(TAIPEI).isoformat())
             )
-        ).hexdigest()
-        return f"fallback:{fingerprint}"
+        )
+        return tuple(dict.fromkeys((self.dedup_key, *legacy)))
 
     @property
     def dedup_basis(self) -> str:
@@ -199,14 +230,15 @@ class NormalizedMessage:
                     "pst_source": self.pst_source,
                     "recipient_search_text": self.recipient_search_text,
                 },
-                "key_fields": self._fallback_dedup_key_fields(),
+                "key_fields": self._fallback_dedup_key_fields(
+                    self._fallback_sent_at_text()
+                ),
                 "method": "fallback",
             },
             sort_keys=True,
         )
 
-    def _fallback_dedup_key_fields(self) -> dict[str, str]:
-        sent_text = self.sent_at.isoformat() if self.sent_at else ""
+    def _fallback_dedup_key_fields(self, sent_text: str) -> dict[str, str]:
         return {
             "body_sha256": sha256(self.body_text.encode("utf-8")).hexdigest(),
             "sender": self.sender.search_text,

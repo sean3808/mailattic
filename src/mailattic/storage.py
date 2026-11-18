@@ -137,6 +137,26 @@ def initialize_database(database_path: str | Path) -> Path:
     return path
 
 
+def find_existing_message_id(
+    connection: sqlite3.Connection,
+    message: NormalizedMessage,
+) -> int | None:
+    """Return the stored id matching *message* by message_id or dedup_key_candidates."""
+    candidates = message.dedup_key_candidates
+    placeholders = ", ".join("?" for _ in candidates)
+    row = connection.execute(
+        f"""
+        SELECT id
+        FROM messages
+        WHERE (? IS NOT NULL AND message_id = ?)
+           OR dedup_key IN ({placeholders})
+        LIMIT 1
+        """,
+        [message.message_id, message.message_id, *candidates],
+    ).fetchone()
+    return int(row[0]) if row is not None else None
+
+
 def persist_message(
     connection: sqlite3.Connection,
     message: NormalizedMessage,
@@ -146,18 +166,8 @@ def persist_message(
     # busy_timeout here; no nested transaction management in this function.
     connection.execute("PRAGMA busy_timeout = 5000;")
 
-    existing_row = connection.execute(
-        """
-        SELECT id
-        FROM messages
-        WHERE (? IS NOT NULL AND message_id = ?)
-           OR dedup_key = ?
-        LIMIT 1
-        """,
-        [message.message_id, message.message_id, message.dedup_key],
-    ).fetchone()
-    if existing_row is not None:
-        stored_id = int(existing_row["id"])
+    stored_id = find_existing_message_id(connection, message)
+    if stored_id is not None:
         return PersistResult(
             inserted=False,
             stored_message_id=stored_id,
