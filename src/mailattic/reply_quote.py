@@ -122,7 +122,6 @@ class QuotableOriginal:
 class _ConditionalSubdoc:
     comment: Comment
     prefix: str
-    inner: str
     suffix: str
     soup: BeautifulSoup
 
@@ -168,7 +167,7 @@ _CSS_CHAR_ESCAPE = re.compile(r"\\(.)", re.DOTALL)
 _BODY_COLOR = re.compile(r"^#?[0-9A-Za-z]{1,32}$")
 _BODY_COLOR_STYLE = {"bgcolor": "background-color", "text": "color"}
 _BODY_LINK_RULE = {"link": "a:link", "vlink": "a:visited", "alink": "a:active"}
-_BODY_KEPT_ATTRIBUTES = ("class", "lang", "dir")
+_BODY_KEPT_ATTRIBUTES = ("lang", "dir")
 _QUOTE_BODY_CLASS = "mailattic-quoted-body"
 # URL characters left as-is inside url("..."); quotes, parentheses, backslash
 # and whitespace are percent-encoded so the value cannot end the CSS string.
@@ -295,7 +294,6 @@ def _build_render_view(html_text: str) -> _RenderView:
                 _ConditionalSubdoc(
                     comment=node,
                     prefix=prefix,
-                    inner=inner,
                     suffix=suffix,
                     soup=inner_soup,
                 )
@@ -376,26 +374,20 @@ def _inspect_soup(
             changed = True
     required_cids: set[str] = set()
     optional_cids: set[str] = set()
+
+    def violation(reason: str) -> tuple[bool, set[str], set[str], str]:
+        return changed, required_cids, optional_cids, reason
+
     for tag in soup.find_all(True):
         tag_name = tag.name.casefold()
         if not remove_active and tag_name in _ACTIVE_TAGS:
-            return (
-                changed,
-                required_cids,
-                optional_cids,
-                f"original HTML retained active tag <{tag.name}>",
-            )
+            return violation(f"original HTML retained active tag <{tag.name}>")
         for name in list(tag.attrs):
             attr_name = name.casefold()
             value = tag.attrs[name]
             if _is_active_attribute(attr_name, value):
                 if not remove_active:
-                    return (
-                        changed,
-                        required_cids,
-                        optional_cids,
-                        f"original HTML retained active attribute {name}",
-                    )
+                    return violation(f"original HTML retained active attribute {name}")
                 del tag.attrs[name]
                 changed = True
             else:
@@ -411,12 +403,7 @@ def _inspect_soup(
             style_text = tag.get_text()
             if _css_is_active(style_text):
                 if not remove_active:
-                    return (
-                        changed,
-                        required_cids,
-                        optional_cids,
-                        "original HTML retained active style rule",
-                    )
+                    return violation("original HTML retained active style rule")
                 tag.decompose()
                 changed = True
             elif style_text:
@@ -483,34 +470,38 @@ def _body_wrapper(body: Tag) -> tuple[str, str]:
     plain colours are dropped rather than written into CSS. Other body
     attributes (margins) are not carried.
     """
-    declarations: list[str] = []
-    for name, prop in _BODY_COLOR_STYLE.items():
+
+    def text_of(name: str) -> str:
         value = body.get(name)
-        if isinstance(value, str) and _BODY_COLOR.match(value.strip()):
-            declarations.append(f"{prop}:{value.strip()}")
-    background = body.get("background")
-    if isinstance(background, str) and background.strip():
-        url = urllib.parse.quote(background.strip(), safe=_URL_SAFE)
-        declarations.append(f'background-image:url("{url}")')
-    body_style = body.get("style")
-    if isinstance(body_style, str) and body_style.strip():
-        declarations.append(body_style.strip())
-    rules = [
-        f".{_QUOTE_BODY_CLASS} {selector}{{color:{value.strip()}}}"
-        for name, selector in _BODY_LINK_RULE.items()
-        if isinstance(value := body.get(name), str) and _BODY_COLOR.match(value.strip())
+        return value.strip() if isinstance(value, str) else ""
+
+    def color_of(name: str) -> str:
+        value = text_of(name)
+        return value if _BODY_COLOR.match(value) else ""
+
+    declarations = [
+        f"{prop}:{color}"
+        for name, prop in _BODY_COLOR_STYLE.items()
+        if (color := color_of(name))
     ]
-    classes = [_QUOTE_BODY_CLASS] if rules else []
+    if background := text_of("background"):
+        url = urllib.parse.quote(background, safe=_URL_SAFE)
+        declarations.append(f'background-image:url("{url}")')
+    if body_style := text_of("style"):
+        declarations.append(body_style)
+    rules = [
+        f".{_QUOTE_BODY_CLASS} {selector}{{color:{color}}}"
+        for name, selector in _BODY_LINK_RULE.items()
+        if (color := color_of(name))
+    ]
+    classes = _attr_strings(body.get("class")) + ([_QUOTE_BODY_CLASS] if rules else [])
     attrs: list[str] = []
+    if classes:
+        attrs.append(f' class="{html.escape(" ".join(classes), quote=True)}"')
     for name in _BODY_KEPT_ATTRIBUTES:
         value = body.get(name)
-        if name == "class":
-            classes = [*_attr_strings(value), *classes]
-            continue
         if isinstance(value, str):
             attrs.append(f' {name}="{html.escape(value, quote=True)}"')
-    if classes:
-        attrs.insert(0, f' class="{html.escape(" ".join(classes), quote=True)}"')
     if declarations:
         style = ";".join(declarations)
         attrs.append(f' style="{html.escape(style, quote=True)}"')
