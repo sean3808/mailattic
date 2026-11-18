@@ -248,8 +248,7 @@ _REQUIRED_IMAP_APPEND_KEYS = ("IMAP_HOST", "IMAP_PORT", "IMAP_USER", "IMAP_PASSW
 # different Sent-folder name ever appears: promote to an env var read
 # alongside the SMTP settings (e.g. IMAP_SENT_FOLDER_NAME).
 SENT_FOLDER_DISPLAY_NAME = "寄件備份"
-_SENT_FOLDER_DISPLAY_NAME = SENT_FOLDER_DISPLAY_NAME
-_SENT_FOLDER_WIRE_NAME = encode_mutf7(_SENT_FOLDER_DISPLAY_NAME)
+_SENT_FOLDER_WIRE_NAME = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
 
 # Bounded socket timeout (seconds) for the best-effort Sent-folder APPEND
 # connection (Codex semantic review, add-mutf7-folder-codec design Decision
@@ -1710,7 +1709,7 @@ def _append_sent_copy(
         print(
             f"Warning: could not append draft_id={draft_id} "
             f"(message_id={message_id}) to the IMAP Sent folder "
-            f"{_SENT_FOLDER_DISPLAY_NAME!r}: {exc}",
+            f"{SENT_FOLDER_DISPLAY_NAME!r}: {exc}",
             file=sys.stderr,
         )
 

@@ -1011,7 +1011,7 @@ def _seed_outbound_message(
     return db_path, db_id
 
 
-def test_unsupported_outbound_source_returns_not_found(tmp_path: Path) -> None:
+def test_outbound_source_missing_from_imap_returns_not_found(tmp_path: Path) -> None:
     db_path, db_id = _seed_outbound_message(tmp_path)
     sent_wire = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
     fake_conn = FakeImapConnection(
