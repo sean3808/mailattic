@@ -25,7 +25,12 @@ from mailattic.outbound import (
     build_quoted_reply_bodies,
 )
 from mailattic.outbound_commands import _handle_draft_reply
-from mailattic.reply_quote import OriginalUnavailable, quotable_original_from_rfc822
+from mailattic.reply_quote import (
+    OriginalUnavailable,
+    quotable_original_from_rfc822,
+    quote_notice_for_category,
+    verify_quoted_html,
+)
 from tests.test_original_export import FakeImapClient, FakeImapConnection
 from tests.test_outbound_draft import PLACEHOLDER_SMTP_SETTINGS, _seed_message
 
@@ -307,7 +312,12 @@ def test_conditional_comment_carrying_active_content_is_removed() -> None:
     assert quotable is not None
     fragment = quotable.html_fragment
     assert "alert(1)" not in fragment and "onclick" not in fragment
+    assert "<p>y</p>" in fragment
     assert "<v:imagedata" in fragment  # Outlook's own VML signature stays
+    assert (
+        "<!--[if gte vml 1]><v:shape><v:imagedata src='x.png'/></v:shape><![endif]-->"
+        in fragment
+    )
 
 
 def test_head_conditional_comments_travel_with_the_head_styles() -> None:
@@ -400,24 +410,112 @@ def test_mislabelled_charset_is_decoded_like_ingest() -> None:
 
 
 @pytest.mark.parametrize(
-    ("fetch", "note"),
+    ("fetch", "note", "expected_category"),
     [
-        (None, "original fetch not configured"),
+        (None, "original fetch not configured", "settings"),
         (
             _fetch_raising("Original message not found on IMAP server."),
             "Original message not found on IMAP server.",
+            "temporary",
         ),
-        (_fetch_returning(_original_eml(with_html=False)), "original has no HTML body"),
+        (
+            _fetch_returning(_original_eml(with_html=False)),
+            "original has no HTML body",
+            "no_html",
+        ),
     ],
 )
 def test_unavailable_original_falls_back_to_stored_text_and_says_why(
-    tmp_path: Path, fetch, note: str
+    tmp_path: Path, fetch, note: str, expected_category: str
 ) -> None:
     result = _reply(tmp_path, fetch)
 
     assert result.quote_source == "stored_text"
     assert result.quote_note == note
+    assert result.quote_notice == quote_notice_for_category(expected_category)
     assert "original body" in str(_quoted_soup(_draft(result)))
+
+
+def test_cid_inside_a_conditional_comment_is_attached(tmp_path: Path) -> None:
+    vml = "<p><!--[if gte vml 1]><v:imagedata src='cid:vml@x'/><![endif]-->Hi</p>"
+    eml = _eml_with_cid(vml, "vml@x")
+
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    draft = _draft(result)
+    assert result.quote_source == "original"
+    assert result.quote_notice is None
+    assert {str(p["Content-ID"]) for p in draft.walk() if p.get("Content-ID")} == {
+        "<vml@x>"
+    }
+
+
+def test_ordinary_comment_with_cid_does_not_cause_fallback(tmp_path: Path) -> None:
+    html = '<html><body><!-- <img src="cid:old@x"> --><p>Hi</p></body></html>'
+    eml = _eml_with_cid(html, None)
+
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    assert result.quote_source == "original"
+    assert result.quote_notice is None
+    assert (
+        "cid:old@x" in _draft(result).get_body(preferencelist=("html",)).get_content()
+    )
+
+
+def test_style_tag_import_and_expression_are_caught() -> None:
+    html = (
+        "<html><head>"
+        "<style>@import url(https://evil.example/a.css);</style>"
+        "<style>p{width:expression(alert(1))}</style>"
+        "<style>p{color:blue}</style>"
+        "</head><body><p>Hi</p></body></html>"
+    )
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None
+    assert "@import" not in quotable.html_fragment
+    assert "expression(" not in quotable.html_fragment
+    assert "color:blue" in quotable.html_fragment
+    assert (
+        verify_quoted_html("<style>@import 'x.css';</style><p>Hi</p>", ()) is not None
+    )
+    assert (
+        verify_quoted_html("<style>p{width:expression(1)}</style><p>Hi</p>", ())
+        is not None
+    )
+
+
+def test_gate_rejects_unclosed_nested_and_unknown_declarations(
+    tmp_path: Path,
+) -> None:
+    assert verify_quoted_html("<!--[if mso]><p>unclosed", ()) is not None
+    assert (
+        verify_quoted_html(
+            "<!--[if mso]><!--[if gte mso 9]><p>x</p><![endif]--><![endif]-->", ()
+        )
+        is not None
+    )
+    assert verify_quoted_html("<!unknown foo><p>Hi</p>", ()) is not None
+
+    eml = _eml_with_cid("<!--[if mso]><p>unclosed", None)
+    result = _reply(tmp_path, _fetch_returning(eml))
+
+    assert result.quote_source == "stored_text"
+    assert result.quote_note is not None and "unclosed" in result.quote_note
+    assert result.quote_notice == quote_notice_for_category("unquotable")
+
+
+def test_downlevel_revealed_conditional_is_sanitised_and_scanned() -> None:
+    html = "<![if !mso]><p onclick='x()'>Hi</p><![endif]>"
+
+    quotable = quotable_original_from_rfc822(_original_eml(html))
+
+    assert quotable is not None
+    assert quotable.rejection_reason is None
+    assert "onclick" not in quotable.html_fragment
+    assert "<p>Hi</p>" in quotable.html_fragment
 
 
 def test_cli_reports_the_quote_source(
@@ -444,6 +542,7 @@ def test_cli_reports_the_quote_source(
 
     out = capsys.readouterr().out
     assert "Quote: stored text (" in out
+    assert f"Quote notice: {quote_notice_for_category('permanent')}" in out
 
 
 # --- the IMAP fetcher --------------------------------------------------------
@@ -518,5 +617,31 @@ def test_fetcher_turns_connection_failure_into_unavailable() -> None:
 
     fetch = imap_original_fetcher(IMAP_ENV, client_factory=broken)
 
-    with pytest.raises(OriginalUnavailable, match="connection refused"):
+    with pytest.raises(OriginalUnavailable, match="connection refused") as exc_info:
         fetch(IMAP_ANCHOR)
+    assert exc_info.value.category == "temporary"
+
+
+def test_mcp_draft_reply_returns_quote_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from mailattic.mcp_server import create_server
+
+    db_path = _seed_message(tmp_path)
+    env_file = tmp_path / "smtp.env"
+    env_file.write_text(PLACEHOLDER_SMTP_SETTINGS, encoding="utf-8")
+    monkeypatch.setenv("MAILATTIC_SMTP_ENV_FILE", str(env_file))
+
+    server = create_server(database_path=db_path)
+    res = asyncio.run(
+        server.call_tool(
+            "mail_draft_reply",
+            {"message_id": SEEDED_MESSAGE_ID, "body_text": "Noted."},
+        )
+    )
+    data = res.structured_content
+    assert data is not None
+    assert data["quote_source"] == "stored_text"
+    assert data["quote_notice"] == quote_notice_for_category("permanent")

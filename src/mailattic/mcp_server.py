@@ -223,10 +223,9 @@ _MAIL_DRAFT_REPLY_DESCRIPTION = (
     "the complete draft (Subject, To, Cc, Bcc, body, attachments, draft_id, and "
     "fingerprint) to the user for conversational review before calling mail_send. "
     "quote_source='original' means the HTML quotes the customer's original as "
-    "sent (quote_note is null). quote_source='stored_text' means it quotes the "
-    "stored text instead: before mail_send, tell the user and quote quote_note "
-    "verbatim; unless quote_note is 'original has no HTML body', the customer "
-    "will see their earlier mail flattened, unlike what they sent."
+    "sent (quote_note and quote_notice are null). quote_source='stored_text' "
+    "means it quotes the stored text instead: before mail_send, relay "
+    "quote_note and quote_notice verbatim to the user."
 )
 _MAIL_DRAFT_NEW_DESCRIPTION = (
     "Generate a new-thread draft email and write it to the MCP-dedicated "
@@ -2602,9 +2601,11 @@ def create_server(
                 "body_text": body,
                 "attachments": attachments_payload,
                 # #136: whether the HTML quotes the original as sent, and if
-                # not, why; body_text is always the plain-text alternative.
+                # not, why and what it means for the customer; body_text is
+                # always the plain-text alternative.
                 "quote_source": result.quote_source,
                 "quote_note": result.quote_note,
+                "quote_notice": result.quote_notice,
             }
 
         states = _draft_ladder_states(result.body_text, _make_payload)

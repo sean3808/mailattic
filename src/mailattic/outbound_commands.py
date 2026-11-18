@@ -292,6 +292,8 @@ def _print_draft_summary(result: DraftReplyResult | DraftNewResult) -> int:
         print("Quote: original message as sent")
     elif result.quote_source is not None:
         print(f"Quote: stored text ({safe(result.quote_note or '')})")
+        if result.quote_notice:
+            print(f"Quote notice: {safe(result.quote_notice)}")
     if result.recipient_checks:
         print("Recipient check:")
         for item in result.recipient_checks:

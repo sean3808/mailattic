@@ -1460,32 +1460,44 @@ def imap_original_fetcher(
         source = classify_message_source(message)
         if source == "pst":
             raise OriginalUnavailable(
-                "the original came from a PST; quoting the stored text"
+                "the original came from a PST; quoting the stored text",
+                category="permanent",
             )
         if source != "imap":
             raise OriginalUnavailable(
-                "the original's source cannot be fetched; quoting the stored text"
+                "the original's source cannot be fetched; quoting the stored text",
+                category="permanent",
             )
         missing = missing_imap_send_keys(env)
         if missing:
             raise OriginalUnavailable(
-                f"send settings have no IMAP account ({', '.join(missing)} missing)"
+                f"send settings have no IMAP account ({', '.join(missing)} missing)",
+                category="settings",
             )
         try:
             client = factory(env)
         except Exception as exc:  # noqa: BLE001 -- any connect failure falls back
-            raise OriginalUnavailable(f"IMAP server connection failed: {exc}") from exc
+            raise OriginalUnavailable(
+                f"IMAP server connection failed: {exc}",
+                category="temporary",
+            ) from exc
         try:
             rfc822, err = _find_imap_rfc822(client, message)
         except Exception as exc:  # noqa: BLE001 -- any lookup failure falls back
-            raise OriginalUnavailable(f"IMAP lookup failed: {exc}") from exc
+            raise OriginalUnavailable(
+                f"IMAP lookup failed: {exc}",
+                category="temporary",
+            ) from exc
         finally:
             with contextlib.suppress(Exception):
                 client.close()
         if err is not None:
-            raise OriginalUnavailable(err)
+            raise OriginalUnavailable(err, category="temporary")
         if rfc822 is None:
-            raise OriginalUnavailable("Original message not found on IMAP server.")
+            raise OriginalUnavailable(
+                "Original message not found on IMAP server.",
+                category="permanent",
+            )
         return rfc822
 
     return fetch

@@ -78,6 +78,8 @@ from .reply_quote import (
     OriginalUnavailable,
     QuotableOriginal,
     quotable_original_from_rfc822,
+    quote_notice_for_category,
+    verify_quoted_html,
 )
 from .storage import connect_database, persist_message, record_ingest_failure
 
@@ -1041,9 +1043,11 @@ class DraftReplyResult:
     attachment_sources: tuple[tuple[str, str, int], ...] = ()
     recipient_checks: tuple[RecipientFamiliarity, ...] = ()
     # Reply drafts only (#136): "original" when the HTML quotes the fetched
-    # original, "stored_text" otherwise, with ``quote_note`` saying why.
+    # original, "stored_text" otherwise, with ``quote_note`` saying why and
+    # ``quote_notice`` stating the user-facing impact.
     quote_source: str | None = None
     quote_note: str | None = None
+    quote_notice: str | None = None
 
 
 DraftNewResult = DraftReplyResult
@@ -1054,24 +1058,40 @@ OriginalFetcher = Callable[[Mapping[str, object]], bytes]
 
 def _resolve_quotable_original(
     original: Mapping[str, object], fetch_original: OriginalFetcher | None
-) -> tuple[QuotableOriginal | None, str | None]:
-    """The original to quote as HTML, or ``None`` and why it is not available."""
+) -> tuple[QuotableOriginal | None, str | None, str | None]:
+    """The original to quote as HTML, or ``None`` with reason and notice."""
     if fetch_original is None:
-        return None, "original fetch not configured"
+        return (
+            None,
+            "original fetch not configured",
+            quote_notice_for_category("settings"),
+        )
     try:
         rfc822 = fetch_original(original)
     except OriginalUnavailable as exc:
-        return None, str(exc)
+        return None, str(exc), quote_notice_for_category(exc.category)
     quotable = quotable_original_from_rfc822(rfc822)
     if quotable is None:
-        return None, "original has no HTML body"
+        return (
+            None,
+            "original has no HTML body",
+            quote_notice_for_category("no_html"),
+        )
+    if quotable.rejection_reason is not None:
+        return (
+            None,
+            quotable.rejection_reason,
+            quote_notice_for_category("unquotable"),
+        )
     if quotable.unresolved_cids:
         # A broken image in the customer's own message is the look #136 removes.
-        return None, (
+        return (
+            None,
             "original references inline images missing from the message: "
-            + ", ".join(quotable.unresolved_cids)
+            + ", ".join(quotable.unresolved_cids),
+            quote_notice_for_category("unquotable"),
         )
-    return quotable, None
+    return quotable, None, None
 
 
 def _add_inline_parts(msg: EmailMessage, quotable: QuotableOriginal | None) -> None:
@@ -1316,10 +1336,26 @@ def assemble_draft_reply(
     msg["References"] = thread_headers["references"]
     msg["Subject"] = thread_headers["subject"] if subject is None else subject
     msg["Date"] = formatdate(localtime=True)
-    quotable, quote_note = _resolve_quotable_original(original, fetch_original)
+    quotable, quote_note, quote_notice = _resolve_quotable_original(
+        original, fetch_original
+    )
     plain_body, html_body = build_quoted_reply_bodies(
         original, body_text, font_style=font_style, quotable=quotable
     )
+    if quotable is not None:
+        attached_cids = {
+            part.content_id
+            for part in quotable.inline_parts
+            if part.maintype == "image"
+        }
+        gate_error = verify_quoted_html(html_body, attached_cids)
+        if gate_error is not None:
+            quotable = None
+            quote_note = gate_error
+            quote_notice = quote_notice_for_category("unquotable")
+            plain_body, html_body = build_quoted_reply_bodies(
+                original, body_text, font_style=font_style, quotable=None
+            )
     msg.set_content(plain_body, charset="utf-8")
     msg.add_alternative(html_body, subtype="html", charset="utf-8")
     _add_inline_parts(msg, quotable)
@@ -1356,6 +1392,7 @@ def assemble_draft_reply(
         recipient_checks=recipient_checks,
         quote_source="original" if quotable is not None else "stored_text",
         quote_note=quote_note,
+        quote_notice=quote_notice,
     )
 
 
