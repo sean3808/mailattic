@@ -23,9 +23,11 @@ import pytest
 from mailattic import original_export
 from mailattic.imap_native import ImapFolder
 from mailattic.models import MaildirSource, PstSource, build_normalized_message
+from mailattic.mutf7 import encode_mutf7
 from mailattic.original_export import (
     export_original_message,
 )
+from mailattic.outbound import SENT_FOLDER_DISPLAY_NAME
 from mailattic.outlook_pst import PR_INTERNET_MESSAGE_ID
 from mailattic.storage import (
     connect_database,
@@ -975,38 +977,195 @@ def test_pst_location_prioritizes_folder_path(tmp_path: Path) -> None:
     )
 
 
-def test_unsupported_outbound_source_returns_not_found(tmp_path: Path) -> None:
+def _seed_outbound_message(
+    tmp_path: Path,
+    *,
+    message_id: str = "<outbound1@example.com>",
+    subject: str = "Outbound Email",
+    sender_name: str = "Sean",
+    sender_email: str = "sean@mailattic.test",
+    sent_at: str = "2026-05-01T10:00:00+08:00",
+    logical_locator: str = "outbound:draft-1",
+) -> tuple[Path, int]:
     db_path = initialize_database(tmp_path / "test.db")
     conn = connect_database(db_path)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO messages (
-            message_id, subject, sender_name, sender_email, sent_at,
-            pst_source, folder_path, logical_locator, dedup_key, source_input_mode
-        ) VALUES (
-            '<outbound1@example.com>', 'Outbound Email', 'Sean', 'sean@mailattic.test',
-            '2026-05-01T10:00:00+08:00', 'outbound-bes', 'Sent',
-            'loc-1', 'dedup-1', 'outbound'
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO messages (
+                message_id, subject, sender_name, sender_email, sent_at,
+                pst_source, folder_path, logical_locator, dedup_key, source_input_mode
+            ) VALUES (
+                ?, ?, ?, ?, ?,
+                'outbound-bes', 'Sent',
+                ?, 'dedup-outbound-1', 'outbound'
+            )
+            """,
+            (message_id, subject, sender_name, sender_email, sent_at, logical_locator),
         )
-        """
+        db_id = int(cur.lastrowid or 0)
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path, db_id
+
+
+def test_unsupported_outbound_source_returns_not_found(tmp_path: Path) -> None:
+    db_path, db_id = _seed_outbound_message(tmp_path)
+    sent_wire = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder(sent_wire, SENT_FOLDER_DISPLAY_NAME, "/"),
+            ImapFolder("INBOX", "INBOX", "/"),
+        ],
+        folder_rfc822_by_uid={sent_wire: {}, "INBOX": {}},
+        folder_uids_by_header={sent_wire: {}, "INBOX": {}},
     )
-    db_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+    imap_client = FakeImapClient(fake_conn)
 
     dest_dir = tmp_path / "exports"
     result = export_original_message(
         db_path,
         db_id,
         destination_dir=dest_dir,
+        imap_client=imap_client,
     )
 
     assert result.status == "not_found"
+    assert result.format == "eml"
+    assert result.source_type == "imap"
     assert result.dest_path is None
     assert result.subject == "Outbound Email"
+    assert result.sender == "Sean <sean@mailattic.test>"
     assert result.sent_at == "2026-05-01T10:00:00+08:00"
-    assert "does not support original export" in (result.detail or "")
+
+
+def test_outbound_source_exports_from_sent_folder(tmp_path: Path) -> None:
+    msg_id = "<outbound-sent-1@example.com>"
+    db_path, db_id = _seed_outbound_message(
+        tmp_path,
+        message_id=msg_id,
+        subject="Outbound Sent Report",
+    )
+    expected_eml = (
+        f"Message-ID: {msg_id}\r\n"
+        "From: Sean <sean@mailattic.test>\r\n"
+        "Subject: Outbound Sent Report\r\n"
+        "\r\n"
+        "Exact outbound body payload.\r\n"
+    ).encode()
+    other_eml = (
+        b"Message-ID: <other-sent@example.com>\r\n"
+        b"From: Sean <sean@mailattic.test>\r\n"
+        b"Subject: Other Sent\r\n"
+        b"\r\n"
+        b"Different message.\r\n"
+    )
+
+    sent_wire = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder(sent_wire, SENT_FOLDER_DISPLAY_NAME, "/"),
+        ],
+        folder_rfc822_by_uid={
+            sent_wire: {101: expected_eml, 102: other_eml},
+        },
+        folder_uids_by_header={
+            sent_wire: {"outbound-sent-1@example.com": [101]},
+        },
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        imap_client=imap_client,
+    )
+
+    assert result.status == "exported"
+    assert result.format == "eml"
+    assert result.source_type == "imap"
+    assert result.dest_path is not None
+    assert result.dest_path.suffix == ".eml"
+    assert result.dest_path.read_bytes() == expected_eml
+
+
+def test_outbound_source_server_or_folder_failure_returns_failed(
+    tmp_path: Path,
+) -> None:
+    db_path, db_id = _seed_outbound_message(tmp_path)
+    sent_wire = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        select_errors={sent_wire: RuntimeError("Sent folder unavailable")},
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        imap_client=imap_client,
+    )
+
+    assert result.status == "failed"
+    assert result.dest_path is None
+    assert result.subject == "Outbound Email"
+    assert result.sender == "Sean <sean@mailattic.test>"
+    assert result.sent_at == "2026-05-01T10:00:00+08:00"
+    assert "Sent folder unavailable" in (result.detail or "")
+
+
+def test_outbound_source_ambiguous_match_returns_failed(tmp_path: Path) -> None:
+    msg_id = "<outbound-dup@example.com>"
+    db_path, db_id = _seed_outbound_message(tmp_path, message_id=msg_id)
+    dup_eml_1 = (
+        f"Message-ID: {msg_id}\r\n"
+        "From: Sean <sean@mailattic.test>\r\n"
+        "Subject: Outbound Email\r\n"
+        "\r\n"
+        "Copy 1.\r\n"
+    ).encode()
+    dup_eml_2 = (
+        f"Message-ID: {msg_id}\r\n"
+        "From: Sean <sean@mailattic.test>\r\n"
+        "Subject: Outbound Email\r\n"
+        "\r\n"
+        "Copy 2.\r\n"
+    ).encode()
+
+    sent_wire = encode_mutf7(SENT_FOLDER_DISPLAY_NAME)
+    fake_conn = FakeImapConnection(
+        rfc822_by_uid={},
+        folders=[
+            ImapFolder(sent_wire, SENT_FOLDER_DISPLAY_NAME, "/"),
+        ],
+        folder_rfc822_by_uid={
+            sent_wire: {201: dup_eml_1, 202: dup_eml_2},
+        },
+        folder_uids_by_header={
+            sent_wire: {"outbound-dup@example.com": [201, 202]},
+        },
+    )
+    imap_client = FakeImapClient(fake_conn)
+
+    dest_dir = tmp_path / "exports"
+    result = export_original_message(
+        db_path,
+        db_id,
+        destination_dir=dest_dir,
+        imap_client=imap_client,
+    )
+
+    assert result.status == "failed"
+    assert result.dest_path is None
+    assert "Ambiguous" in (result.detail or "")
 
 
 def test_imap_search_raising_imap_error_fails(tmp_path: Path) -> None:
